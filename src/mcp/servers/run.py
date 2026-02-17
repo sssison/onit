@@ -113,7 +113,7 @@ def prepare_server_args(config):
             
         transport = server.get('transport', 'streamable-http')
         host = server.get('host', '0.0.0.0')
-        port = server.get('port', 9003)
+        port = server.get('port', 18201)
         path = server.get('path', f'/{name.lower()}')
         enabled = server.get('enabled', True)
         module = server.get('module')

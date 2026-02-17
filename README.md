@@ -144,7 +144,7 @@ docker compose up --build
 
 This launches the services defined in `docker-compose.yml` (web UI on port 9000 and A2A server on port 9001).
 
-> **Note:** Pass API keys via an `.env` file or individual `-e KEY=value` flags. Never bake secrets into the image. If you run MCP servers inside the container (`onit --mcp`), expose ports 9002-9006 as well.
+> **Note:** Pass API keys via an `.env` file or individual `-e KEY=value` flags. Never bake secrets into the image. If you run MCP servers inside the container (`onit --mcp`), expose ports 18200-18204 as well.
 
 ## Quick Start
 
@@ -315,7 +315,7 @@ serving:
 # Agent behavior
 persona: "assistant"
 verbose: false
-show_logs: true
+show_logs: false
 theme: dark
 timeout: 60
 
@@ -646,6 +646,7 @@ pytest src/test/ -v
 - [OAuth2 Redirect Flow](docs/OAUTH_REDIRECT_FLOW.md) — Full OAuth2 redirect flow implementation details
 - [OAuth Quick Start](docs/OAUTH_SETUP_QUICK_START.md) — Quick setup checklist for Google OAuth
 - [Web Authentication](docs/WEB_AUTHENTICATION.md) — Web UI authentication reference
+- [Web Deployment](docs/DEPLOYMENT_WEB.md) — Production deployment with HTTP/HTTPS via nginx or Caddy
 
 ## License
 

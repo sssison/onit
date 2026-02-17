@@ -1251,7 +1251,7 @@ def get_document_context(
 def run(
     transport: str = "streamable-http",
     host: str = "0.0.0.0",
-    port: int = 9004,
+    port: int = 18202,
     path: str = "/bash",
     options: dict = {}
 ) -> None:

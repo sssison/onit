@@ -92,7 +92,7 @@ When using create_presentation, create_excel, or create_document tools, always p
 def run(
     transport: str = "streamable-http",
     host: str = "0.0.0.0",
-    port: int = 9002,
+    port: int = 18200,
     path: str = "/prompts",
     options: dict = {}
 ) -> None:

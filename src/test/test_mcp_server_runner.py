@@ -50,7 +50,7 @@ class TestPrepareServerArgs:
                 {"name": "A", "module": "tasks.a", "enabled": True, "port": 9000,
                  "host": "0.0.0.0", "path": "/a", "transport": "streamable-http"},
                 {"name": "B", "module": "tasks.b", "enabled": False, "port": 9001},
-                {"name": "C", "module": "tasks.c", "port": 9002,
+                {"name": "C", "module": "tasks.c", "port": 18200,
                  "host": "0.0.0.0", "path": "/c"},
             ]
         }

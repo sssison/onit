@@ -674,7 +674,7 @@ def extract_pdf_images(
 def run(
     transport: str = "streamable-http",
     host: str = "0.0.0.0",
-    port: int = 9003,
+    port: int = 18201,
     path: str = "/search",
     options: dict = {}
 ) -> None:

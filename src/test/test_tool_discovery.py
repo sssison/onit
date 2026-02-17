@@ -53,7 +53,7 @@ def _mock_client(tools=None, resources=None, prompts=None):
 class TestDiscoverServerTools:
     @pytest.mark.asyncio
     async def test_discovers_tools_with_input_schema(self):
-        server = {"name": "TestServer", "url": "http://127.0.0.1:9003/test", "enabled": True}
+        server = {"name": "TestServer", "url": "http://127.0.0.1:18201/test", "enabled": True}
         mock = _mock_client(tools=[_fake_tool("search")])
         with patch("lib.tools.Client", return_value=mock):
             handlers = await _discover_server_tools(server)
@@ -62,7 +62,7 @@ class TestDiscoverServerTools:
 
     @pytest.mark.asyncio
     async def test_discovers_prompts_with_arguments(self):
-        server = {"name": "Prompts", "url": "http://127.0.0.1:9002/prompts", "enabled": True}
+        server = {"name": "Prompts", "url": "http://127.0.0.1:18200/prompts", "enabled": True}
         mock = _mock_client(prompts=[_fake_prompt("assistant")])
         with patch("lib.tools.Client", return_value=mock):
             handlers = await _discover_server_tools(server)
@@ -89,15 +89,15 @@ class TestDiscoverTools:
     @pytest.mark.asyncio
     async def test_discovers_from_multiple_servers(self):
         servers = [
-            {"name": "A", "url": "http://127.0.0.1:9003/a", "enabled": True},
-            {"name": "B", "url": "http://127.0.0.1:9004/b", "enabled": True},
+            {"name": "A", "url": "http://127.0.0.1:18201/a", "enabled": True},
+            {"name": "B", "url": "http://127.0.0.1:18202/b", "enabled": True},
         ]
 
         mock_a = _mock_client(tools=[_fake_tool("search")])
         mock_b = _mock_client(tools=[_fake_tool("bash")])
 
         def client_factory(url):
-            return mock_a if "9003" in url else mock_b
+            return mock_a if "18201" in url else mock_b
 
         with patch("lib.tools.Client", side_effect=client_factory):
             registry = await discover_tools(servers)
@@ -109,7 +109,7 @@ class TestDiscoverTools:
     @pytest.mark.asyncio
     async def test_handles_connection_error(self):
         servers = [
-            {"name": "Good", "url": "http://127.0.0.1:9003/ok", "enabled": True},
+            {"name": "Good", "url": "http://127.0.0.1:18201/ok", "enabled": True},
             {"name": "Bad", "url": "http://127.0.0.1:9999/bad", "enabled": True},
         ]
 

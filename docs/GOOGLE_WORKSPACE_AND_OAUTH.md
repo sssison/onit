@@ -74,7 +74,7 @@ Place the JSON key at `~/.config/gcloud/credentials.json` — it will be found a
 onit --mcp
 ```
 
-Verify the Google Workspace server is running on port 9006. Then start the agent:
+Verify the Google Workspace server is running on port 18204. Then start the agent:
 
 ```bash
 onit
@@ -278,34 +278,34 @@ mcp:
   servers:
     - name: PromptsMCPServer
       description: Prompt templates
-      url: http://127.0.0.1:9002/prompts
+      url: http://127.0.0.1:18200/prompts
       enabled: true
 
     - name: WebSearchHandler
       description: Web search
-      url: http://127.0.0.1:9003/search
+      url: http://127.0.0.1:18201/search
       enabled: true
 
     - name: BashMCPServer
       description: Bash commands
-      url: http://127.0.0.1:9004/bash
+      url: http://127.0.0.1:18202/bash
       enabled: true
 
     - name: OfficeMCPServer
       description: Microsoft Office
-      url: http://127.0.0.1:9005/office
+      url: http://127.0.0.1:18203/office
       enabled: true
 
     - name: GoogleWorkspaceMCPServer
       description: Google Workspace
-      url: http://127.0.0.1:9006/workspace
+      url: http://127.0.0.1:18204/workspace
       enabled: true
 ```
 
 Then in a separate terminal:
 
 ```bash
-# Terminal 1: Start MCP servers (including Google Workspace on port 9006)
+# Terminal 1: Start MCP servers (including Google Workspace on port 18204)
 onit --mcp
 
 # Terminal 2: Start the web UI with OAuth
@@ -317,7 +317,8 @@ With Docker:
 ```bash
 docker run -it --rm \
   -p 9000:9000 \
-  -p 9001-9006:9001-9006 \
+  -p 9001:9001 \
+  -p 18200-18204:18200-18204 \
   -v ~/.config/gcloud/credentials.json:/app/credentials.json:ro \
   --env-file .env \
   onit --web --web-port 9000

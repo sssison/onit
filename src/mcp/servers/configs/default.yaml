@@ -4,7 +4,7 @@ servers:
     description: "MCP server for prompt templates and instruction generation"
     enabled: true
     host : 0.0.0.0
-    port : 9002
+    port : 18200
     path : /prompts
     transport : 'streamable-http'
 
@@ -13,7 +13,7 @@ servers:
     description: "MCP server for general web search tasks"
     enabled: true
     host : 0.0.0.0
-    port : 9003
+    port : 18201
     path : /search
     transport : 'streamable-http'
 
@@ -22,7 +22,7 @@ servers:
     description: "MCP server for bash commands and document search"
     enabled: true
     host : 0.0.0.0
-    port : 9004
+    port : 18202
     path : /bash
     transport : 'streamable-http'
 
@@ -31,7 +31,7 @@ servers:
     description: "MCP server for creating Microsoft Office documents such as Word, Excel, and PowerPoint"
     enabled: true
     host : 0.0.0.0
-    port : 9005
+    port : 18203
     path : /office
     transport : 'streamable-http'
 
@@ -40,7 +40,7 @@ servers:
     description: "MCP server for creating Google Workspace documents such as Google Docs, Sheets, and Slides"
     enabled: true
     host : 0.0.0.0
-    port : 9006
+    port : 18204
     path : /workspace
     transport : 'streamable-http'
     # Service account JSON for non-interactive auth (download from Google Cloud Console)
