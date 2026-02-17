@@ -94,11 +94,18 @@ pip install -e ".[web]"
 pip install -e ".[all]"
 ```
 
-### From pip (once published)
+### From pip
 
 ```bash
 pip install onit
 ```
+
+or install everything
+
+```bash
+pip install onit[all]
+```
+
 
 ## Docker
 
