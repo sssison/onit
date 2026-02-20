@@ -46,6 +46,9 @@ mcp-servers = [
     "python-pptx",
     "ddgs",
     "pypdf",
+    "ollama",
+    "urllib3",
+    "PyMuPDF",
 ]
 google = [
     "google-api-python-client",
