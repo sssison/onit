@@ -40,6 +40,27 @@ class TestLoadConfig:
             result = load_config(default_path)
             assert "servers" in result
 
+    def test_default_config_includes_turtlebot_v2_servers(self):
+        """The built-in default config should include TurtleBot V2 MCP servers."""
+        default_path = os.path.join(
+            os.path.dirname(__file__), "..", "mcp", "servers", "configs", "default.yaml"
+        )
+        if not os.path.exists(default_path):
+            pytest.skip("Default MCP server config not present in this environment")
+
+        result = load_config(default_path)
+        servers = {server["name"]: server for server in result.get("servers", [])}
+
+        expected = {
+            "TurtlebotMotionMCPServerV2": ("src.mcp.turtlebot_v2.motion_mcp_server", "/turtlebot-motion-v2"),
+            "TurtlebotCameraMCPServerV2": ("src.mcp.turtlebot_v2.camera_mcp_server", "/turtlebot-camera-v2"),
+            "TurtlebotVisionMCPServerV2": ("src.mcp.turtlebot_v2.vision_mcp_server", "/turtlebot-vision-v2"),
+        }
+        for name, (module, path) in expected.items():
+            assert name in servers
+            assert servers[name]["module"] == module
+            assert servers[name]["path"] == path
+
 
 # ── prepare_server_args ─────────────────────────────────────────────────────
 

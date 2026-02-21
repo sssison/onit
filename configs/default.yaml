@@ -88,9 +88,24 @@ mcp:
     - name: TurtlebotMotionServer
       description: Connects to turtlebot motion server
       url: "http://localhost:18205/turtlebot-motion"
-      enabled: true
+      enabled: false
 
     - name: TurtlebotCameraServer
-      description: Connects to turtlebot motion server
+      description: Connects to turtlebot camera server
       url: "http://localhost:18206/turtlebot-camera"
+      enabled: false
+
+    - name: TurtlebotMotionServerV2
+      description: Connects to TurtleBot motion MCP server V2
+      url: "http://localhost:18205/turtlebot-motion-v2"
+      enabled: true
+
+    - name: TurtlebotCameraServerV2
+      description: Connects to TurtleBot camera MCP server V2
+      url: "http://localhost:18206/turtlebot-camera-v2"
+      enabled: true
+
+    - name: TurtlebotVisionServerV2
+      description: Connects to TurtleBot vision MCP server V2
+      url: "http://localhost:18207/turtlebot-vision-v2"
       enabled: true

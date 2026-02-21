@@ -49,6 +49,7 @@ mcp-servers = [
     "ollama",
     "urllib3",
     "PyMuPDF",
+    "Pillow",
 ]
 google = [
     "google-api-python-client",
