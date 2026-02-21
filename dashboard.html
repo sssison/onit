@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robot Control Dashboard</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        h1 { text-align: center; margin-bottom: 20px; color: #333; }
+        
+        /* Main Layout */
+        .container {
+            display: flex;
+            flex: 1;
+            gap: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+            width: 100%;
+        }
+
+        /* Left Column: Video */
+        .video-panel {
+            flex: 2;
+            background: #000;
+            border-radius: 10px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .video-feed {
+            width: 100%;
+            height: auto;
+            max-height: 100%;
+            transform: rotate(90deg);
+        }
+
+        /* Right Column: Controls */
+        .control-panel {
+            flex: 1;
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            gap: 30px;
+        }
+
+        /* Manual Input Section */
+        .input-group {
+            border: 1px solid #ddd;
+            padding: 15px;
+            border-radius: 8px;
+        }
+        .input-group h3 { margin-top: 0; }
+        .input-row {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+            align-items: center;
+        }
+        input[type="number"] {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        button.manual-btn {
+            width: 100%;
+            padding: 10px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button.manual-btn:hover { background-color: #0056b3; }
+
+        /* D-Pad Buttons */
+        .d-pad {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            max-width: 200px;
+            margin: 0 auto;
+        }
+        .d-btn {
+            padding: 15px;
+            font-size: 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            background-color: #ddd;
+            transition: background 0.1s;
+        }
+        .d-btn:active { background-color: #bbb; transform: scale(0.95); }
+        
+        .btn-forward { grid-column: 2; background-color: #28a745; color: white; }
+        .btn-left { grid-column: 1; grid-row: 2; }
+        .btn-stop { grid-column: 2; grid-row: 2; background-color: #dc3545; color: white; font-weight: bold; font-size: 16px; }
+        .btn-right { grid-column: 3; grid-row: 2; }
+        .btn-back { grid-column: 2; grid-row: 3; }
+
+        /* Status Log */
+        #status-log {
+            margin-top: auto;
+            font-size: 0.9em;
+            color: #666;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Robot Command Center</h1>
+
+    <div class="container">
+        <div class="video-panel">
+            <img id="videoStream" class="video-feed" src="" alt="Video Stream Offline">
+        </div>
+
+        <div class="control-panel">
+            
+            <div class="d-pad">
+		    <button class="d-btn btn-forward" onclick="move(0.1, 0.0)">▲</button>
+		    <button class="d-btn btn-left" onclick="move(0.0, 1.0)">◀</button>
+		    <button class="d-btn btn-stop" onclick="stopRobot()">STOP</button>
+		    <button class="d-btn btn-right" onclick="move(0.0, -1.0)">▶</button>
+		    <button class="d-btn btn-back" onclick="move(-0.1, 0.0)">▼</button>
+		</div>
+
+            <div class="input-group">
+                <h3>Manual Input</h3>
+                <div class="input-row">
+                    <label>Linear (m/s):</label>
+                    <input type="number" id="linearInput" step="0.1" value="0.0">
+                </div>
+                <div class="input-row">
+                    <label>Angular (rad/s):</label>
+                    <input type="number" id="angularInput" step="0.1" value="0.0">
+                </div>
+                <button class="manual-btn" onclick="sendManual()">Send Command</button>
+            </div>
+
+            <div id="status-log">Status: Ready</div>
+        </div>
+    </div>
+
+    <script>
+	    const ROBOT_IP = '192.168.0.102'; // Automatically detects the IP if hosted on the bot
+	    const JETSON_IP = '192.168.0.101';
+	    const MOTION_URL = `http://${ROBOT_IP}:5001`;
+	    const VIDEO_URL = `http://${JETSON_IP}:5000/video_feed`;
+
+	    document.getElementById('videoStream').src = VIDEO_URL;
+
+	    async function sendCommand(endpoint, data) {
+		const statusLog = document.getElementById('status-log');
+		try {
+		    const response = await fetch(`${MOTION_URL}${endpoint}`, {
+		        method: 'POST',
+		        headers: { 'Content-Type': 'application/json' },
+		        body: JSON.stringify(data)
+		    });
+		    
+		    if (response.ok) {
+		        statusLog.innerText = `Status: Command Sent (${data.linear || 0}, ${data.angular || 0})`;
+		        statusLog.style.color = '#28a745';
+		    }
+		} catch (error) {
+		    statusLog.innerText = 'Error: Cannot reach Robot';
+		    statusLog.style.color = '#dc3545';
+		}
+	    }
+
+	    function move(lin, ang) { sendCommand('/move', { linear: lin, angular: ang }); }
+	    function stopRobot() { sendCommand('/stop', {}); }
+	    
+	    function sendManual() {
+		const lin = parseFloat(document.getElementById('linearInput').value);
+		const ang = parseFloat(document.getElementById('angularInput').value);
+		move(lin, ang);
+	    }
+
+	    // Smooth Keyboard Control
+	    document.addEventListener('keydown', (e) => {
+		switch(e.key) {
+		    case "ArrowUp":    move(0.2, 0.0);  break;
+		    case "ArrowDown":  move(-0.2, 0.0); break;
+		    case "ArrowLeft":  move(0.0, 1.0);  break;
+		    case "ArrowRight": move(0.0, -1.0); break;
+		    case " ":          stopRobot();     break;
+		}
+	    });
+	</script>
+</body>
+</html>
