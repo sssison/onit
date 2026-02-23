@@ -957,7 +957,16 @@ class WebChatUI:
             safe_name = os.path.basename(filename)
             filepath = os.path.join(self.data_path, safe_name)
             if os.path.isfile(filepath):
-                return FileResponse(filepath)
+                # Read content directly to avoid Content-Length mismatch
+                # if the file is still being written concurrently.
+                try:
+                    with open(filepath, "rb") as f:
+                        content = f.read()
+                    import mimetypes
+                    media_type = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
+                    return Response(content=content, media_type=media_type)
+                except OSError:
+                    return Response(content="File read error", status_code=500)
             return Response(content="File not found", status_code=404)
 
         @fastapi_app.post("/uploads/")

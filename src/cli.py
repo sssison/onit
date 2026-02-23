@@ -320,7 +320,7 @@ def main():
                         help='Client mode: send a task to a remote OnIt A2A server and print the answer.')
     parser.add_argument('--a2a-host', type=str, default='http://localhost:9001',
                         help='A2A server URL for client mode (default: http://localhost:9001).')
-    parser.add_argument('--a2a-task', type=str, default=None,
+    parser.add_argument('--a2a-task', '--task', type=str, default=None,
                         help='Task to execute in A2A loop or client mode.')
     parser.add_argument('--a2a-file', type=str, default=None,
                         help='File to upload to the A2A server along with the task.')

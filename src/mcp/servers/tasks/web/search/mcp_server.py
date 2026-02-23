@@ -114,6 +114,13 @@ def _read_pdf(url: str) -> str:
     """Extract text content from a PDF URL."""
     try:
         response = requests.get(url, timeout=READ_TIMEOUT)
+        response.raise_for_status()
+
+        # Verify download is complete if Content-Length was provided
+        expected = response.headers.get('Content-Length')
+        if expected and len(response.content) < int(expected):
+            return f"Error reading PDF: incomplete download ({len(response.content)}/{expected} bytes)"
+
         from pypdf import PdfReader
         pdf_file = BytesIO(response.content)
         reader = PdfReader(pdf_file)
@@ -252,9 +259,16 @@ def _download_file(url: str, output_dir: str, timeout: int = 30) -> dict:
 
         # Write to file with owner-only permissions
         fd = os.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        bytes_written = 0
         with os.fdopen(fd, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
+                bytes_written += len(chunk)
+
+        # Verify complete download if Content-Length was provided
+        if content_length and bytes_written < int(content_length):
+            os.unlink(filepath)
+            return {"url": url, "error": f"Incomplete download ({bytes_written}/{content_length} bytes)"}
 
         return {
             "url": url,
@@ -606,6 +620,9 @@ def extract_pdf_images(
             # Download PDF first
             response = requests.get(pdf_path, timeout=30)
             response.raise_for_status()
+            expected = response.headers.get('Content-Length')
+            if expected and len(response.content) < int(expected):
+                return json.dumps({"error": f"Incomplete PDF download ({len(response.content)}/{expected} bytes)", "pdf_path": pdf_path})
             pdf_data = response.content
             doc = fitz.open(stream=pdf_data, filetype="pdf")
             pdf_name = os.path.basename(urlparse(pdf_path).path) or "document"
