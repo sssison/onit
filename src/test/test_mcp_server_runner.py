@@ -55,6 +55,7 @@ class TestLoadConfig:
             "TurtlebotMotionMCPServerV2": ("src.mcp.turtlebot_v2.motion_mcp_server", "/turtlebot-motion-v2"),
             "TurtlebotCameraMCPServerV2": ("src.mcp.turtlebot_v2.camera_mcp_server", "/turtlebot-camera-v2"),
             "TurtlebotVisionMCPServerV2": ("src.mcp.turtlebot_v2.vision_mcp_server", "/turtlebot-vision-v2"),
+            "TurtlebotLidarMCPServerV2": ("src.mcp.turtlebot_v2.lidar_mcp_server", "/turtlebot-lidar-v2"),
         }
         for name, (module, path) in expected.items():
             assert name in servers

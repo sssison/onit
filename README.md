@@ -71,6 +71,9 @@ python3 motion_server/motion_server_tbot.py
 ```bash
 export MOTION_SERVER_BASE_URL="http://10.158.38.26:5001"
 export CAMERA_TOPIC="/camera/image_raw/compressed"
+export LIDAR_TOPIC="/scan"
+export LIDAR_NODE_NAME="lidar_mcp_server_node_v2"
+export LIDAR_FRAME_LOG_EVERY="30"
 
 # Vision server settings (OpenAI-compatible endpoint)
 export TBOT_VISION_HOST="http://127.0.0.1:8000/v1"
@@ -96,10 +99,12 @@ onit --config configs/default.yaml --text-show-logs
 ### 7) Sample tool-chain flow (camera -> vision -> motion)
 1. `tbot_camera_get_decoded_frame(wait_for_new_frame=true, wait_timeout_s=1.0)`
 2. `tbot_vision_analyze_scene(images=[<image_from_step_1>], task="Analyze scene for navigation and hazards.")`
-3. `tbot_motion_move(linear=0.03, angular=0.0, duration_s=1.5)`
-4. `tbot_motion_stop()`
+3. `tbot_lidar_check_collision(front_threshold_m=0.25, side_threshold_m=0.20, back_threshold_m=0.25)`
+4. `tbot_motion_move(linear=0.03, angular=0.0, duration_s=1.5)`
+5. `tbot_motion_stop()`
 
 The V2 configuration keeps legacy TurtleBot MCP entries disabled and enables:
 - `TurtlebotMotionServerV2`
 - `TurtlebotCameraServerV2`
 - `TurtlebotVisionServerV2`
+- `TurtlebotLidarServerV2`

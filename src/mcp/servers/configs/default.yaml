@@ -72,3 +72,12 @@ servers:
     port : 18207
     path : /turtlebot-vision-v2
     transport : 'streamable-http'
+
+  - name: TurtlebotLidarMCPServerV2
+    module: src.mcp.turtlebot_v2.lidar_mcp_server
+    description: "TurtleBot LiDAR MCP server V2"
+    enabled: true
+    host : 0.0.0.0
+    port : 18208
+    path : /turtlebot-lidar-v2
+    transport : 'streamable-http'
