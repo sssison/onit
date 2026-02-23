@@ -68,7 +68,7 @@ mcp:
     - name: WebSearchHandler
       description: Handles web, news and weather search queries
       url: http://127.0.0.1:18201/search
-      enabled: true
+      enabled: false
 
     - name: BashMCPServer
       description: Executes bash commands and searches documents on the server
@@ -98,7 +98,7 @@ mcp:
     - name: TurtlebotMotionServerV2
       description: Connects to TurtleBot motion MCP server V2
       url: "http://localhost:18205/turtlebot-motion-v2"
-      enabled: true
+      enabled: false
 
     - name: TurtlebotCameraServerV2
       description: Connects to TurtleBot camera MCP server V2
@@ -108,7 +108,7 @@ mcp:
     - name: TurtlebotVisionServerV2
       description: Connects to TurtleBot vision MCP server V2
       url: "http://localhost:18207/turtlebot-vision-v2"
-      enabled: true
+      enabled: false
 
     - name: TurtlebotLidarServerV2
       description: Connects to TurtleBot LiDAR MCP server V2

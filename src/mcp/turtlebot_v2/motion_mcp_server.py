@@ -31,6 +31,7 @@ BASE_URL = os.getenv("MOTION_SERVER_BASE_URL", "http://10.158.38.26:5001").rstri
 HTTP_TIMEOUT_S = _env_float("MOTION_TIMEOUT_S", 2.0)
 MAX_LINEAR = abs(_env_float("MOTION_MAX_LINEAR", 0.2))
 MAX_ANGULAR = abs(_env_float("MOTION_MAX_ANGULAR", 1.0))
+ANGULAR_SIGN = _env_float("MOTION_ANGULAR_SIGN", -1.0)
 
 MOVE_PATH = "/move"
 STOP_PATH = "/stop"
@@ -208,7 +209,8 @@ async def tbot_motion_move(
     angular_f = _validate_finite("angular", angular)
 
     linear_cmd = _clamp(linear_f, MAX_LINEAR)
-    angular_cmd = _clamp(angular_f, MAX_ANGULAR)
+    angular_cmd_unmapped = _clamp(angular_f, MAX_ANGULAR)
+    angular_cmd = angular_cmd_unmapped * ANGULAR_SIGN
 
     command_version = _reserve_motion_command()
     result = await _post_json(MOVE_PATH, {"linear": linear_cmd, "angular": angular_cmd})
@@ -249,7 +251,9 @@ async def tbot_motion_move(
         **result,
         "requested": {"linear": linear_f, "angular": angular_f},
         "commanded": {"linear": linear_cmd, "angular": angular_cmd},
-        "was_clamped": (linear_cmd != linear_f) or (angular_cmd != angular_f),
+        "commanded_input_frame": {"linear": linear_cmd, "angular": angular_cmd_unmapped},
+        "angular_sign": ANGULAR_SIGN,
+        "was_clamped": (linear_cmd != linear_f) or (angular_cmd_unmapped != angular_f),
         "limits": {"max_linear": MAX_LINEAR, "max_angular": MAX_ANGULAR},
         "base_url": BASE_URL,
         "endpoint": MOVE_PATH,
@@ -284,4 +288,3 @@ def run(
 
 if __name__ == "__main__":
     run()
-

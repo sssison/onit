@@ -72,12 +72,14 @@ def test_post_json_request_error():
 
 
 def test_motion_move_clamps_and_verifies_health():
+    expected_angular = (-motion_v2.MAX_ANGULAR) * motion_v2.ANGULAR_SIGN
+
     async def fake_post(path, payload=None):
         assert path == motion_v2.MOVE_PATH
         return {"status": "updated", "linear": payload["linear"], "angular": payload["angular"]}
 
     async def fake_health():
-        return {"linear": motion_v2.MAX_LINEAR, "angular": -motion_v2.MAX_ANGULAR}, None
+        return {"linear": motion_v2.MAX_LINEAR, "angular": expected_angular}, None
 
     with patch.object(motion_v2, "_post_json", side_effect=fake_post), patch.object(
         motion_v2, "_try_get_health", side_effect=fake_health
@@ -86,7 +88,8 @@ def test_motion_move_clamps_and_verifies_health():
 
     assert result["was_clamped"] is True
     assert result["commanded"]["linear"] == motion_v2.MAX_LINEAR
-    assert result["commanded"]["angular"] == -motion_v2.MAX_ANGULAR
+    assert result["commanded"]["angular"] == expected_angular
+    assert result["commanded_input_frame"]["angular"] == -motion_v2.MAX_ANGULAR
     assert result["verification"]["command_matches_health"] is True
 
 

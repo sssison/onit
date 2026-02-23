@@ -78,22 +78,15 @@ def test_collision_returns_stop_when_front_too_close():
     assert result["directions"]["front"]["collision"] is True
 
 
-def test_find_clear_heading_selects_best_clearance():
+def test_sector_stats_return_expected_percentiles():
     scan = _make_scan()
-    for index in range(len(scan["ranges"])):
-        scan["ranges"][index] = 0.5
+    scan["ranges"][_index_from_deg(scan, -1.0)] = 1.0
+    scan["ranges"][_index_from_deg(scan, 0.0)] = 2.0
+    scan["ranges"][_index_from_deg(scan, 1.0)] = 3.0
 
-    for angle in range(25, 36):
-        scan["ranges"][_index_from_deg(scan, float(angle))] = 2.0
-
-    result = lidar_v2._find_clear_heading_from_scan(
-        scan=scan,
-        search_min_deg=-60.0,
-        search_max_deg=60.0,
-        step_deg=10.0,
-        sector_half_width_deg=5.0,
-    )
-
-    assert result["status"] == "ok"
-    assert result["best_heading_deg"] == 30.0
-    assert result["best_clearance_m"] == 2.0
+    stats = lidar_v2._compute_sector_stats(scan, center_deg=0.0, half_width_deg=2.0)
+    assert stats["status"] == "ok"
+    assert stats["min_m"] == 1.0
+    assert stats["p10_m"] == 1.0
+    assert stats["p50_m"] == 2.0
+    assert stats["p90_m"] == 2.0

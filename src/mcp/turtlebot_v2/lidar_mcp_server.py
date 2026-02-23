@@ -461,7 +461,7 @@ if RCLPY_AVAILABLE:
                 if self._latest_scan is None:
                     raise RuntimeError(
                         f"No scan received yet on topic '{self._topic_name}'. "
-                        "Use tbot_lidar_wait_for_scan() or confirm the publisher is active."
+                        "Use tbot_lidar_health() or confirm the publisher is active."
                     )
                 age_s = max(0.0, time.monotonic() - float(self._latest_scan["received_mono_s"]))
                 return {
@@ -568,96 +568,6 @@ async def tbot_lidar_health() -> dict[str, Any]:
 
 
 @mcp_lidar_v2.tool()
-async def tbot_lidar_wait_for_scan(timeout_s: float = 5.0) -> dict[str, Any]:
-    """Wait up to timeout_s for a newer LiDAR scan and return subscriber status."""
-    timeout_value = _ensure_finite("timeout_s", timeout_s)
-    if timeout_value <= 0:
-        raise ValueError("timeout_s must be > 0")
-
-    node = _get_lidar_node()
-    initial_scan_count = node.snapshot()["scan_count"]
-    scan_arrived = await asyncio.to_thread(node.wait_for_scan, timeout_value, initial_scan_count)
-    snapshot = node.snapshot()
-    status = "online" if snapshot["scan_present"] else "waiting_for_scans"
-    return {
-        "status": status,
-        "ros_available": RCLPY_AVAILABLE,
-        "scan_arrived": scan_arrived,
-        "wait_timeout_s": timeout_value,
-        "initial_scan_count": initial_scan_count,
-        **snapshot,
-    }
-
-
-@mcp_lidar_v2.tool()
-async def tbot_lidar_get_scan_summary(
-    include_ranges: bool = False,
-    max_points: int = 180,
-    include_intensities: bool = False,
-) -> dict[str, Any]:
-    """Return LiDAR metadata and optional downsampled range/intensity arrays."""
-    if max_points <= 0:
-        raise ValueError("max_points must be > 0")
-
-    scan = _get_lidar_node().latest_scan()
-    ranges = scan["ranges"]
-    num_points = len(ranges)
-
-    valid_pairs: list[tuple[int, float]] = []
-    for index, value in enumerate(ranges):
-        if _is_valid_range(value, scan["range_min"], scan["range_max"]):
-            valid_pairs.append((index, float(value)))
-
-    valid_points = len(valid_pairs)
-    invalid_points = num_points - valid_points
-    min_range_m = None
-    closest_angle_deg = None
-    if valid_pairs:
-        closest_index, closest_range = min(valid_pairs, key=lambda pair: pair[1])
-        min_range_m = closest_range
-        closest_angle_deg = _angle_for_index_deg(scan, closest_index)
-
-    response: dict[str, Any] = {
-        "topic": scan["topic"],
-        "frame_id": scan["frame_id"],
-        "scan_count": scan["scan_count"],
-        "stamp_s": scan["stamp_s"],
-        "received_unix_s": scan["received_unix_s"],
-        "age_s": scan["age_s"],
-        "angle_min_deg": math.degrees(scan["angle_min"]),
-        "angle_max_deg": math.degrees(scan["angle_max"]),
-        "angle_increment_deg": math.degrees(scan["angle_increment"]),
-        "range_min_m": scan["range_min"],
-        "range_max_m": scan["range_max"],
-        "num_points": num_points,
-        "valid_points": valid_points,
-        "invalid_points": invalid_points,
-        "min_range_m": min_range_m,
-        "closest_angle_deg": closest_angle_deg,
-    }
-
-    if include_ranges:
-        stride = max(1, int(math.ceil(num_points / max_points)))
-        sampled_indices = list(range(0, num_points, stride))
-        response["sampled_stride"] = stride
-        response["sampled_count"] = len(sampled_indices)
-        response["sampled_angles_deg"] = [_angle_for_index_deg(scan, index) for index in sampled_indices]
-        response["sampled_ranges_m"] = [
-            float(ranges[index]) if _is_valid_range(ranges[index], scan["range_min"], scan["range_max"]) else None
-            for index in sampled_indices
-        ]
-
-        intensities = scan.get("intensities", [])
-        if include_intensities:
-            if len(intensities) == num_points:
-                response["sampled_intensities"] = [float(intensities[index]) for index in sampled_indices]
-            else:
-                response["sampled_intensities"] = []
-
-    return response
-
-
-@mcp_lidar_v2.tool()
 async def tbot_lidar_distance_at_angle(
     angle_deg: float = 0.0,
     window_deg: float = 2.0,
@@ -724,40 +634,6 @@ async def tbot_lidar_check_collision(
     )
 
 
-@mcp_lidar_v2.tool()
-async def tbot_lidar_find_clear_heading(
-    search_min_deg: float = -90.0,
-    search_max_deg: float = 90.0,
-    step_deg: float = 5.0,
-    sector_half_width_deg: float = 10.0,
-) -> dict[str, Any]:
-    """Find the heading with the best sector clearance within a search range."""
-    search_min = _ensure_finite("search_min_deg", search_min_deg)
-    search_max = _ensure_finite("search_max_deg", search_max_deg)
-    step = _ensure_finite("step_deg", step_deg)
-    sector_half_width = _ensure_non_negative("sector_half_width_deg", sector_half_width_deg)
-
-    if step <= 0:
-        raise ValueError("step_deg must be > 0")
-    if search_min > search_max:
-        raise ValueError("search_min_deg must be <= search_max_deg")
-
-    result = _find_clear_heading_from_scan(
-        scan=_get_lidar_node().latest_scan(),
-        search_min_deg=search_min,
-        search_max_deg=search_max,
-        step_deg=step,
-        sector_half_width_deg=sector_half_width,
-    )
-    return {
-        **result,
-        "search_min_deg": search_min,
-        "search_max_deg": search_max,
-        "step_deg": step,
-        "sector_half_width_deg": sector_half_width,
-    }
-
-
 def run(
     transport: str = "streamable-http",
     host: str = "0.0.0.0",
@@ -785,4 +661,3 @@ def run(
 
 if __name__ == "__main__":
     run()
-

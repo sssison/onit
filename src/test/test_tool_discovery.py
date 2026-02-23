@@ -37,6 +37,16 @@ def _fake_prompt(name="assistant", description="Assistant prompt"):
     return prompt
 
 
+def _fake_resource(name="knowledge", description="Knowledge resource"):
+    """Create a mock resource-like object."""
+    resource = MagicMock(spec=[])
+    resource.name = name
+    resource.description = description
+    resource.inputSchema = {"properties": {"query": {"type": "string"}}}
+    resource.outputSchema = {"properties": {"content": {"type": "string"}}}
+    return resource
+
+
 def _mock_client(tools=None, resources=None, prompts=None):
     """Build a mock fastmcp.Client context manager."""
     client = AsyncMock()
@@ -61,14 +71,20 @@ class TestDiscoverServerTools:
         assert handlers[0].tool_item["function"]["name"] == "search"
 
     @pytest.mark.asyncio
-    async def test_discovers_prompts_with_arguments(self):
+    async def test_ignores_prompts_and_resources(self):
         server = {"name": "Prompts", "url": "http://127.0.0.1:18200/prompts", "enabled": True}
-        mock = _mock_client(prompts=[_fake_prompt("assistant")])
+        mock = _mock_client(prompts=[_fake_prompt("assistant")], resources=[_fake_resource("docs")])
         with patch("lib.tools.Client", return_value=mock):
             handlers = await _discover_server_tools(server)
-        assert len(handlers) == 1
-        props = handlers[0].tool_item["function"]["parameters"]["properties"]
-        assert "task" in props
+        assert len(handlers) == 0
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_only_prompts_and_resources_exist(self):
+        server = {"name": "Mixed", "url": "http://127.0.0.1:18200/mixed", "enabled": True}
+        mock = _mock_client(tools=[], prompts=[_fake_prompt("assistant")], resources=[_fake_resource("docs")])
+        with patch("lib.tools.Client", return_value=mock):
+            handlers = await _discover_server_tools(server)
+        assert handlers == []
 
     @pytest.mark.asyncio
     async def test_skips_disabled_server(self):

@@ -136,6 +136,23 @@ class TestOnItInitialize:
         assert onit.web_google_client_id is None
         assert onit.web_google_client_secret is None
 
+    def test_default_config_distance_profile_servers(self):
+        import yaml
+
+        config_path = os.path.join(os.path.dirname(__file__), "..", "configs", "default.yaml")
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            cfg = yaml.safe_load(config_file)
+
+        servers = {server["name"]: server for server in cfg["mcp"]["servers"]}
+
+        assert servers["PromptsMCPServer"]["enabled"] is True
+        assert servers["TurtlebotCameraServerV2"]["enabled"] is True
+        assert servers["TurtlebotLidarServerV2"]["enabled"] is True
+
+        assert servers["WebSearchHandler"]["enabled"] is False
+        assert servers["TurtlebotMotionServerV2"]["enabled"] is False
+        assert servers["TurtlebotVisionServerV2"]["enabled"] is False
+
 
 # ── OnIt.load_session_history ───────────────────────────────────────────────
 
