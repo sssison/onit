@@ -237,16 +237,16 @@ def _mcp_servers_ready(config_data: dict, timeout: float = 15.0) -> bool:
     return False
 
 
-def _start_mcp_servers_background(extra_configs=None, log_level='ERROR'):
+def _start_mcp_servers_background(log_level='ERROR'):
     """Start MCP servers in a daemon thread. Blocks forever (runs in background)."""
     from .mcp.servers.run import run_servers
     try:
-        run_servers(extra_configs=extra_configs, log_level=log_level)
+        run_servers(log_level=log_level)
     except Exception:
         pass
 
 
-def _ensure_mcp_servers(config_data: dict, extra_configs=None, log_level='ERROR'):
+def _ensure_mcp_servers(config_data: dict, log_level='ERROR'):
     """Start MCP servers if they are not already running, then wait for readiness."""
     from urllib.parse import urlparse
 
@@ -268,7 +268,7 @@ def _ensure_mcp_servers(config_data: dict, extra_configs=None, log_level='ERROR'
     # Start MCP servers in a daemon thread
     mcp_thread = threading.Thread(
         target=_start_mcp_servers_background,
-        args=(extra_configs, log_level),
+        args=(log_level,),
         daemon=True,
     )
     mcp_thread.start()
@@ -325,7 +325,7 @@ def main():
     parser.add_argument('--a2a-file', type=str, default=None,
                         help='File to upload to the A2A server along with the task.')
     parser.add_argument('--a2a-image', type=str, default=None,
-                        help='Image file to send to the A2A server for vision processing.')
+                        help='Image file to send to the A2A server for vision processing (model is a VLM).')
     parser.add_argument('--a2a-loop', action='store_true', default=None,
                         help='Enable A2A loop mode.')
     parser.add_argument('--a2a-period', type=float, default=None,
@@ -341,12 +341,6 @@ def main():
     parser.add_argument('--mcp-sse', type=str, action='append', default=None,
                         help='URL of an external MCP tools server using SSE transport (can be repeated). '
                              'Example: --mcp-sse http://localhost:8080/sse')
-    parser.add_argument('--mcp-config', type=str, action='append', default=None,
-                        help='Path to additional MCP server config YAML (can be repeated). '
-                             'Servers are merged with the default config.')
-    parser.add_argument('--mcp-log-level', default='ERROR',
-                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-                        help='MCP server log level.')
     args = parser.parse_args()
 
     # Client mode: send task to remote A2A server and exit
@@ -474,8 +468,7 @@ def main():
     # Auto-start MCP servers if not already running
     _ensure_mcp_servers(
         config_data,
-        extra_configs=args.mcp_config,
-        log_level=args.mcp_log_level,
+        log_level='DEBUG' if config_data.get('verbose') else 'ERROR',
     )
 
     onit = OnIt(config=config_data)

@@ -33,6 +33,7 @@ Core Tools:
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -341,10 +342,10 @@ def search_directory(
         grep_flags += "E"  # extended regex
         
         # Exclude hidden files unless requested
-        exclude = "" if include_hidden else "--exclude-dir='.*' --exclude='.*'"
+        exclude = "" if include_hidden else "--exclude-dir='.[!.]*' --exclude='.[!.]*'"
         
         # Build command
-        cmd = f"grep {grep_flags} {exclude} --include='{file_pattern}' '{pattern}' . 2>/dev/null | head -n {max_results}"
+        cmd = f"grep {grep_flags} {exclude} --include={shlex.quote(file_pattern)} {shlex.quote(pattern)} . 2>/dev/null | head -n {int(max_results)}"
         
         result = _run_command(cmd, cwd=dir_path)
         
@@ -524,24 +525,53 @@ def find_files(
                 "status": "error"
             })
         
-        # Build find command
-        cmd_parts = ["find", f"'{dir_path}'"]
-        
+        # Validate numeric parameters
+        max_results = int(max_results)
+        if max_results <= 0:
+            max_results = 100
+
+        if max_depth is not None:
+            max_depth = int(max_depth)
+            if max_depth < 0:
+                return json.dumps({"error": "max_depth must be non-negative", "status": "error"})
+
+        if modified_days is not None:
+            modified_days = int(modified_days)
+            if modified_days < 0:
+                return json.dumps({"error": "modified_days must be non-negative", "status": "error"})
+
+        # Validate file_type against allowlist
+        allowed_file_types = {"f", "d", "l", "b", "c", "p", "s"}
+        if file_type and file_type not in allowed_file_types:
+            return json.dumps({
+                "error": f"Invalid file_type: {file_type}. Must be one of: {', '.join(sorted(allowed_file_types))}",
+                "status": "error"
+            })
+
+        # Validate size_filter format
+        if size_filter and not re.match(r'^[+-]?\d+[bcwkMG]?$', size_filter):
+            return json.dumps({
+                "error": f"Invalid size_filter: {size_filter}. Expected format: [+-]N[bcwkMG]",
+                "status": "error"
+            })
+
+        cmd_parts = ["find", shlex.quote(dir_path)]
+
         if max_depth is not None:
             cmd_parts.append(f"-maxdepth {max_depth}")
-        
+
         if file_type:
             cmd_parts.append(f"-type {file_type}")
-        
+
         if name_pattern:
-            cmd_parts.append(f"-name '{name_pattern}'")
-        
+            cmd_parts.append(f"-name {shlex.quote(name_pattern)}")
+
         if size_filter:
             cmd_parts.append(f"-size {size_filter}")
-        
+
         if modified_days is not None:
             cmd_parts.append(f"-mtime -{modified_days}")
-        
+
         cmd = " ".join(cmd_parts) + f" 2>/dev/null | head -n {max_results}"
         
         result = _run_command(cmd, cwd="/")
@@ -624,7 +654,7 @@ def transform_text(
                     "error": f"File not found: {file_path}",
                     "status": "error"
                 })
-            input_source = f"cat '{file_path}'"
+            input_source = f"cat {shlex.quote(file_path)}"
         else:
             # Use a temp file within DATA_PATH (not system temp or home folder)
             tmp_dir = os.path.join(os.path.abspath(os.path.expanduser(DATA_PATH)), "tmp")
@@ -633,15 +663,22 @@ def transform_text(
                 f.write(input_text)
                 temp_path = f.name
             os.chmod(temp_path, 0o600)
-            input_source = f"cat '{temp_path}'"
-        
-        # Build command based on operation
+            input_source = f"cat {shlex.quote(temp_path)}"
+
         if operation == "sed":
-            cmd = f"{input_source} | sed '{expression}'"
+            cmd = f"{input_source} | sed {shlex.quote(expression)}"
         elif operation == "awk":
-            cmd = f"{input_source} | awk '{expression}'"
+            cmd = f"{input_source} | awk {shlex.quote(expression)}"
         elif operation == "tr":
-            cmd = f"{input_source} | tr {expression}"
+            try:
+                tr_args = shlex.split(expression)
+                quoted_tr_args = " ".join(shlex.quote(arg) for arg in tr_args)
+                cmd = f"{input_source} | tr {quoted_tr_args}"
+            except ValueError as e:
+                return json.dumps({
+                    "error": f"Invalid tr expression: {e}",
+                    "status": "error"
+                })
         
         result = _run_command(cmd)
         
@@ -843,7 +880,15 @@ def run(
     logger.info(f"Data path: {DATA_PATH}")
     logger.info("Available tools: search_document, search_directory, extract_tables, find_files, transform_text, get_document_context")
 
-    mcp.run(transport=transport, host=host, port=port, path=path)
+    quiet = 'verbose' not in options
+    if quiet:
+        import uvicorn.config
+        uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn.access"]["level"] = "WARNING"
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+    mcp.run(transport=transport, host=host, port=port, path=path,
+            uvicorn_config={"access_log": False, "log_level": "warning"} if quiet else {})
 
 # =============================================================================
 # SERVER STARTUP

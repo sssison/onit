@@ -26,7 +26,6 @@ timeout: 600
 web_title: "OnIt Chat"
 web: false
 web_port: 9000
-web_share: false
 
 # Google OAuth2 Authentication (Full Redirect Flow)
 # To set up Google OAuth2, follow these steps:

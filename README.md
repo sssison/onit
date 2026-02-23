@@ -271,7 +271,6 @@ onit --a2a-client --a2a-host http://127.0.0.1:9001 --a2a-task "what is the weath
 |------|-------------|---------|
 | `--mcp-host` | Override the host/IP in all MCP server URLs (e.g. `192.168.1.100`) | — |
 | `--mcp-sse` | URL of an external MCP tools server using SSE transport (can be repeated) | — |
-| `--mcp-log-level` | MCP server log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) | `INFO` |
 
 ## Configuration
 
@@ -300,7 +299,6 @@ template_path:                # optional path to custom prompt template YAML
 web_title: "OnIt Chat"
 web: false
 web_port: 9000
-web_share: false
 
 # Google OAuth2 Authentication (optional)
 web_google_client_id:

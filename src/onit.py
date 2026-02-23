@@ -172,7 +172,6 @@ class OnIt(BaseModel):
     task: str | None = Field(default=None)
     web: bool = Field(default=False)
     web_port: int = Field(default=9000)
-    web_share: bool = Field(default=False)
     web_google_client_id: str | None = Field(default=None)
     web_google_client_secret: str | None = Field(default=None)
     web_allowed_emails: list[str] | None = Field(default=None)
@@ -209,7 +208,6 @@ class OnIt(BaseModel):
                     data_path=self.data_path,
                     show_logs=self.show_logs,
                     server_port=self.web_port,
-                    share=self.web_share,
                     google_client_id=self.web_google_client_id,
                     google_client_secret=self.web_google_client_secret,
                     allowed_emails=self.web_allowed_emails,
@@ -325,7 +323,6 @@ class OnIt(BaseModel):
         self.task = self.config_data.get('task', None)
         self.web = self.config_data.get('web', False)
         self.web_port = self.config_data.get('web_port', 9000)
-        self.web_share = self.config_data.get('web_share', False)
         self.web_google_client_id = self.config_data.get('web_google_client_id', None)
         self.web_google_client_secret = self.config_data.get('web_google_client_secret', None)
         # Nullify placeholder credentials so auth is cleanly disabled
@@ -594,7 +591,7 @@ class OnIt(BaseModel):
 
         print(f"A2A server running at http://0.0.0.0:{self.a2a_port}/ (Ctrl+C to stop)")
 
-        config = uvicorn.Config(wrapped_app, host="0.0.0.0", port=self.a2a_port, log_level="info" if self.verbose else "warning")
+        config = uvicorn.Config(wrapped_app, host="0.0.0.0", port=self.a2a_port, log_level="info" if self.verbose else "warning", access_log=self.verbose)
         server = uvicorn.Server(config)
         await server.serve()
 

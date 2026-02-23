@@ -44,15 +44,24 @@ def run_server(name:str,
         bool: True if server started successfully, False otherwise
     """
     try:
+        # Suppress noisy uvicorn logs in child processes unless verbose.
+        # Override LOGGING_CONFIG *before* uvicorn is imported so that
+        # dictConfig() never resets the access logger back to INFO.
+        if 'verbose' not in options:
+            import uvicorn.config
+            uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn.access"]["level"] = "WARNING"
+            logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+            logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
         if 'stdio' in transport:
             logger.info(f"Starting {name} server using stdio transport")
         else:
             logger.info(f"Starting {name} server at {host}:{port} with path {path} using transport {transport}")
-        
+
         if not module:
             logger.error(f"No module specified for server {name}")
             return False
-            
+
         # Import the server module dynamically
         # Built-in shorthand: names starting with "tasks." or "src." are
         # resolved relative to the onit package.  Everything else is treated
@@ -85,21 +94,16 @@ def run_server(name:str,
         logger.error(f"Error starting {name} server: {e}")
         return False
 
-def load_config(config_path=None, extra_configs=None):
+def load_config(config_path=None):
     """
-    Load server configuration from YAML file, optionally merging additional
-    configs supplied via ``--mcp-config``.
+    Load server configuration from YAML file.
 
     Args:
         config_path (str, optional): Path to the base configuration file.
             Defaults to the built-in ``configs/default.yaml``.
-        extra_configs (list[str], optional): Paths to additional YAML config
-            files whose ``servers`` lists are appended to the base config.
-            This allows third parties to add their own MCP servers without
-            modifying the default config.
 
     Returns:
-        dict: Merged configuration with a ``servers`` list.
+        dict: Configuration with a ``servers`` list.
     """
     if config_path is None:
         config_path = os.path.join(os.path.dirname(__file__), "configs", "default.yaml")
@@ -115,19 +119,6 @@ def load_config(config_path=None, extra_configs=None):
     except yaml.YAMLError as e:
         logger.error(f"Error parsing YAML configuration: {e}")
         raise
-
-    # Merge additional third-party configs (--mcp-config)
-    for extra_path in (extra_configs or []):
-        logger.info(f"Merging extra MCP config from {extra_path}")
-        if not os.path.exists(extra_path):
-            raise FileNotFoundError(f"Extra config file not found at {extra_path}")
-        try:
-            with open(extra_path, 'r') as f:
-                extra = yaml.safe_load(f)
-        except yaml.YAMLError as e:
-            logger.error(f"Error parsing extra YAML config {extra_path}: {e}")
-            raise
-        config.setdefault('servers', []).extend(extra.get('servers', []))
 
     return config
 
@@ -166,17 +157,24 @@ def prepare_server_args(config):
             
     return server_args
 
-def run_servers(config_path=None, extra_configs=None, log_level='INFO'):
+def run_servers(config_path=None, log_level='INFO'):
     """Run MCP servers based on a configuration file.
 
     Args:
         config_path (str, optional): Path to YAML config. Defaults to built-in default.
-        extra_configs (list[str], optional): Additional config files to merge (--mcp-config).
         log_level (str): Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
     """
     logging.getLogger().setLevel(getattr(logging, log_level))
+    # Suppress noisy uvicorn access logs unless in DEBUG mode
+    if log_level != 'DEBUG':
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     try:
-        config = load_config(config_path, extra_configs=extra_configs)
+        config = load_config(config_path)
+        # Propagate verbose flag into each server's options so child processes
+        # (which get fresh logging configs) can suppress uvicorn access logs.
+        if log_level == 'DEBUG':
+            for server in config.get('servers', []):
+                server.setdefault('options', {})['verbose'] = True
         server_args = prepare_server_args(config)
 
         if not server_args:

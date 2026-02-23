@@ -249,7 +249,6 @@ class WebChatUI:
         data_path: str = "~/.onit/data",
         show_logs: bool = False,
         server_port: int = 9000,
-        share: bool = False,
         google_client_id: Optional[str] = None,
         google_client_secret: Optional[str] = None,
         allowed_emails: Optional[list[str]] = None,
@@ -264,7 +263,6 @@ class WebChatUI:
         self.show_logs = show_logs
         self.verbose = verbose
         self.server_port = server_port
-        self.share = share
         self.console = NullConsole()
 
         # authentication
@@ -1004,7 +1002,8 @@ class WebChatUI:
                 fastapi_app,
                 host="0.0.0.0",
                 port=self.server_port,
-                log_level="info" if self.verbose else "warning"
+                log_level="info" if self.verbose else "warning",
+                access_log=self.verbose,
             )
 
         thread = threading.Thread(target=_run, daemon=True)

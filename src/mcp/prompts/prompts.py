@@ -102,5 +102,13 @@ def run(
     else:
         logger.setLevel(logging.ERROR)
 
+    quiet = 'verbose' not in options
+    if quiet:
+        import uvicorn.config
+        uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn.access"]["level"] = "WARNING"
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
     logger.info(f"Starting Prompts MCP Server at {host}:{port}{path}")
-    mcp_prompts.run(transport=transport, host=host, port=port, path=path)
+    mcp_prompts.run(transport=transport, host=host, port=port, path=path,
+                    uvicorn_config={"access_log": False, "log_level": "warning"} if quiet else {})

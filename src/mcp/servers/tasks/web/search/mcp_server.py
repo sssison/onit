@@ -706,7 +706,15 @@ def run(
     logger.info(f"Data path: {DATA_PATH}")
     logger.info("4 Core Tools: search, fetch_content, get_weather, extract_pdf_images")
 
-    mcp.run(transport=transport, host=host, port=port, path=path)
+    quiet = 'verbose' not in options
+    if quiet:
+        import uvicorn.config
+        uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn.access"]["level"] = "WARNING"
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+    mcp.run(transport=transport, host=host, port=port, path=path,
+            uvicorn_config={"access_log": False, "log_level": "warning"} if quiet else {})
 
 
 if __name__ == "__main__":

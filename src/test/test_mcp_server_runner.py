@@ -46,31 +46,6 @@ class TestLoadConfig:
             for s in result["servers"]:
                 assert s.get("transport") == "sse"
 
-    def test_extra_configs_merged(self, tmp_path):
-        """Extra configs should be merged into the base config."""
-        base = {"servers": [{"name": "Base", "module": "tasks.base", "port": 9000}]}
-        extra = {"servers": [{"name": "Extra", "module": "tasks.extra", "port": 9001}]}
-
-        base_file = tmp_path / "base.yaml"
-        base_file.write_text(yaml.dump(base))
-        extra_file = tmp_path / "extra.yaml"
-        extra_file.write_text(yaml.dump(extra))
-
-        result = load_config(str(base_file), extra_configs=[str(extra_file)])
-        assert len(result["servers"]) == 2
-        names = [s["name"] for s in result["servers"]]
-        assert "Base" in names
-        assert "Extra" in names
-
-    def test_extra_config_missing_file_raises(self, tmp_path):
-        """Missing extra config file should raise FileNotFoundError."""
-        base = {"servers": []}
-        base_file = tmp_path / "base.yaml"
-        base_file.write_text(yaml.dump(base))
-
-        with pytest.raises(FileNotFoundError):
-            load_config(str(base_file), extra_configs=["/nonexistent/extra.yaml"])
-
 
 # ── prepare_server_args ─────────────────────────────────────────────────────
 

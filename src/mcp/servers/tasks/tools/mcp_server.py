@@ -441,7 +441,14 @@ def run(
                  "search_directory, extract_tables, find_files, transform_text, "
                  "get_document_context")
 
-    mcp.run(transport=transport, host=host, port=port, path=path)
+    if not verbose:
+        import uvicorn.config
+        uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn.access"]["level"] = "WARNING"
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+    mcp.run(transport=transport, host=host, port=port, path=path,
+            uvicorn_config={"access_log": False, "log_level": "warning"} if not verbose else {})
 
 
 if __name__ == "__main__":
