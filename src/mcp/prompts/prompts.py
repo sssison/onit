@@ -15,6 +15,7 @@
 """
 
 from fastmcp import FastMCP
+from datetime import datetime
 import yaml
 import uuid
 import logging
@@ -37,6 +38,7 @@ async def assistant_instruction(task: str,
 
    data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / session_id)
    Path(data_path).mkdir(parents=True, exist_ok=True)
+   current_date = datetime.now().strftime("%Y-%m-%d")
 
    default_template = """
 Think step by step on how to complete the following task enclosed in <task> and </task> tags.
@@ -48,6 +50,7 @@ Think step by step on how to complete the following task enclosed in <task> and 
 Execute the step by step action plan to complete the task.
 If you need additional information or the task is unclear given the context and previous interactions, ask for clarification.
 If you know the answer, provide it right away. Else, use the tools to complete the action plan.
+Today's date is `{current_date}`. Use this as context for any date-related reasoning.
 Avoid repeated tool call sequences that do not lead to progress. 
 
 ## File Operations Policy
@@ -71,6 +74,7 @@ Avoid repeated tool call sequences that do not lead to progress.
 
    instruction = template.format(
       task=task,
+      current_date=current_date,
       data_path=data_path,
       session_id=session_id
    )
