@@ -32,8 +32,8 @@ def _env_float(name: str, default: float) -> float:
 
 
 VISION_TIMEOUT_S = _env_float("TBOT_VISION_TIMEOUT_S", 60.0)
-DEFAULT_VISION_HOST = os.getenv("TBOT_VISION_HOST") or os.getenv("ONIT_HOST", "http://127.0.0.1:8000/v1")
-DEFAULT_VISION_MODEL = os.getenv("TBOT_VISION_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
+DEFAULT_VISION_HOST = os.getenv("TBOT_VISION_HOST") or os.getenv("ONIT_HOST", "http://202.92.159.240:8001/v1")
+DEFAULT_VISION_MODEL = os.getenv("TBOT_VISION_MODEL", "nvidia/Cosmos-Reason2-8B")
 DEFAULT_VISION_API_KEY = os.getenv("TBOT_VISION_API_KEY", "EMPTY")
 
 

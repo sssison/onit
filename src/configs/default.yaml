@@ -1,9 +1,9 @@
 serving:
   # Set via env var ONIT_HOST or --host CLI flag
-  host: http://202.92.159.240:8002/v1
+  host: http://202.92.159.240:8000/v1
   host_key: EMPTY  # API key. For OpenRouter set here or via OPENROUTER_API_KEY env var
-  #model: Qwen/Qwen3-30B-A3B-Instruct-2507
-  model: Qwen/Qwen3-VL-8B-Instruct
+  model: Qwen/Qwen3-30B-A3B-Instruct-2507
+  #model: Qwen/Qwen3-VL-8B-Instruct
   #model: nvidia/Cosmos-Reason2-8B
   think: true
   max_tokens: 262144
@@ -83,16 +83,6 @@ mcp:
     - name: GoogleWorkspaceMCPServer
       description: Creates Google Workspace documents such as Google Docs, Sheets, and Slides
       url: http://127.0.0.1:18204/workspace
-      enabled: false
-
-    - name: TurtlebotMotionServer
-      description: Connects to turtlebot motion server
-      url: "http://localhost:18205/turtlebot-motion"
-      enabled: false
-
-    - name: TurtlebotCameraServer
-      description: Connects to turtlebot camera server
-      url: "http://localhost:18206/turtlebot-camera"
       enabled: false
 
     - name: TurtlebotMotionServerV2
