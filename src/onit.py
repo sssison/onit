@@ -180,6 +180,8 @@ class OnIt(BaseModel):
     a2a_port: int = Field(default=9001)
     a2a_name: str = Field(default="OnIt")
     a2a_description: str = Field(default="An intelligent agent for task automation and assistance.")
+    gateway: bool = Field(default=False)
+    gateway_token: str | None = Field(default=None, exclude=True)
     prompt_url: str | None = Field(default=None, exclude=True)
     file_server_url: str | None = Field(default=None, exclude=True)
     chat_ui: Any | None = Field(default=None, exclude=True)
@@ -216,7 +218,12 @@ class OnIt(BaseModel):
                     verbose=self.verbose,
                 )
             else:
-                banner = "OnIt Agent to Agent Server" if self.a2a else "OnIt Chat Interface"
+                if self.a2a:
+                    banner = "OnIt Agent to Agent Server"
+                elif self.gateway:
+                    banner = "OnIt Telegram Gateway"
+                else:
+                    banner = "OnIt Chat Interface"
                 self.chat_ui = ChatUI(self.theme, show_logs=self.show_logs, banner_title=banner)
         
     def initialize(self):
@@ -336,6 +343,8 @@ class OnIt(BaseModel):
         self.a2a_port = self.config_data.get('a2a_port', 9001)
         self.a2a_name = self.config_data.get('a2a_name', 'OnIt')
         self.a2a_description = self.config_data.get('a2a_description', 'An intelligent agent for task automation and assistance.')
+        self.gateway = self.config_data.get('gateway', False)
+        self.gateway_token = self.config_data.get('gateway_token', None)
     def load_session_history(self, max_turns: int = 20) -> list[dict]:
         """Load recent session history from the JSONL session file.
 
@@ -605,6 +614,22 @@ class OnIt(BaseModel):
         config = uvicorn.Config(wrapped_app, host="0.0.0.0", port=self.a2a_port, log_level="info" if self.verbose else "warning", access_log=self.verbose)
         server = uvicorn.Server(config)
         await server.serve()
+
+    def run_gateway_sync(self) -> None:
+        """Run OnIt as a Telegram bot gateway (blocking, owns the event loop)."""
+        from .ui.telegram import TelegramGateway
+
+        if not self.gateway_token:
+            raise ValueError(
+                "Telegram gateway requires a bot token. Set TELEGRAM_BOT_TOKEN "
+                "environment variable or gateway_token in config."
+            )
+        self.input_queue = asyncio.Queue(maxsize=10)
+        self.output_queue = asyncio.Queue(maxsize=10)
+        self.safety_queue = asyncio.Queue(maxsize=10)
+        self.status = "running"
+        gateway = TelegramGateway(self, self.gateway_token)
+        gateway.run_sync()
 
     async def client_to_agent(self) -> None:
         """Handle client to agent communication"""

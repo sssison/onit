@@ -54,6 +54,7 @@ That's it. MCP servers start automatically, and you get an interactive terminal 
 
 ```bash
 onit --web                          # Gradio web UI on port 9000
+onit --gateway                      # Telegram bot gateway
 onit --a2a                          # A2A server on port 9001
 onit --client --task "your task"    # Send a task to an A2A server and print the answer
 ```
@@ -122,6 +123,12 @@ The LLM provider is auto-detected from the host URL. If it contains `openrouter.
 | `--web` | Launch Gradio web UI | `false` |
 | `--web-port` | Gradio web UI port | `9000` |
 
+**Telegram Gateway:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--gateway` | Run as a Telegram bot gateway (requires `TELEGRAM_BOT_TOKEN` env var) | `false` |
+
 **A2A (Agent-to-Agent):**
 
 | Flag | Description | Default |
@@ -172,6 +179,30 @@ Connect to additional external MCP servers:
 
 ```bash
 onit --mcp-sse http://localhost:8080/sse --mcp-sse http://192.168.1.50:9090/sse
+```
+
+### Telegram Gateway
+
+Chat with OnIt remotely from the Telegram mobile app using a Telegram bot.
+
+**Setup:**
+
+1. Create a bot with [BotFather](https://t.me/BotFather) on Telegram (`/newbot`) and copy the token.
+2. Set the token and start the gateway:
+
+```bash
+export TELEGRAM_BOT_TOKEN=your-bot-token-here
+onit --gateway
+```
+
+3. Open Telegram, find your bot, and send a message. OnIt will respond using the full agent with all its tools.
+
+You can also send photos — the bot will pass them to the LLM for vision processing (if your model supports it). The photo caption is used as the prompt (defaults to "Describe this image." if no caption is provided).
+
+**Install the gateway dependency separately if not using `[all]`:**
+
+```bash
+pip install "onit[gateway]"
 ```
 
 ### A2A Protocol
@@ -333,11 +364,11 @@ Browse available models at [openrouter.ai/models](https://openrouter.ai/models) 
 ┌─────────────────────────────────────────────────────┐
 │                     OnIt (src/onit.py)              │
 │                                                     │
-│  ┌─────────-┐  ┌──────────┐  ┌──────────┐           │
-│  │ ChatUI   │  │ WebChatUI│  │ A2A      │           │
-│  │(terminal)│  │ (Gradio) │  │ Server   │           │
-│  └────┬────-┘  └────┬─────┘  └────┬─────┘           │
-│       └─────────┬───┘             │                 │
+│  ┌─────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
+│  │ ChatUI  │ │ WebChatUI│ │ Telegram │ │ A2A      │  │
+│  │(terminal│ │ (Gradio) │ │ Gateway  │ │ Server   │  │
+│  └────┬────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘  │
+│       └─────────┬─┘            │             │       │
 │                 ▼                 ▼                 │
 │          client_to_agent()  /  process_task()       │
 │                 │                                   │
@@ -378,7 +409,8 @@ onit/
 │   │       └── chat.py         # LLM interface (vLLM + OpenRouter)
 │   ├── ui/
 │   │   ├── text.py             # Rich terminal UI
-│   │   └── web.py              # Gradio web UI
+│   │   ├── web.py              # Gradio web UI
+│   │   └── telegram.py         # Telegram bot gateway
 │   └── test/                   # Test suite (pytest)
 ```
 

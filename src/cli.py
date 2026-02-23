@@ -4,6 +4,7 @@ CLI entry point for the OnIt agent.
 Usage:
     onit                        # interactive terminal chat
     onit --web                  # Gradio web UI
+    onit --gateway              # Telegram bot gateway
     onit --config my.yaml       # custom config
     onit --a2a                  # A2A server mode
     onit --client --a2a-task "question"  # send task to A2A server (default: localhost:9001)
@@ -331,6 +332,10 @@ def main():
     parser.add_argument('--a2a-period', '--period', type=float, default=None,
                         help='Period in seconds between A2A loop iterations (default: 10).')
 
+    # Gateway options
+    parser.add_argument('--gateway', action='store_true', default=None,
+                        help='Run as a Telegram bot gateway (requires TELEGRAM_BOT_TOKEN env var).')
+
     # MCP options
     parser.add_argument('--mcp-host', type=str, default=None,
                         help='Override the host/IP in all MCP server URLs (e.g. 192.168.1.100).')
@@ -393,6 +398,7 @@ def main():
         'template_path': 'template_path',
         'a2a': 'a2a',
         'a2a_port': 'a2a_port',
+        'gateway': 'gateway',
     }
     for arg_name, config_key in arg_to_config.items():
         value = getattr(args, arg_name, None)
@@ -465,6 +471,15 @@ def main():
               file=sys.stderr)
         os.environ['ONIT_DISABLE_WEATHER'] = '1'
 
+    # Check TELEGRAM_BOT_TOKEN for gateway mode
+    if config_data.get('gateway'):
+        gateway_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+        if not gateway_token:
+            print("Error: --gateway requires TELEGRAM_BOT_TOKEN environment variable.",
+                  file=sys.stderr)
+            sys.exit(1)
+        config_data['gateway_token'] = gateway_token
+
     # Auto-start MCP servers if not already running
     _ensure_mcp_servers(
         config_data,
@@ -472,7 +487,10 @@ def main():
     )
 
     onit = OnIt(config=config_data)
-    asyncio.run(onit.run())
+    if config_data.get('gateway'):
+        onit.run_gateway_sync()
+    else:
+        asyncio.run(onit.run())
 
 
 if __name__ == "__main__":

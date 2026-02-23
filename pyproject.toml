@@ -39,6 +39,9 @@ web = [
     "gradio",
     "google-auth",
 ]
+gateway = [
+    "python-telegram-bot",
+]
 mcp-servers = [
     "beautifulsoup4",
     "python-dateutil",
@@ -56,6 +59,7 @@ test = [
 ]
 all = [
     "onit[web]",
+    "onit[gateway]",
     "onit[mcp-servers]",
     "onit[test]",
 ]
