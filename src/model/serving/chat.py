@@ -85,6 +85,39 @@ def _parse_tool_call_from_content(content: str, tool_registry) -> Optional[dict]
     return None
 
 
+def _extract_base64_file(tool_response: str, data_path: str) -> str:
+    """Detect base64-encoded file data in a tool response and save it to disk.
+
+    If the response is JSON containing a 'file_data_base64' field, decode it,
+    write the file to data_path, and return a cleaned JSON string with the
+    base64 data replaced by the local file path.  Otherwise return the
+    original response unchanged.
+    """
+    try:
+        data = json.loads(tool_response)
+    except (json.JSONDecodeError, TypeError):
+        return tool_response
+
+    if not isinstance(data, dict) or "file_data_base64" not in data:
+        return tool_response
+
+    file_data_b64 = data.pop("file_data_base64")
+    file_name = data.get("file_name", f"{uuid.uuid4()}.bin")
+    safe_name = os.path.basename(file_name)
+    filepath = os.path.join(data_path, safe_name)
+    os.makedirs(data_path, exist_ok=True)
+
+    file_bytes = base64.b64decode(file_data_b64)
+    fd = os.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(file_bytes)
+
+    data["saved_path"] = filepath
+    data["download_url"] = f"/uploads/{safe_name}"
+    data["file_size_bytes"] = len(file_bytes)
+    return json.dumps(data)
+
+
 async def chat(host: str = "http://127.0.0.1:8001/v1",
          host_key: str = "EMPTY",
          model: str = "Qwen/Qwen3-8B",
@@ -100,6 +133,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     tools = tool_registry.get_tool_items() if tool_registry else []
     chat_ui = kwargs['chat_ui'] if 'chat_ui' in kwargs else None
     verbose = kwargs['verbose'] if 'verbose' in kwargs else False
+    data_path = kwargs.get('data_path', '')
     max_tokens = kwargs.get('max_tokens', 262144)
     memories = kwargs.get('memories', None)
     prompt_intro = kwargs.get('prompt_intro', "I am a helpful AI assistant. My name is OnIt.")
@@ -241,6 +275,8 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                                 elif verbose:
                                     print(f"{function_name} timed out after {timeout}s")
                             tool_response = "" if tool_response is None else str(tool_response)
+                            if data_path and "file_data_base64" in tool_response:
+                                tool_response = _extract_base64_file(tool_response, data_path)
                             tool_message = {'role': 'tool', 'content': tool_response, 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
                             messages.append(tool_message)
                             truncated = tool_response[:200] + "..." if len(tool_response) > 200 else tool_response
@@ -296,6 +332,9 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                             if chat_ui:
                                 chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
                         tool_response = "" if tool_response is None else str(tool_response)
+                        # Extract base64 file data from tool response and save to disk
+                        if data_path and "file_data_base64" in tool_response:
+                            tool_response = _extract_base64_file(tool_response, data_path)
                         tool_message = {'role': 'tool', 'content': tool_response, 'name': tool.function.name, 'parameters': function_arguments, "tool_call_id": tool.id,}
                         messages.append(tool_message)
 

@@ -405,6 +405,7 @@ class OnIt(BaseModel):
             'console': None, 'chat_ui': None,
             'cursor': AGENT_CURSOR, 'memories': None,
             'verbose': self.verbose,
+            'data_path': self.data_path,
             'max_tokens': self.model_serving.get('max_tokens', 262144),
             'session_history': self.load_session_history(),
         }
@@ -470,6 +471,7 @@ class OnIt(BaseModel):
                           'cursor': AGENT_CURSOR,
                           'memories': None,
                           'verbose': self.verbose,
+                          'data_path': self.data_path,
                           'max_tokens': self.model_serving.get('max_tokens', 262144),
                           'session_history': self.load_session_history()}
                 last_response = await chat(host=self.model_serving["host"],
@@ -737,6 +739,7 @@ class OnIt(BaseModel):
                           'cursor': AGENT_CURSOR,
                           'memories': None,
                           'verbose': self.verbose,
+                          'data_path': self.data_path,
                           'max_tokens': self.model_serving.get('max_tokens', 262144),
                           'session_history': self.load_session_history()}
                 last_response = await chat(host=self.model_serving["host"],
