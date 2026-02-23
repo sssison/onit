@@ -114,3 +114,8 @@ mcp:
       description: Connects to TurtleBot LiDAR MCP server V2
       url: "http://localhost:18208/turtlebot-lidar-v2"
       enabled: true
+
+    - name: TurtlebotSearchServerV2
+      description: Connects to TurtleBot composite search MCP server V2
+      url: "http://localhost:18209/turtlebot-search-v2"
+      enabled: true

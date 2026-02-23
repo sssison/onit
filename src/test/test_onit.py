@@ -148,6 +148,7 @@ class TestOnItInitialize:
         assert servers["PromptsMCPServer"]["enabled"] is True
         assert servers["TurtlebotCameraServerV2"]["enabled"] is True
         assert servers["TurtlebotLidarServerV2"]["enabled"] is True
+        assert servers["TurtlebotSearchServerV2"]["enabled"] is True
 
         assert servers["WebSearchHandler"]["enabled"] is False
         assert servers["TurtlebotMotionServerV2"]["enabled"] is False
