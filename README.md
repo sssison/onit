@@ -17,7 +17,7 @@ Or from source:
 ```bash
 git clone https://github.com/sibyl-oracles/onit.git
 cd onit
-pip install -e ".[all]"
+pip install -e ".[all]" --upgrade
 ```
 
 ### 2. Configure
