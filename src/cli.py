@@ -322,13 +322,13 @@ def main():
                         help='A2A server URL for client mode (default: http://localhost:9001).')
     parser.add_argument('--a2a-task', '--task', type=str, default=None,
                         help='Task to execute in A2A loop or client mode.')
-    parser.add_argument('--a2a-file', type=str, default=None,
+    parser.add_argument('--a2a-file', '--file', type=str, default=None,
                         help='File to upload to the A2A server along with the task.')
-    parser.add_argument('--a2a-image', type=str, default=None,
+    parser.add_argument('--a2a-image', '--image', type=str, default=None,
                         help='Image file to send to the A2A server for vision processing (model is a VLM).')
-    parser.add_argument('--a2a-loop', action='store_true', default=None,
+    parser.add_argument('--a2a-loop', '--loop', action='store_true', default=None,
                         help='Enable A2A loop mode.')
-    parser.add_argument('--a2a-period', type=float, default=None,
+    parser.add_argument('--a2a-period', '--period', type=float, default=None,
                         help='Period in seconds between A2A loop iterations (default: 10).')
 
     # MCP options
