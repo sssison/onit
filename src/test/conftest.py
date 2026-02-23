@@ -31,12 +31,12 @@ def sample_config_dict(tmp_path):
             "servers": [
                 {
                     "name": "PromptsMCPServer",
-                    "url": "http://127.0.0.1:18200/prompts",
+                    "url": "http://127.0.0.1:18200/sse",
                     "enabled": True,
                 },
                 {
-                    "name": "TestServer",
-                    "url": "http://127.0.0.1:18201/test",
+                    "name": "ToolsMCPServer",
+                    "url": "http://127.0.0.1:18201/sse",
                     "enabled": True,
                 },
             ],
@@ -55,7 +55,7 @@ def sample_config_dict(tmp_path):
 @pytest.fixture
 def make_tool_item():
     """Factory to build a tool_item dict."""
-    def _make(name="test_tool", description="A test tool", url="http://127.0.0.1:18201/test"):
+    def _make(name="test_tool", description="A test tool", url="http://127.0.0.1:18201/sse"):
         return {
             "type": "function",
             "function": {
@@ -74,8 +74,8 @@ def mock_tool_registry(make_tool_item):
     from type.tools import ToolRegistry, ToolHandler
 
     registry = ToolRegistry()
-    for name, url in [("search", "http://127.0.0.1:18201/search"),
-                      ("bash", "http://127.0.0.1:18202/bash")]:
+    for name, url in [("search", "http://127.0.0.1:18201/sse"),
+                      ("bash", "http://127.0.0.1:18201/sse")]:
         handler = ToolHandler(url=url, tool_item=make_tool_item(name=name, url=url))
         registry.register(handler)
     return registry

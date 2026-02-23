@@ -1004,7 +1004,7 @@ class WebChatUI:
                 fastapi_app,
                 host="0.0.0.0",
                 port=self.server_port,
-                log_level="warning"  # Changed from "info" to reduce log verbosity
+                log_level="info" if self.verbose else "warning"
             )
 
         thread = threading.Thread(target=_run, daemon=True)

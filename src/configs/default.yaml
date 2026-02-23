@@ -60,25 +60,10 @@ mcp:
   servers:
     - name: PromptsMCPServer
       description: Provides prompt templates for instruction generation
-      url: http://127.0.0.1:18200/prompts
+      url: http://127.0.0.1:18200/sse
       enabled: true
 
-    - name: WebSearchHandler
-      description: Handles web, news and weather search queries
-      url: http://127.0.0.1:18201/search
+    - name: ToolsMCPServer
+      description: Web search, bash commands, file operations, and document tools
+      url: http://127.0.0.1:18201/sse
       enabled: true
-
-    - name: BashMCPServer
-      description: Executes bash commands and searches documents on the server
-      url: http://127.0.0.1:18202/bash
-      enabled: true
-
-    - name: OfficeMCPServer
-      description: Creates Microsoft Office documents such as Word, Excel, and PowerPoint
-      url: http://127.0.0.1:18203/office
-      enabled: true
-
-    - name: GoogleWorkspaceMCPServer
-      description: Creates Google Workspace documents such as Google Docs, Sheets, and Slides
-      url: http://127.0.0.1:18204/workspace
-      enabled: false

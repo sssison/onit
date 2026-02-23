@@ -821,10 +821,10 @@ def get_document_context(
 # =============================================================================
 
 def run(
-    transport: str = "streamable-http",
+    transport: str = "sse",
     host: str = "0.0.0.0",
     port: int = 18202,
-    path: str = "/docsearch",
+    path: str = "/sse",
     options: dict = {}
 ) -> None:
     """Run the MCP server."""

@@ -9,7 +9,10 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from src.cli import _find_default_config, _send_task, _download_files, _upload_file
+from src.cli import (
+    _find_default_config, _send_task, _download_files, _upload_file,
+    _is_port_open, _mcp_servers_ready, _ensure_mcp_servers,
+)
 
 
 # ── _find_default_config ────────────────────────────────────────────────────
@@ -173,3 +176,80 @@ class TestSendTask:
             result = _send_task("http://localhost:9001", "question")
 
         assert "unexpected" in result
+
+
+# ── _is_port_open ──────────────────────────────────────────────────────────
+
+class TestIsPortOpen:
+    def test_returns_true_for_open_port(self):
+        with patch("src.cli.socket.create_connection") as mock_conn:
+            mock_sock = MagicMock()
+            mock_conn.return_value = mock_sock
+            assert _is_port_open("127.0.0.1", 8080) is True
+            mock_sock.close.assert_called_once()
+
+    def test_returns_false_for_closed_port(self):
+        with patch("src.cli.socket.create_connection", side_effect=ConnectionRefusedError):
+            assert _is_port_open("127.0.0.1", 9999) is False
+
+
+# ── _mcp_servers_ready ─────────────────────────────────────────────────────
+
+class TestMcpServersReady:
+    def test_returns_true_when_all_servers_up(self):
+        config = {
+            "mcp": {
+                "servers": [
+                    {"name": "A", "url": "http://127.0.0.1:18200/sse", "enabled": True},
+                    {"name": "B", "url": "http://127.0.0.1:18201/sse", "enabled": True},
+                ]
+            }
+        }
+        with patch("src.cli._is_port_open", return_value=True):
+            assert _mcp_servers_ready(config, timeout=1.0) is True
+
+    def test_returns_true_when_no_servers(self):
+        assert _mcp_servers_ready({}, timeout=1.0) is True
+
+    def test_returns_false_when_server_unreachable(self):
+        config = {
+            "mcp": {
+                "servers": [
+                    {"name": "A", "url": "http://127.0.0.1:18200/sse", "enabled": True},
+                ]
+            }
+        }
+        with patch("src.cli._is_port_open", return_value=False):
+            assert _mcp_servers_ready(config, timeout=0.5) is False
+
+
+# ── _ensure_mcp_servers ────────────────────────────────────────────────────
+
+class TestEnsureMcpServers:
+    def test_skips_start_when_already_running(self):
+        config = {
+            "mcp": {
+                "servers": [
+                    {"name": "A", "url": "http://127.0.0.1:18200/sse", "enabled": True},
+                ]
+            }
+        }
+        with patch("src.cli._is_port_open", return_value=True), \
+             patch("src.cli.threading.Thread") as mock_thread:
+            _ensure_mcp_servers(config)
+            mock_thread.assert_not_called()
+
+    def test_starts_servers_when_not_running(self):
+        config = {
+            "mcp": {
+                "servers": [
+                    {"name": "A", "url": "http://127.0.0.1:18200/sse", "enabled": True},
+                ]
+            }
+        }
+        mock_thread_instance = MagicMock()
+        with patch("src.cli._is_port_open", return_value=False), \
+             patch("src.cli.threading.Thread", return_value=mock_thread_instance), \
+             patch("src.cli._mcp_servers_ready", return_value=True):
+            _ensure_mcp_servers(config)
+            mock_thread_instance.start.assert_called_once()

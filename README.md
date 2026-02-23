@@ -19,7 +19,7 @@ OnIt is intended as lean AI agent framework. The design philosophy adheres to th
 
 - **Interactive chat** — Rich terminal UI with input history, theming, and execution logs
 - **Web UI** — Gradio-based browser interface with file upload, copy buttons, and real-time polling
-- **MCP tool integration** — Automatic tool discovery from any number of MCP servers (web search, bash, office documents, Google Workspace)
+- **MCP tool integration** — Automatic tool discovery from any number of MCP servers (web search, bash, file operations) with support for external SSE servers via `--mcp-sse`
 - **A2A protocol** — Run OnIt as an A2A server so other agents can send tasks and receive responses
 - **Loop mode** — Execute a fixed task on a configurable timer (useful for monitoring and periodic workflows)
 - **Prompt templates** — Customizable YAML-based instruction templates per persona
@@ -57,8 +57,8 @@ OnIt is intended as lean AI agent framework. The design philosophy adheres to th
             ┌────────────┼────────────┐
             ▼            ▼            ▼
      ┌───────────┐ ┌──────────┐ ┌──────────┐
-     │ Web Search│ │  Bash    │ │  Office  │  ...
-     │ MCP Server│ │MCP Server│ │MCP Server│
+     │  Prompts  │ │  Tools   │ │ External │  ...
+     │ MCP Server│ │MCP Server│ │MCP (SSE) │
      └───────────┘ └──────────┘ └──────────┘
 ```
 
@@ -72,7 +72,7 @@ OnIt is intended as lean AI agent framework. The design philosophy adheres to th
 | `Chat` | `src/model/serving/chat.py` | LLM interface via OpenAI-compatible API. Supports private vLLM and OpenRouter.ai models. Handles tool calling loops, thinking mode, retries, and safety interrupts. |
 | `Tool discovery` | `src/lib/tools.py` | Connects to each MCP server URL, discovers available tools, and builds a unified tool registry. |
 | `Prompts` | `src/mcp/prompts/prompts.py` | FastMCP-based prompt engineering. Supports custom YAML templates per persona. |
-| `MCP servers` | `src/mcp/servers/` | Pre-built MCP servers for web search, bash, Microsoft Office, and Google Workspace. |
+| `MCP servers` | `src/mcp/servers/` | Pre-built MCP servers for web search, bash, and file operations. |
 
 ## Installation
 
@@ -136,18 +136,17 @@ docker run -it --rm -v $(pwd)/configs:/app/configs --env-file .env onit --config
 
 ### Docker Compose
 
-Start the MCP servers, web UI, and A2A server together:
+Start the web UI and A2A server together:
 
 ```bash
 docker compose up --build
 ```
 
-This launches three services defined in `docker-compose.yml`:
-- **onit-mcp** — MCP servers on ports 18200-18204
-- **onit-web** — Web UI on port 9000 (depends on MCP servers)
-- **onit-a2a** — A2A server on port 9001 (depends on MCP servers)
+This launches services defined in `docker-compose.yml`:
+- **onit-web** — Web UI on port 9000
+- **onit-a2a** — A2A server on port 9001
 
-The web and A2A services automatically use `--mcp-host onit-mcp` to route MCP requests to the MCP container via Docker networking.
+MCP servers are started automatically within each container.
 
 > **Note:** Pass API keys via an `.env` file or individual `-e KEY=value` flags. Never bake secrets into the image.
 
@@ -191,40 +190,9 @@ serving:
 
 > The provider is auto-detected: if the host URL contains `openrouter.ai`, the API key is read from `host_key` in the config or the `OPENROUTER_API_KEY` environment variable. All other hosts default to vLLM with no key required.
 
-### 2. Start MCP servers
+### 2. Run the agent
 
-MCP servers must be running before launching the agent. Start all enabled servers with:
-
-```bash
-# Default config (src/mcp/servers/configs/default.yaml)
-onit --mcp
-
-# Custom config
-onit --mcp --config path/to/mcp_servers.yaml
-
-# With debug logging
-onit --mcp --config path/to/mcp_servers.yaml --mcp-log-level DEBUG
-```
-
-This starts all enabled MCP servers defined in the config file. Each server runs in its own process. The MCP server config structure is:
-
-```yaml
-servers:
-  - name: WebSearchMCPServer
-    module: tasks.web.search
-    description: "MCP server for web search"
-    enabled: true
-    host: 0.0.0.0
-    port: 18201
-    path: /search
-    transport: 'streamable-http'
-```
-
-See `src/mcp/servers/configs/default.yaml` for the full default configuration.
-
-### 3. Run the agent
-
-With environment variables set and MCP servers running, launch the agent:
+With environment variables set, launch the agent. MCP servers are started automatically before the interface launches:
 
 **Terminal chat:**
 
@@ -301,8 +269,8 @@ onit --a2a-client --a2a-host http://127.0.0.1:9001 --a2a-task "what is the weath
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--mcp` | Run MCP servers | `false` |
 | `--mcp-host` | Override the host/IP in all MCP server URLs (e.g. `192.168.1.100`) | — |
+| `--mcp-sse` | URL of an external MCP tools server using SSE transport (can be repeated) | — |
 | `--mcp-log-level` | MCP server log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) | `INFO` |
 
 ## Configuration
@@ -338,19 +306,9 @@ web_share: false
 web_google_client_id:
 web_google_client_secret:
 
-# MCP servers the agent connects to as a client
+# MCP servers the agent connects to as a client (auto-started)
 mcp:
   # mcp_host: 192.168.1.100    # override host/IP in all server URLs (or use --mcp-host)
-  servers:
-    - name: PromptsMCPServer
-      description: Provides prompt templates for instruction generation
-      url: http://127.0.0.1:18200/prompts
-      enabled: true
-
-    - name: WebSearchHandler
-      description: Handles web, news and weather search queries
-      url: http://127.0.0.1:18201/search
-      enabled: true
 ```
 
 ## Custom Prompt Templates
@@ -382,28 +340,27 @@ See example templates in `src/mcp/prompts/prompt_templates/`.
 
 ## MCP Servers
 
+MCP servers are started automatically before the text, web, or A2A interface launches. 
+
 ### Pre-built servers
 
 | Server | Module | Description |
 |--------|--------|-------------|
-| Web Search | `tasks.web.search` | Web, news, and weather search (uses Ollama Search API) |
-| Bash | `tasks.os.bash` | Execute shell commands |
-| Document Search | `tasks.os.filesystem` | Search patterns in documents (text, PDF, markdown) with table extraction |
-| Microsoft Office | `tasks.office.microsoft` | Create Word, Excel, PowerPoint documents |
-| Google Workspace | `tasks.office.google` | Create Google Docs, Sheets, Slides (disabled by default) |
+| Tools | `tasks.tools` | Consolidated server: web search, bash, file operations, and document tools |
 
-> **Google Workspace:** The Google Workspace MCP server is disabled by default in the agent config. To enable it, first set up the Google Workspace API by following the [Google Workspace and OAuth guide](docs/GOOGLE_WORKSPACE_AND_OAUTH.md), then set `enabled: true` for `GoogleWorkspaceMCPServer` in your `configs/default.yaml`.
+### External MCP servers (SSE)
 
-### Running MCP servers
-
-All servers are configured via `src/mcp/servers/configs/default.yaml` and launched with:
+Connect to additional MCP tools servers running externally using `--mcp-sse`:
 
 ```bash
-onit --mcp
+# Single external server
+onit --mcp-sse http://localhost:8080/sse
 
-# Or with a custom config
-onit --mcp --config path/to/mcp_servers.yaml
+# Multiple external servers
+onit --mcp-sse http://localhost:8080/sse --mcp-sse http://192.168.1.50:9090/sse
 ```
+
+Tools from external servers are automatically discovered and merged with the built-in tools.
 
 ## A2A Protocol
 
@@ -633,7 +590,7 @@ onit/
 │   │   └── servers/
 │   │       ├── run.py          # Multi-process server launcher
 │   │       ├── configs/        # Server config YAMLs
-│   │       └── tasks/          # Task servers (web, bash, office)
+│   │       └── tasks/          # Task servers (tools, web, bash, filesystem)
 │   ├── model/
 │   │   └── serving/
 │   │       └── chat.py          # LLM interface (vLLM + OpenRouter)
@@ -664,9 +621,6 @@ pytest src/test/ -v
 
 ## Documentation
 
-- [Google Workspace and OAuth for Gmail](docs/GOOGLE_WORKSPACE_AND_OAUTH.md) — Service account setup, domain-wide delegation, Gmail, and Web UI OAuth
-- [OAuth2 Redirect Flow](docs/OAUTH_REDIRECT_FLOW.md) — Full OAuth2 redirect flow implementation details
-- [OAuth Quick Start](docs/OAUTH_SETUP_QUICK_START.md) — Quick setup checklist for Google OAuth
 - [Web Authentication](docs/WEB_AUTHENTICATION.md) — Web UI authentication reference
 - [Web Deployment](docs/DEPLOYMENT_WEB.md) — Production deployment with HTTP/HTTPS via nginx or Caddy
 

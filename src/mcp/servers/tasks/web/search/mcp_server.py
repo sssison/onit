@@ -286,6 +286,9 @@ def search(
     type: str = "web",
     max_results: int = 5
 ) -> str:
+    if os.environ.get('ONIT_DISABLE_WEB_SEARCH'):
+        return json.dumps({"error": "Web search is disabled. Set OLLAMA_API_KEY or use --ollama-api-key to enable."})
+
     try:
         max_results = min(max_results, 10)
         ddgs = DDGS(timeout=10)
@@ -486,10 +489,17 @@ def get_weather(
 ) -> str:
     global openweather_api_key
 
+    if os.environ.get('ONIT_DISABLE_WEATHER'):
+        return json.dumps({"error": "Weather tool is disabled. Set OPENWEATHERMAP_API_KEY or use --openweathermap-api-key to enable."})
+
+    # Re-check env in case it was set via CLI after module load
+    if not openweather_api_key:
+        openweather_api_key = os.environ.get('OPENWEATHER_API_KEY') or os.environ.get('OPENWEATHERMAP_API_KEY')
+
     if not openweather_api_key:
         return json.dumps({
             "error": "OpenWeather API key not set",
-            "help": "Set OPENWEATHER_API_KEY or OPENWEATHERMAP_API_KEY environment variable"
+            "help": "Set OPENWEATHERMAP_API_KEY or use --openweathermap-api-key CLI option"
         })
 
     try:
@@ -672,10 +682,10 @@ def extract_pdf_images(
 # =============================================================================
 
 def run(
-    transport: str = "streamable-http",
+    transport: str = "sse",
     host: str = "0.0.0.0",
     port: int = 18201,
-    path: str = "/search",
+    path: str = "/sse",
     options: dict = {}
 ) -> None:
     """Run the MCP server."""

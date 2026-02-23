@@ -267,11 +267,13 @@ class OnIt(BaseModel):
         self.user_id = self.config_data.get('user_id', 'default_user')
         self.status = "initialized"
         self.verbose = self.config_data.get('verbose', False)
-        # Suppress tool discovery and MCP client logs unless verbose
+        # Suppress noisy logs unless verbose
         if not self.verbose:
             logging.getLogger("src.lib.tools").setLevel(logging.WARNING)
             logging.getLogger("lib.tools").setLevel(logging.WARNING)
             logging.getLogger("type.tools").setLevel(logging.WARNING)
+            logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+            logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
         # append session id to sessions path
         self.session_id = str(uuid.uuid4())
         self.session_path = os.path.join(self.config_data.get('session_path', '~/.onit/sessions'), f"{self.session_id}.jsonl")
@@ -592,7 +594,7 @@ class OnIt(BaseModel):
 
         print(f"A2A server running at http://0.0.0.0:{self.a2a_port}/ (Ctrl+C to stop)")
 
-        config = uvicorn.Config(wrapped_app, host="0.0.0.0", port=self.a2a_port, log_level="info")
+        config = uvicorn.Config(wrapped_app, host="0.0.0.0", port=self.a2a_port, log_level="info" if self.verbose else "warning")
         server = uvicorn.Server(config)
         await server.serve()
 

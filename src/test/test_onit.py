@@ -30,7 +30,7 @@ def _make_config(tmp_path, overrides=None):
             "servers": [
                 {
                     "name": "PromptsMCPServer",
-                    "url": "http://127.0.0.1:18200/prompts",
+                    "url": "http://127.0.0.1:18200/sse",
                     "enabled": True,
                 },
             ],

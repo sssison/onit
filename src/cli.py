@@ -6,9 +6,7 @@ Usage:
     onit --web                  # Gradio web UI
     onit --config my.yaml       # custom config
     onit --a2a                  # A2A server mode
-    onit --a2a-client --a2a-task "question"  # send task to A2A server (default: localhost:9001)
-    onit --mcp                  # run MCP servers (default config)
-    onit --mcp --config mcp.yaml  # run MCP servers with custom config
+    onit --client --a2a-task "question"  # send task to A2A server (default: localhost:9001)
 """
 
 import argparse
@@ -16,7 +14,10 @@ import asyncio
 import base64
 import json
 import os
+import socket
 import sys
+import time
+import threading
 
 import requests
 import yaml
@@ -193,6 +194,91 @@ def _find_default_config() -> str:
     return "configs/default.yaml"
 
 
+def _is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    """Check if a TCP port is accepting connections."""
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.close()
+        return True
+    except (ConnectionRefusedError, OSError):
+        return False
+
+
+def _mcp_servers_ready(config_data: dict, timeout: float = 15.0) -> bool:
+    """Wait for all enabled MCP servers to be reachable.
+
+    Parses the agent config's mcp.servers list and checks each URL's port.
+    Returns True if all servers respond within timeout, False otherwise.
+    """
+    from urllib.parse import urlparse
+
+    servers = config_data.get('mcp', {}).get('servers', [])
+    endpoints = []
+    for s in servers:
+        if s.get('enabled', True) and s.get('url'):
+            parsed = urlparse(s['url'])
+            host = parsed.hostname or '127.0.0.1'
+            port = parsed.port or 80
+            endpoints.append((host, port, s.get('name', 'Unknown')))
+
+    if not endpoints:
+        return True
+
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        all_up = True
+        for host, port, _ in endpoints:
+            if not _is_port_open(host, port):
+                all_up = False
+                break
+        if all_up:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _start_mcp_servers_background(extra_configs=None, log_level='ERROR'):
+    """Start MCP servers in a daemon thread. Blocks forever (runs in background)."""
+    from .mcp.servers.run import run_servers
+    try:
+        run_servers(extra_configs=extra_configs, log_level=log_level)
+    except Exception:
+        pass
+
+
+def _ensure_mcp_servers(config_data: dict, extra_configs=None, log_level='ERROR'):
+    """Start MCP servers if they are not already running, then wait for readiness."""
+    from urllib.parse import urlparse
+
+    # Check if servers are already running by probing the first enabled server port
+    servers = config_data.get('mcp', {}).get('servers', [])
+    already_running = True
+    for s in servers:
+        if s.get('enabled', True) and s.get('url'):
+            parsed = urlparse(s['url'])
+            host = parsed.hostname or '127.0.0.1'
+            port = parsed.port or 80
+            if not _is_port_open(host, port, timeout=0.3):
+                already_running = False
+                break
+
+    if already_running and servers:
+        return
+
+    # Start MCP servers in a daemon thread
+    mcp_thread = threading.Thread(
+        target=_start_mcp_servers_background,
+        args=(extra_configs, log_level),
+        daemon=True,
+    )
+    mcp_thread.start()
+
+    # Wait for all servers to be reachable
+    if not _mcp_servers_ready(config_data, timeout=15.0):
+        print("Warning: some MCP servers may not have started in time.",
+              file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="onit",
@@ -229,7 +315,8 @@ def main():
                         help='Run as an A2A protocol server.')
     parser.add_argument('--a2a-port', type=int, default=None,
                         help='A2A server port (default: 9001).')
-    parser.add_argument('--a2a-client', action='store_true', default=False,
+    parser.add_argument('--client', '--a2a-client', action='store_true', default=False,
+                        dest='a2a_client',
                         help='Client mode: send a task to a remote OnIt A2A server and print the answer.')
     parser.add_argument('--a2a-host', type=str, default='http://localhost:9001',
                         help='A2A server URL for client mode (default: http://localhost:9001).')
@@ -245,25 +332,27 @@ def main():
                         help='Period in seconds between A2A loop iterations (default: 10).')
 
     # MCP options
-    parser.add_argument('--mcp', action='store_true', default=False,
-                        help='Run MCP servers.')
     parser.add_argument('--mcp-host', type=str, default=None,
                         help='Override the host/IP in all MCP server URLs (e.g. 192.168.1.100).')
-    parser.add_argument('--mcp-log-level', default='INFO',
+    parser.add_argument('--ollama-api-key', type=str, default=None,
+                        help='Ollama API key for web search. Overrides OLLAMA_API_KEY env var.')
+    parser.add_argument('--openweathermap-api-key', type=str, default=None,
+                        help='OpenWeatherMap API key for weather tool. Overrides OPENWEATHERMAP_API_KEY env var.')
+    parser.add_argument('--mcp-sse', type=str, action='append', default=None,
+                        help='URL of an external MCP tools server using SSE transport (can be repeated). '
+                             'Example: --mcp-sse http://localhost:8080/sse')
+    parser.add_argument('--mcp-config', type=str, action='append', default=None,
+                        help='Path to additional MCP server config YAML (can be repeated). '
+                             'Servers are merged with the default config.')
+    parser.add_argument('--mcp-log-level', default='ERROR',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='MCP server log level.')
     args = parser.parse_args()
 
-    # MCP server mode: run MCP servers and exit
-    if args.mcp:
-        from .mcp.servers.run import run_servers
-        run_servers(config_path=args.config, log_level=args.mcp_log_level)
-        return
-
     # Client mode: send task to remote A2A server and exit
     if args.a2a_client:
         if not args.a2a_task:
-            print("Error: --a2a-client requires --a2a-task", file=sys.stderr)
+            print("Error: --client requires --a2a-task", file=sys.stderr)
             sys.exit(1)
         # Validate image file if provided
         if args.a2a_image:
@@ -328,6 +417,17 @@ def main():
     if args.mcp_host:
         config_data.setdefault('mcp', {})['mcp_host'] = args.mcp_host
 
+    # --mcp-sse adds external MCP servers to the servers list
+    if args.mcp_sse:
+        servers = config_data.setdefault('mcp', {}).setdefault('servers', [])
+        for i, url in enumerate(args.mcp_sse):
+            servers.append({
+                'name': f'ExternalSSE_{i}',
+                'description': f'External MCP server at {url}',
+                'url': url,
+                'enabled': True,
+            })
+
     # Check that essential environment variables are set
     serving = config_data.get('serving', {})
     host = serving.get('host') or os.environ.get('ONIT_HOST')
@@ -341,10 +441,42 @@ def main():
             missing.append('OPENROUTER_API_KEY (or set serving.host_key in config)')
 
     if missing:
-        print("Warning: missing environment variable(s):", file=sys.stderr)
+        print("Error: missing required configuration:", file=sys.stderr)
         for var in missing:
             print(f"  - {var}", file=sys.stderr)
-        print("Set them in your .env file or environment before running.", file=sys.stderr)
+        print("\nSet via environment variable, CLI option (--host), or in your config YAML.", file=sys.stderr)
+        sys.exit(1)
+
+    # Check OLLAMA_API_KEY for web search support
+    ollama_api_key = args.ollama_api_key or os.environ.get('OLLAMA_API_KEY')
+    if ollama_api_key:
+        os.environ['OLLAMA_API_KEY'] = ollama_api_key
+    else:
+        print("Warning: OLLAMA_API_KEY is not set. Web search tool will be disabled.",
+              file=sys.stderr)
+        print("Set via environment variable or --ollama-api-key CLI option.",
+              file=sys.stderr)
+        os.environ['ONIT_DISABLE_WEB_SEARCH'] = '1'
+
+    # Check OPENWEATHERMAP_API_KEY for weather tool support
+    weather_api_key = (args.openweathermap_api_key
+                       or os.environ.get('OPENWEATHERMAP_API_KEY')
+                       or os.environ.get('OPENWEATHER_API_KEY'))
+    if weather_api_key:
+        os.environ['OPENWEATHERMAP_API_KEY'] = weather_api_key
+    else:
+        print("Warning: OPENWEATHERMAP_API_KEY is not set. Weather tool will be disabled.",
+              file=sys.stderr)
+        print("Set via environment variable or --openweathermap-api-key CLI option.",
+              file=sys.stderr)
+        os.environ['ONIT_DISABLE_WEATHER'] = '1'
+
+    # Auto-start MCP servers if not already running
+    _ensure_mcp_servers(
+        config_data,
+        extra_configs=args.mcp_config,
+        log_level=args.mcp_log_level,
+    )
 
     onit = OnIt(config=config_data)
     asyncio.run(onit.run())

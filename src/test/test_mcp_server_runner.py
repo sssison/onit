@@ -31,14 +31,45 @@ class TestLoadConfig:
         with pytest.raises(FileNotFoundError):
             load_config("/nonexistent/config.yaml")
 
-    def test_default_config_exists(self):
-        """The built-in default config should be loadable."""
+    def test_default_config_has_two_servers(self):
+        """The built-in default config should have PromptsMCPServer and ToolsMCPServer."""
         default_path = os.path.join(
             os.path.dirname(__file__), "..", "mcp", "servers", "configs", "default.yaml"
         )
         if os.path.exists(default_path):
             result = load_config(default_path)
             assert "servers" in result
+            names = [s["name"] for s in result["servers"]]
+            assert "PromptsMCPServer" in names
+            assert "ToolsMCPServer" in names
+            assert len(result["servers"]) == 2
+            for s in result["servers"]:
+                assert s.get("transport") == "sse"
+
+    def test_extra_configs_merged(self, tmp_path):
+        """Extra configs should be merged into the base config."""
+        base = {"servers": [{"name": "Base", "module": "tasks.base", "port": 9000}]}
+        extra = {"servers": [{"name": "Extra", "module": "tasks.extra", "port": 9001}]}
+
+        base_file = tmp_path / "base.yaml"
+        base_file.write_text(yaml.dump(base))
+        extra_file = tmp_path / "extra.yaml"
+        extra_file.write_text(yaml.dump(extra))
+
+        result = load_config(str(base_file), extra_configs=[str(extra_file)])
+        assert len(result["servers"]) == 2
+        names = [s["name"] for s in result["servers"]]
+        assert "Base" in names
+        assert "Extra" in names
+
+    def test_extra_config_missing_file_raises(self, tmp_path):
+        """Missing extra config file should raise FileNotFoundError."""
+        base = {"servers": []}
+        base_file = tmp_path / "base.yaml"
+        base_file.write_text(yaml.dump(base))
+
+        with pytest.raises(FileNotFoundError):
+            load_config(str(base_file), extra_configs=["/nonexistent/extra.yaml"])
 
 
 # ── prepare_server_args ─────────────────────────────────────────────────────
@@ -48,7 +79,7 @@ class TestPrepareServerArgs:
         config = {
             "servers": [
                 {"name": "A", "module": "tasks.a", "enabled": True, "port": 9000,
-                 "host": "0.0.0.0", "path": "/a", "transport": "streamable-http"},
+                 "host": "0.0.0.0", "path": "/a", "transport": "sse"},
                 {"name": "B", "module": "tasks.b", "enabled": False, "port": 9001},
                 {"name": "C", "module": "tasks.c", "port": 18200,
                  "host": "0.0.0.0", "path": "/c"},
@@ -98,7 +129,7 @@ class TestRunServer:
 
         with patch("builtins.__import__", return_value=mock_module):
             result = run_server(
-                name="Test", transport="streamable-http",
+                name="Test", transport="sse",
                 host="0.0.0.0", port=9000, path="/test",
                 module="tasks.test", options={}
             )
@@ -108,7 +139,7 @@ class TestRunServer:
     def test_run_server_import_error(self):
         with patch("builtins.__import__", side_effect=ImportError("no module")):
             result = run_server(
-                name="Bad", transport="streamable-http",
+                name="Bad", transport="sse",
                 host="0.0.0.0", port=9000, path="/bad",
                 module="tasks.nonexistent", options={}
             )
@@ -116,7 +147,7 @@ class TestRunServer:
 
     def test_run_server_no_module(self):
         result = run_server(
-            name="Empty", transport="streamable-http",
+            name="Empty", transport="sse",
             host="0.0.0.0", port=9000, path="/empty",
             module="", options={}
         )
