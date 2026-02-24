@@ -466,7 +466,7 @@ class OnIt(BaseModel):
             except Exception:
                 pass
             return response
-        return "Error: No response from model."
+        return "I am sorry. Can you rephrase the question or provide more details?"
 
     async def run_loop(self) -> None:
         """Run the OnIt agent in loop mode, executing a task repeatedly."""

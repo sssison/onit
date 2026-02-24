@@ -204,7 +204,22 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
 
     if chat_ui:
         chat_ui.add_log(f"Starting chat with model: {model}", level="info")
+
+    MAX_CHAT_ITERATIONS = 25
+    MAX_REPEATED_TOOL_CALLS = 3
+    iteration_count = 0
+    tool_call_history = []  # list of (name, args_json) tuples
+
     while True:
+        iteration_count += 1
+        if iteration_count > MAX_CHAT_ITERATIONS:
+            msg = "I was unable to complete your request after many attempts. Please try rephrasing your question or providing additional details."
+            if chat_ui:
+                chat_ui.add_log(f"Chat loop exceeded {MAX_CHAT_ITERATIONS} iterations, stopping.", level="warning")
+            elif verbose:
+                print(f"Chat loop exceeded {MAX_CHAT_ITERATIONS} iterations, stopping.")
+            return msg
+
         try:
             if not safety_queue.empty():
                 return None
@@ -297,6 +312,16 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     # Tool not found in registry
                     tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found', 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
                     messages.append(tool_message)
+                # Check for repeated tool calls
+                call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
+                tool_call_history.append(call_key)
+                if tool_call_history.count(call_key) >= MAX_REPEATED_TOOL_CALLS:
+                    msg = f"I noticed I'm repeatedly calling the same tool ({function_name}) with identical arguments. This suggests I'm stuck. Please try rephrasing your question or providing additional details."
+                    if chat_ui:
+                        chat_ui.add_log(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", level="warning")
+                    elif verbose:
+                        print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
+                    return msg
                 continue  # loop back for the model to generate the final response
 
             if "</think>" in last_response:
@@ -355,3 +380,13 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 # Tool not found in registry
                 tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found', 'name': function_name, 'parameters': function_arguments, "tool_call_id": tool.id}
                 messages.append(tool_message)
+            # Check for repeated tool calls
+            call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
+            tool_call_history.append(call_key)
+            if tool_call_history.count(call_key) >= MAX_REPEATED_TOOL_CALLS:
+                msg = f"I noticed I'm repeatedly calling the same tool ({function_name}) with identical arguments. This suggests I'm stuck. Please try rephrasing your question or providing additional details."
+                if chat_ui:
+                    chat_ui.add_log(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", level="warning")
+                elif verbose:
+                    print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
+                return msg
