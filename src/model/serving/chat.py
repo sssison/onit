@@ -80,8 +80,7 @@ def _parse_tool_call_from_content(content: str, tool_registry) -> Optional[dict]
     except json.JSONDecodeError:
         return None
     if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
-        if obj["name"] in tool_registry.tools:
-            return obj
+        return obj
     return None
 
 

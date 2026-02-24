@@ -165,6 +165,7 @@ class OnIt(BaseModel):
     session_path: str = Field(default="~/.onit/sessions")
     data_path: str = Field(default="")
     template_path: str | None = Field(default=None)
+    documents_path: str | None = Field(default=None)
     timeout: int | None = Field(default=None)
     show_logs: bool = Field(default=False)
     loop: bool = Field(default=False)
@@ -321,6 +322,7 @@ class OnIt(BaseModel):
                 local_ip = "127.0.0.1"
             self.file_server_url = f"http://{local_ip}:{a2a_port}"
         self.template_path = self.config_data.get('template_path', None)
+        self.documents_path = self.config_data.get('documents_path', None)
         self.timeout = self.config_data.get('timeout', None)  # default timeout 300 seconds
         if self.timeout is not None and self.timeout < 0:
             self.timeout = None  # no timeout
@@ -407,6 +409,7 @@ class OnIt(BaseModel):
                 "session_id": self.session_id,
                 "template_path": self.template_path,
                 "file_server_url": self.file_server_url,
+                "documents_path": self.documents_path,
             })
             instruction = instruction.messages[0].content.text
 
@@ -470,7 +473,8 @@ class OnIt(BaseModel):
                     instruction = await prompt_client.get_prompt(self.persona, {"task": self.task,
                                                                                 "session_id": self.session_id,
                                                                                 "template_path": self.template_path,
-                                                                                "file_server_url": self.file_server_url})
+                                                                                "file_server_url": self.file_server_url,
+                                                                                "documents_path": self.documents_path})
                     instruction = instruction.messages[0]
                     instruction = instruction.content.text
 
@@ -668,7 +672,8 @@ class OnIt(BaseModel):
                 instruction = await prompt_client.get_prompt(self.persona, {"task": task,
                                                                             "session_id": self.session_id,
                                                                             "template_path": self.template_path,
-                                                                            "file_server_url": self.file_server_url})
+                                                                            "file_server_url": self.file_server_url,
+                                                                            "documents_path": self.documents_path})
                 instruction = instruction.messages[0]
                 instruction = instruction.content.text
                 

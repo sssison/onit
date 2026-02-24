@@ -298,6 +298,8 @@ def main():
                         help='Request timeout in seconds (-1 for no timeout).')
     parser.add_argument('--template-path', type=str, default=None,
                         help='Path to custom prompt template YAML file.')
+    parser.add_argument('--documents-path', type=str, default=None,
+                        help='Path to local documents directory. The model will search here before the web.')
 
     # Text UI options
     parser.add_argument('--text-theme', type=str, default=None,
@@ -396,6 +398,7 @@ def main():
         'web': 'web',
         'web_port': 'web_port',
         'template_path': 'template_path',
+        'documents_path': 'documents_path',
         'a2a': 'a2a',
         'a2a_port': 'a2a_port',
         'gateway': 'gateway',

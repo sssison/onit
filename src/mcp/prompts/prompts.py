@@ -30,7 +30,8 @@ mcp_prompts = FastMCP("Prompts MCP")
 async def assistant_instruction(task: str,
                                 session_id: str = None,
                                 template_path: str = None,
-                                file_server_url: str = None) -> str:
+                                file_server_url: str = None,
+                                documents_path: str = None) -> str:
    import tempfile
 
    if session_id is None:
@@ -50,8 +51,11 @@ Think step by step on how to complete the following task enclosed in <task> and 
 Execute the step by step action plan to complete the task.
 If you need additional information or the task is unclear given the context and previous interactions, ask for clarification.
 If you know the answer, provide it right away. Else, use the tools to complete the action plan.
-Today's date is `{current_date}`. Use this as context for any date-related reasoning.
 Avoid repeated tool call sequences that do not lead to progress. 
+Today is `{current_date}`.
+For any date-related questions, assume the user is asking about the next upcoming
+occurrence relative to today unless a past date, year, or keywords like **last**,
+ **previous**, or **when was** are explicitly mentioned.
 
 ## File Operations Policy
 - **Working directory**: `{data_path}` — all file operations must use this directory.
@@ -79,7 +83,7 @@ Avoid repeated tool call sequences that do not lead to progress.
       session_id=session_id
    )
 
-   if file_server_url:
+   if file_server_url and file_server_url != "null":
       instruction += f"""
 Files are served by a remote file server at {file_server_url}/uploads/.
 Before reading any file referenced in the task, first download it:
@@ -88,6 +92,11 @@ After creating or saving any output file, upload it back to the file server:
   curl -s -X POST -F 'file=@{data_path}/<filename>' {file_server_url}/uploads/
 Always download before reading and upload after writing.
 When using create_presentation, create_excel, or create_document tools, always pass callback_url="{file_server_url}" so files are automatically uploaded.
+"""
+
+   if documents_path and documents_path != "null":
+      instruction += f"""
+Find and read relevant documents to this task in `{documents_path}` before searching the web.
 """
 
    return instruction
