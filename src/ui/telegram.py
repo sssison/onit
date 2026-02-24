@@ -47,10 +47,10 @@ def _split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
 class TelegramGateway:
     """Telegram bot that routes messages through an OnIt agent instance."""
 
-    def __init__(self, onit, token: str, verbose: bool = False):
+    def __init__(self, onit, token: str, show_logs: bool = False):
         self.onit = onit
         self.token = token
-        self.verbose = verbose
+        self.show_logs = show_logs
         # Per-chat session state: chat_id -> {session_id, session_path, data_path}
         self._chat_sessions: dict[int, dict] = {}
 
@@ -91,7 +91,7 @@ class TelegramGateway:
         chat_id = update.message.chat.id
         session = self._get_chat_session(chat_id)
 
-        if self.verbose:
+        if self.show_logs:
             user = update.message.from_user
             name = user.username or user.first_name or str(user.id)
             print(f"[MSG] {name}: {text}")
@@ -130,7 +130,7 @@ class TelegramGateway:
             except asyncio.CancelledError:
                 pass
 
-        if self.verbose:
+        if self.show_logs:
             print(f"[BOT] {response}")
 
         # Send response, splitting if needed
@@ -144,7 +144,7 @@ class TelegramGateway:
         chat_id = update.message.chat.id
         session = self._get_chat_session(chat_id)
 
-        if self.verbose:
+        if self.show_logs:
             user = update.message.from_user
             name = user.username or user.first_name or str(user.id)
             print(f"[IMG] {name}: {caption}")
@@ -190,7 +190,7 @@ class TelegramGateway:
             except asyncio.CancelledError:
                 pass
 
-        if self.verbose:
+        if self.show_logs:
             print(f"[BOT] {response}")
 
         for chunk in _split_message(response):

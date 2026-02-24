@@ -338,6 +338,8 @@ def main():
     # Gateway options
     parser.add_argument('--gateway', action='store_true', default=None,
                         help='Run as a Telegram bot gateway (requires TELEGRAM_BOT_TOKEN env var).')
+    parser.add_argument('--gateway-show-logs', action='store_true', default=None,
+                        help='Show received messages and bot replies in the terminal (gateway mode only).')
 
     # MCP options
     parser.add_argument('--mcp-host', type=str, default=None,
@@ -404,6 +406,7 @@ def main():
         'a2a': 'a2a',
         'a2a_port': 'a2a_port',
         'gateway': 'gateway',
+        'gateway_show_logs': 'gateway_show_logs',
     }
     for arg_name, config_key in arg_to_config.items():
         value = getattr(args, arg_name, None)

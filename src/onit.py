@@ -347,6 +347,7 @@ class OnIt(BaseModel):
         self.a2a_description = self.config_data.get('a2a_description', 'An intelligent agent for task automation and assistance.')
         self.gateway = self.config_data.get('gateway', False)
         self.gateway_token = self.config_data.get('gateway_token', None)
+        self.gateway_show_logs = self.config_data.get('gateway_show_logs', False)
     def load_session_history(self, max_turns: int = 20, session_path: str | None = None) -> list[dict]:
         """Load recent session history from the JSONL session file.
 
@@ -652,7 +653,7 @@ class OnIt(BaseModel):
         self.output_queue = asyncio.Queue(maxsize=10)
         self.safety_queue = asyncio.Queue(maxsize=10)
         self.status = "running"
-        gateway = TelegramGateway(self, self.gateway_token, verbose=self.verbose)
+        gateway = TelegramGateway(self, self.gateway_token, show_logs=self.gateway_show_logs)
         gateway.run_sync()
 
     async def client_to_agent(self) -> None:
