@@ -47,9 +47,10 @@ def _split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
 class TelegramGateway:
     """Telegram bot that routes messages through an OnIt agent instance."""
 
-    def __init__(self, onit, token: str):
+    def __init__(self, onit, token: str, verbose: bool = False):
         self.onit = onit
         self.token = token
+        self.verbose = verbose
         # Per-chat session state: chat_id -> {session_id, session_path, data_path}
         self._chat_sessions: dict[int, dict] = {}
 
@@ -90,6 +91,11 @@ class TelegramGateway:
         chat_id = update.message.chat.id
         session = self._get_chat_session(chat_id)
 
+        if self.verbose:
+            user = update.message.from_user
+            name = user.username or user.first_name or str(user.id)
+            print(f"[MSG] {name}: {text}")
+
         # Show typing indicator
         await update.message.chat.send_action(ChatAction.TYPING)
 
@@ -124,6 +130,9 @@ class TelegramGateway:
             except asyncio.CancelledError:
                 pass
 
+        if self.verbose:
+            print(f"[BOT] {response}")
+
         # Send response, splitting if needed
         for chunk in _split_message(response):
             await update.message.reply_text(chunk)
@@ -134,6 +143,11 @@ class TelegramGateway:
 
         chat_id = update.message.chat.id
         session = self._get_chat_session(chat_id)
+
+        if self.verbose:
+            user = update.message.from_user
+            name = user.username or user.first_name or str(user.id)
+            print(f"[IMG] {name}: {caption}")
 
         # Show typing indicator
         await update.message.chat.send_action(ChatAction.TYPING)
@@ -176,6 +190,9 @@ class TelegramGateway:
             except asyncio.CancelledError:
                 pass
 
+        if self.verbose:
+            print(f"[BOT] {response}")
+
         for chunk in _split_message(response):
             await update.message.reply_text(chunk)
 
@@ -186,6 +203,12 @@ class TelegramGateway:
         run_polling() manages its own asyncio event loop.  OnIt should call
         this from a dedicated thread or before entering its own asyncio.run().
         """
+        # Suppress noisy library logs; verbose mode uses print() for messages
+        if not self.verbose:
+            logging.getLogger("telegram").setLevel(logging.WARNING)
+            logging.getLogger("httpx").setLevel(logging.WARNING)
+            logging.getLogger("httpcore").setLevel(logging.WARNING)
+
         app = (
             Application.builder()
             .token(self.token)

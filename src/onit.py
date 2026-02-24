@@ -652,7 +652,7 @@ class OnIt(BaseModel):
         self.output_queue = asyncio.Queue(maxsize=10)
         self.safety_queue = asyncio.Queue(maxsize=10)
         self.status = "running"
-        gateway = TelegramGateway(self, self.gateway_token)
+        gateway = TelegramGateway(self, self.gateway_token, verbose=self.verbose)
         gateway.run_sync()
 
     async def client_to_agent(self) -> None:
