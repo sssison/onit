@@ -204,10 +204,9 @@ class TelegramGateway:
         this from a dedicated thread or before entering its own asyncio.run().
         """
         # Suppress noisy library logs; verbose mode uses print() for messages
-        if not self.verbose:
-            logging.getLogger("telegram").setLevel(logging.WARNING)
-            logging.getLogger("httpx").setLevel(logging.WARNING)
-            logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("telegram").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
         app = (
             Application.builder()
