@@ -183,6 +183,7 @@ class OnIt(BaseModel):
     a2a_description: str = Field(default="An intelligent agent for task automation and assistance.")
     gateway: bool = Field(default=False)
     gateway_token: str | None = Field(default=None, exclude=True)
+    gateway_show_logs: bool = Field(default=False)
     prompt_url: str | None = Field(default=None, exclude=True)
     file_server_url: str | None = Field(default=None, exclude=True)
     chat_ui: Any | None = Field(default=None, exclude=True)
