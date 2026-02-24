@@ -166,6 +166,7 @@ class OnIt(BaseModel):
     data_path: str = Field(default="")
     template_path: str | None = Field(default=None)
     documents_path: str | None = Field(default=None)
+    topic: str | None = Field(default=None)
     timeout: int | None = Field(default=None)
     show_logs: bool = Field(default=False)
     loop: bool = Field(default=False)
