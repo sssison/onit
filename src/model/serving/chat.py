@@ -215,7 +215,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
          tool_registry: Optional[Any] = None,
          timeout: int = None,
          stream: bool = False,
-         think: bool = True,
+         think: bool = False,
          safety_queue: Optional[asyncio.Queue] = None,
          **kwargs) -> Optional[str]:
 
@@ -223,7 +223,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     chat_ui = kwargs['chat_ui'] if 'chat_ui' in kwargs else None
     verbose = kwargs['verbose'] if 'verbose' in kwargs else False
     data_path = kwargs.get('data_path', '')
-    max_tokens = kwargs.get('max_tokens', 2048)
+    max_tokens = kwargs.get('max_tokens', 8192)
     memories = kwargs.get('memories', None)
     prompt_intro = kwargs.get('prompt_intro', "I am a helpful AI assistant. My name is OnIt.")
 
@@ -316,12 +316,14 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 model=model,
                 messages=messages,
                 stream=stream,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                temperature=0.8,
+                tool_choice="auto",          # never "required"
+                temperature=0.6,             # official recommendation
+                top_p=0.95,
+                max_tokens=max_tokens,             # cap to prevent runaway generation
                 extra_body={
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    "repetition_penalty": 1.05,
+                    "top_k": 20,             # vLLM extension, important for Qwen3
+                    "repetition_penalty": 1.05,  # helps break repetition loops
+                    "chat_template_kwargs": {"enable_thinking": think},  # if not using CoT
                 },
             )
             if tools: # and not images_bytes:  # vLLM doesn't support tools + images in the same message, so only include tools if no images are present

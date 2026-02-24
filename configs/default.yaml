@@ -3,8 +3,8 @@ serving:
   # host: http://localhost:8000/v1
   # host_key: EMPTY  # API key. For OpenRouter set here or via OPENROUTER_API_KEY env var
   model: Qwen/Qwen3-30B-A3B-Instruct-2507
-  think: true
-  max_tokens: 2048
+  think: false
+  max_tokens: 8192
 
 messages:
   safety_warning:  "Press 'Enter' key to stop all tasks."
@@ -19,7 +19,7 @@ session_path: "~/.onit/sessions"
 template_path:
 
 # number of seconds before a request times out; -1 for no timeout
-timeout: 600
+timeout: -1
 
 # Web UI settings
 web_title: "OnIt Chat"
