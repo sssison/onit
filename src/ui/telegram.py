@@ -77,7 +77,8 @@ class TelegramGateway:
         name = "Assistant"
         await update.message.reply_text(
             f"Hey there! I'm {name}, your friendly AI assistant. "
-            f"Feel free to send me a message or a photo and I'll be happy to help!"
+            f"Feel free to send me a message or a photo and I'll be happy to help!\n\n"
+            f"⚠️ May produce inaccurate information. Verify important details independently."
         )
 
     async def _handle_message(self, update: Update, context) -> None:
