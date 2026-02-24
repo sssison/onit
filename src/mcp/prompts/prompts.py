@@ -40,7 +40,7 @@ async def assistant_instruction(task: str,
 
    data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / session_id)
    Path(data_path).mkdir(parents=True, exist_ok=True)
-   current_date = datetime.now().strftime("%Y-%m-%d")
+   current_date = datetime.now().strftime("%B %d, %Y")
 
    default_template = """
 Think step by step on how to complete the following task enclosed in <task> and </task> tags.
@@ -50,20 +50,14 @@ Think step by step on how to complete the following task enclosed in <task> and 
 </task>
 
 Execute the step by step action plan to complete the task.
-If you need additional information or the task is unclear given the context and previous interactions, ask for clarification.
+If you need additional information, ask for clarification.
 If you know the answer, provide it right away. Else, use the tools to complete the action plan.
-Today is `{current_date}`.
-For any date-related questions, assume the user is asking about the next upcoming
-occurrence relative to today unless a past date, year, or keywords like **last**,
-**previous**, or **when was** are explicitly mentioned.
+Use date today, `{current_date}`, in reasoning requiring date information.
 
 ## File Operations Policy
 - **Working directory**: `{data_path}` — all file operations must use this directory.
 - **Session ID**: `{session_id}` — files created in this session are owned by this session only.
 - **NEVER** create files in the user home directory or any location outside `{data_path}`.
-- All temporary and output files must be saved within `{data_path}`.
-- Files are created with restricted permissions — only the session owner can access them.
-- Other sessions cannot read or write files belonging to this session.
 """
 
    template = default_template
@@ -101,8 +95,7 @@ When using create_presentation, create_excel, or create_document tools, always p
 
    if documents_path and documents_path != "null":
       instruction += f"""
-Find and read all relevant documents (PDF, TXT, DOCX, XLSX, PPTX, and Markdown (MD)) in `{documents_path}`.
-Search the web if you can't find the answer in the documents.
+Start with documents (PDF, TXT, DOCX, XLSX, PPTX, and Markdown (MD)) in `{documents_path}`.
 """
 
    return instruction

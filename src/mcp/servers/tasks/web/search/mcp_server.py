@@ -93,6 +93,17 @@ def _secure_makedirs(dir_path: str) -> None:
     os.makedirs(dir_path, mode=0o700, exist_ok=True)
 
 
+def _validate_required(**kwargs) -> str:
+    """Check for missing required arguments. Returns JSON error string or empty string."""
+    missing = [name for name, value in kwargs.items() if value is None]
+    if missing:
+        return json.dumps({
+            "error": f"Missing required argument(s): {', '.join(missing)}.",
+            "status": "error"
+        })
+    return ""
+
+
 def _get_media_dir() -> str:
     """Get the media directory path within DATA_PATH."""
     return os.path.join(os.path.abspath(os.path.expanduser(DATA_PATH)), "media")
@@ -296,10 +307,12 @@ Args:
 Returns JSON: [{title, snippet, url, source, date}]"""
 )
 def search(
-    query: str,
+    query: str = None,
     type: str = "web",
     max_results: int = 5
 ) -> str:
+    if err := _validate_required(query=query):
+        return err
     if os.environ.get('ONIT_DISABLE_WEB_SEARCH'):
         return json.dumps({"error": "Web search is disabled. Set OLLAMA_API_KEY or use --ollama-api-key to enable."})
 
@@ -352,12 +365,14 @@ Args:
 Returns JSON: {title, url, content, images, videos, downloaded}"""
 )
 def fetch_content(
-    url: str,
+    url: str = None,
     extract_media: bool = True,
     download_media: bool = False,
     output_dir: str = "",
     media_limit: int = 10
 ) -> str:
+    if err := _validate_required(url=url):
+        return err
     try:
         # Normalize URL
         if not url.startswith(("http://", "https://")):
@@ -595,10 +610,12 @@ Args:
 Returns JSON: {pdf_path, output_dir, images: [{path, width, height, format}], image_count, status}"""
 )
 def extract_pdf_images(
-    pdf_path: str,
+    pdf_path: str = None,
     output_dir: str = "",
     min_size: int = 100
 ) -> str:
+    if err := _validate_required(pdf_path=pdf_path):
+        return err
     try:
         import fitz  # PyMuPDF
     except ImportError:

@@ -37,7 +37,8 @@ import shlex
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Annotated, Optional, List, Dict, Any
+from pydantic import Field
 
 from fastmcp import FastMCP
 
@@ -69,6 +70,17 @@ def _truncate_output(text: str, max_size: int = MAX_OUTPUT_SIZE) -> str:
 def _secure_makedirs(dir_path: str) -> None:
     """Create directory with owner-only permissions (0o700)."""
     os.makedirs(dir_path, mode=0o700, exist_ok=True)
+
+
+def _validate_required(**kwargs) -> str:
+    """Check for missing required arguments. Returns JSON error string or empty string."""
+    missing = [name for name, value in kwargs.items() if value is None]
+    if missing:
+        return json.dumps({
+            "error": f"Missing required argument(s): {', '.join(missing)}.",
+            "status": "error"
+        })
+    return ""
 
 
 def _run_command(command: str, cwd: str = ".", timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
@@ -210,26 +222,35 @@ def _get_file_content(file_path: str) -> tuple[str, str]:
 
 @mcp.tool(
     title="Search Document",
-    description="""Search for patterns in a document. Supports text, PDF, and markdown files.
-Uses grep-like pattern matching with context lines around matches.
+    description="""Search for a regex pattern in a single document file. Supports text, PDF, and markdown files.
+Uses grep-like regex pattern matching and returns matching lines with surrounding context.
 
-Args:
+IMPORTANT - Required parameters:
 - path: File path to search (e.g., "~/docs/report.pdf", "README.md")
-- pattern: Search pattern (regex supported)
-- case_sensitive: Case-sensitive search (default: false)
-- context_lines: Lines of context around matches (default: 3)
-- max_matches: Maximum matches to return (default: 50)
+- pattern: Regex search pattern to find in the document (e.g., "error.*timeout", "subjects")
+  Do NOT use 'query' - the parameter name is 'pattern'.
+
+Optional parameters:
+- case_sensitive: Whether search is case-sensitive (default: false)
+- context_lines: Number of lines of context before/after each match (default: 3).
+  Do NOT use 'context_chars' - the parameter name is 'context_lines'.
+- max_matches: Maximum number of matches to return (default: 50).
+  Do NOT use 'max_sections' - the parameter name is 'max_matches'.
+
+Example: search_document(path="report.pdf", pattern="conclusion")
 
 Returns JSON: {matches, total_matches, file, format, status}
 Each match includes: {line_number, match, context_before, context_after}"""
 )
 def search_document(
-    path: str,
-    pattern: str,
-    case_sensitive: bool = False,
-    context_lines: int = 3,
-    max_matches: int = 50
+    path: Annotated[Optional[str], Field(description="File path to search (e.g., '~/docs/report.pdf', 'README.md')")] = None,
+    pattern: Annotated[Optional[str], Field(description="Regex search pattern to find in the document (e.g., 'error.*timeout', 'subjects')")] = None,
+    case_sensitive: Annotated[bool, Field(description="Whether search is case-sensitive")] = False,
+    context_lines: Annotated[int, Field(description="Number of lines of context before/after each match")] = 3,
+    max_matches: Annotated[int, Field(description="Maximum number of matches to return")] = 50
 ) -> str:
+    if err := _validate_required(path=path, pattern=pattern):
+        return err
     try:
         file_path = os.path.abspath(os.path.expanduser(path))
         
@@ -318,13 +339,15 @@ Returns JSON: {results, total_files, total_matches, status}
 Each result includes: {file, line_number, content}"""
 )
 def search_directory(
-    directory: str,
-    pattern: str,
+    directory: Optional[str] = None,
+    pattern: Optional[str] = None,
     file_pattern: str = "*",
     case_sensitive: bool = False,
     include_hidden: bool = False,
     max_results: int = 100
 ) -> str:
+    if err := _validate_required(directory=directory, pattern=pattern):
+        return err
     try:
         dir_path = os.path.abspath(os.path.expanduser(directory))
         
@@ -403,10 +426,12 @@ Returns JSON: {tables, total_tables, file, format, status}
 Each table includes: {headers, rows, row_count, page (for PDF)}"""
 )
 def extract_tables(
-    path: str,
+    path: Optional[str] = None,
     table_index: Optional[int] = None,
     output_format: str = "json"
 ) -> str:
+    if err := _validate_required(path=path):
+        return err
     try:
         file_path = os.path.abspath(os.path.expanduser(path))
         
@@ -634,18 +659,20 @@ Args:
 Returns JSON: {output, operation, expression, status}"""
 )
 def transform_text(
-    input_text: str,
-    operation: str,
-    expression: str,
+    input_text: Optional[str] = None,
+    operation: Optional[str] = None,
+    expression: Optional[str] = None,
     is_file: bool = False
 ) -> str:
+    if err := _validate_required(input_text=input_text, operation=operation, expression=expression):
+        return err
     try:
         if operation not in ["sed", "awk", "tr"]:
             return json.dumps({
                 "error": f"Invalid operation: {operation}. Use 'sed', 'awk', or 'tr'",
                 "status": "error"
             })
-        
+
         # Get input content
         if is_file:
             file_path = os.path.abspath(os.path.expanduser(input_text))
@@ -729,12 +756,14 @@ Returns JSON: {sections, query, file, status}
 Each section includes: {content, relevance_keywords, position}"""
 )
 def get_document_context(
-    path: str,
-    query: str,
+    path: Optional[str] = None,
+    query: Optional[str] = None,
     keywords: Optional[str] = None,
     context_chars: int = 500,
     max_sections: int = 5
 ) -> str:
+    if err := _validate_required(path=path, query=query):
+        return err
     try:
         file_path = os.path.abspath(os.path.expanduser(path))
         

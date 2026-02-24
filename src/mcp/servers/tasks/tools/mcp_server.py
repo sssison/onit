@@ -35,10 +35,13 @@ and document search into a single MCP server.
 14. get_document_context - Extract relevant context from documents
 '''
 
+import json
 import os
 import tempfile
+from typing import Annotated, Optional
 
 from fastmcp import FastMCP
+from pydantic import Field
 
 import logging
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -53,6 +56,17 @@ DATA_PATH = os.path.join(tempfile.gettempdir(), "onit", "data")
 def _secure_makedirs(dir_path: str) -> None:
     """Create directory with owner-only permissions (0o700)."""
     os.makedirs(dir_path, mode=0o700, exist_ok=True)
+
+
+def _validate_required(**kwargs) -> str:
+    """Check for missing required arguments. Returns JSON error string or empty string."""
+    missing = [name for name, value in kwargs.items() if value is None]
+    if missing:
+        return json.dumps({
+            "error": f"Missing required argument(s): {', '.join(missing)}.",
+            "status": "error"
+        })
+    return ""
 
 
 def _init_submodules(data_path: str, verbose: bool = False):
@@ -97,7 +111,9 @@ Args:
 
 Returns JSON: [{title, snippet, url, source, date}]"""
 )
-def search(query: str, type: str = "web", max_results: int = 5) -> str:
+def search(query: Optional[str] = None, type: str = "web", max_results: int = 5) -> str:
+    if err := _validate_required(query=query):
+        return err
     return _search(query=query, type=type, max_results=max_results)
 
 
@@ -115,12 +131,14 @@ Args:
 Returns JSON: {title, url, content, images, videos, downloaded}"""
 )
 def fetch_content(
-    url: str,
+    url: Optional[str] = None,
     extract_media: bool = True,
     download_media: bool = False,
     output_dir: str = "",
     media_limit: int = 10,
 ) -> str:
+    if err := _validate_required(url=url):
+        return err
     return _fetch_content(
         url=url,
         extract_media=extract_media,
@@ -157,7 +175,9 @@ Args:
 
 Returns JSON: {pdf_path, output_dir, images: [{path, width, height, format}], image_count, status}"""
 )
-def extract_pdf_images(pdf_path: str, output_dir: str = "", min_size: int = 100) -> str:
+def extract_pdf_images(pdf_path: Optional[str] = None, output_dir: str = "", min_size: int = 100) -> str:
+    if err := _validate_required(pdf_path=pdf_path):
+        return err
     return _extract_pdf_images(pdf_path=pdf_path, output_dir=output_dir, min_size=min_size)
 
 
@@ -176,8 +196,6 @@ from src.mcp.servers.tasks.os.bash.mcp_server import (
     get_document_context as _get_document_context,
 )
 
-from typing import Optional
-
 
 @mcp.tool(
     title="Run Shell Command",
@@ -190,7 +208,9 @@ Args:
 
 Returns JSON: {stdout, stderr, returncode, cwd, command, status}"""
 )
-def bash(command: str, cwd: str = ".", timeout: int = 300) -> str:
+def bash(command: Optional[str] = None, cwd: str = ".", timeout: int = 300) -> str:
+    if err := _validate_required(command=command):
+        return err
     return _bash(command=command, cwd=cwd, timeout=timeout)
 
 
@@ -205,7 +225,9 @@ Args:
 
 Returns JSON: {content, path, size_bytes, format, status} or {path, size_bytes, format, type} for binary files"""
 )
-def read_file(path: str, encoding: str = "utf-8", max_chars: int = 100000) -> str:
+def read_file(path: Optional[str] = None, encoding: str = "utf-8", max_chars: int = 100000) -> str:
+    if err := _validate_required(path=path):
+        return err
     return _read_file(path=path, encoding=encoding, max_chars=max_chars)
 
 
@@ -222,7 +244,9 @@ Args:
 
 Returns JSON: {path, size_bytes, mode, status}"""
 )
-def write_file(path: str, content: str, mode: str = "write", encoding: str = "utf-8") -> str:
+def write_file(path: Optional[str] = None, content: Optional[str] = None, mode: str = "write", encoding: str = "utf-8") -> str:
+    if err := _validate_required(path=path, content=content):
+        return err
     return _write_file(path=path, content=content, mode=mode, encoding=encoding)
 
 
@@ -239,32 +263,43 @@ Args:
 
 Returns JSON: {filename, size_bytes, download_url, status} or {filename, size_bytes, content_base64, status}"""
 )
-def send_file(path: str, callback_url: Optional[str] = None) -> str:
+def send_file(path: Optional[str] = None, callback_url: Optional[str] = None) -> str:
+    if err := _validate_required(path=path):
+        return err
     return _send_file(path=path, callback_url=callback_url)
 
 
 @mcp.tool(
     title="Search Document",
-    description="""Search for patterns in a document. Supports text, PDF, and markdown files.
-Uses grep-like pattern matching with context lines around matches.
+    description="""Search for a regex pattern in a single document file. Supports text, PDF, and markdown files.
+Uses grep-like regex pattern matching and returns matching lines with surrounding context.
 
-Args:
+IMPORTANT - Required parameters:
 - path: File path to search (e.g., "~/docs/report.pdf", "README.md")
-- pattern: Search pattern (regex supported)
-- case_sensitive: Case-sensitive search (default: false)
-- context_lines: Lines of context around matches (default: 3)
-- max_matches: Maximum matches to return (default: 50)
+- pattern: Regex search pattern to find in the document (e.g., "error.*timeout", "subjects")
+  Do NOT use 'query' - the parameter name is 'pattern'.
+
+Optional parameters:
+- case_sensitive: Whether search is case-sensitive (default: false)
+- context_lines: Number of lines of context before/after each match (default: 3).
+  Do NOT use 'context_chars' - the parameter name is 'context_lines'.
+- max_matches: Maximum number of matches to return (default: 50).
+  Do NOT use 'max_sections' - the parameter name is 'max_matches'.
+
+Example: search_document(path="report.pdf", pattern="conclusion")
 
 Returns JSON: {matches, total_matches, file, format, status}
 Each match includes: {line_number, match, context_before, context_after}"""
 )
 def search_document(
-    path: str,
-    pattern: str,
-    case_sensitive: bool = False,
-    context_lines: int = 3,
-    max_matches: int = 50,
+    path: Annotated[Optional[str], Field(description="File path to search (e.g., '~/docs/report.pdf', 'README.md')")] = None,
+    pattern: Annotated[Optional[str], Field(description="Regex search pattern to find in the document (e.g., 'error.*timeout', 'subjects')")] = None,
+    case_sensitive: Annotated[bool, Field(description="Whether search is case-sensitive")] = False,
+    context_lines: Annotated[int, Field(description="Number of lines of context before/after each match")] = 3,
+    max_matches: Annotated[int, Field(description="Maximum number of matches to return")] = 50,
 ) -> str:
+    if err := _validate_required(path=path, pattern=pattern):
+        return err
     return _search_document(
         path=path, pattern=pattern, case_sensitive=case_sensitive,
         context_lines=context_lines, max_matches=max_matches,
@@ -288,13 +323,15 @@ Returns JSON: {results, total_files, total_matches, status}
 Each result includes: {file, line_number, content}"""
 )
 def search_directory(
-    directory: str,
-    pattern: str,
+    directory: Optional[str] = None,
+    pattern: Optional[str] = None,
     file_pattern: str = "*",
     case_sensitive: bool = False,
     include_hidden: bool = False,
     max_results: int = 100,
 ) -> str:
+    if err := _validate_required(directory=directory, pattern=pattern):
+        return err
     return _search_directory(
         directory=directory, pattern=pattern, file_pattern=file_pattern,
         case_sensitive=case_sensitive, include_hidden=include_hidden,
@@ -316,8 +353,10 @@ Returns JSON: {tables, total_tables, file, format, status}
 Each table includes: {headers, rows, row_count, page (for PDF)}"""
 )
 def extract_tables(
-    path: str, table_index: Optional[int] = None, output_format: str = "json"
+    path: Optional[str] = None, table_index: Optional[int] = None, output_format: str = "json"
 ) -> str:
+    if err := _validate_required(path=path):
+        return err
     return _extract_tables(path=path, table_index=table_index, output_format=output_format)
 
 
@@ -370,8 +409,11 @@ Args:
 Returns JSON: {output, operation, expression, status}"""
 )
 def transform_text(
-    input_text: str, operation: str, expression: str, is_file: bool = False
+    input_text: Optional[str] = None, operation: Optional[str] = None,
+    expression: Optional[str] = None, is_file: bool = False
 ) -> str:
+    if err := _validate_required(input_text=input_text, operation=operation, expression=expression):
+        return err
     return _transform_text(
         input_text=input_text, operation=operation,
         expression=expression, is_file=is_file,
@@ -394,12 +436,14 @@ Returns JSON: {sections, query, file, status}
 Each section includes: {content, relevance_keywords, position}"""
 )
 def get_document_context(
-    path: str,
-    query: str,
+    path: Optional[str] = None,
+    query: Optional[str] = None,
     keywords: Optional[str] = None,
     context_chars: int = 500,
     max_sections: int = 5,
 ) -> str:
+    if err := _validate_required(path=path, query=query):
+        return err
     return _get_document_context(
         path=path, query=query, keywords=keywords,
         context_chars=context_chars, max_sections=max_sections,

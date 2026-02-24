@@ -21,6 +21,7 @@ import asyncio
 import base64
 import os
 import json
+import re
 import uuid
 from openai import AsyncOpenAI, OpenAIError, APITimeoutError
 from typing import List, Optional, Any
@@ -62,28 +63,115 @@ def _parse_tool_call_from_content(content: str, tool_registry) -> Optional[dict]
     start = text.find("{")
     if start == -1:
         return None
-    # Find the matching closing brace
+    # Find the matching closing brace, respecting JSON string literals
     depth = 0
+    in_string = False
+    escape = False
     end = -1
     for i in range(start, len(text)):
-        if text[i] == "{":
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            if in_string:
+                escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
             depth += 1
-        elif text[i] == "}":
+        elif ch == "}":
             depth -= 1
             if depth == 0:
                 end = i + 1
                 break
     if end == -1:
-        return None
+        # JSON may be truncated (e.g. max_tokens cut it off).
+        # Try regex fallback to extract tool name and arguments.
+        return _parse_truncated_tool_call(text[start:], tool_registry)
     try:
         obj = json.loads(text[start:end])
     except json.JSONDecodeError:
-        return None
+        return _parse_truncated_tool_call(text[start:end], tool_registry)
     if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
         if obj["name"] not in tool_registry.tools:
             return None
         return obj
     return None
+
+
+def _parse_truncated_tool_call(text: str, tool_registry) -> Optional[dict]:
+    """Attempt to extract a tool call from truncated/malformed JSON.
+
+    When the model's response is cut off (e.g. by max_tokens), the JSON may be
+    incomplete.  This function uses regex to extract the tool name and any
+    parseable arguments from the partial JSON.
+    """
+    # Extract the tool name
+    name_match = re.search(r'"name"\s*:\s*"([^"]+)"', text)
+    if not name_match:
+        return None
+    tool_name = name_match.group(1)
+    if tool_name not in tool_registry.tools:
+        return None
+    # Try to extract arguments object - find where "arguments" value starts
+    args_match = re.search(r'"arguments"\s*:\s*\{', text)
+    if not args_match:
+        return {"name": tool_name, "arguments": {}}
+    args_start = args_match.end() - 1  # include the opening brace
+    # Try progressively larger substrings, closing any open braces
+    # First try parsing as-is with closing braces appended
+    args_text = text[args_start:]
+    # Count unclosed braces (string-aware)
+    depth = 0
+    in_str = False
+    esc = False
+    last_valid = -1
+    for i, ch in enumerate(args_text):
+        if esc:
+            esc = False
+            continue
+        if ch == '\\' and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                last_valid = i + 1
+                break
+    if last_valid > 0:
+        try:
+            args = json.loads(args_text[:last_valid])
+            return {"name": tool_name, "arguments": args}
+        except json.JSONDecodeError:
+            pass
+    # Arguments JSON is truncated - return with empty args so the tool can be
+    # re-invoked by the model on the next iteration
+    return {"name": tool_name, "arguments": {}}
+
+
+def _looks_like_raw_tool_call(content: str) -> bool:
+    """Check if content looks like a raw tool-call JSON that wasn't parsed.
+
+    Returns True if the text contains patterns like {"name": "...", "arguments": ...}
+    that indicate the model emitted a tool call as plain text.
+    """
+    if not content:
+        return False
+    text = content.split("</think>")[-1].strip() if "</think>" in content else content.strip()
+    # Quick heuristic: must contain both "name" and "arguments" keys in JSON-like syntax
+    return bool(re.search(r'"name"\s*:\s*"[^"]+"', text) and re.search(r'"arguments"\s*:', text))
 
 
 def _extract_base64_file(tool_response: str, data_path: str) -> str:
@@ -205,8 +293,8 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     if chat_ui:
         chat_ui.add_log(f"Starting chat with model: {model}", level="info")
 
-    MAX_CHAT_ITERATIONS = 25
-    MAX_REPEATED_TOOL_CALLS = 3
+    MAX_CHAT_ITERATIONS = 100
+    MAX_REPEATED_TOOL_CALLS = 30
     iteration_count = 0
     tool_call_history = []  # list of (name, args_json) tuples
 
@@ -230,7 +318,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 stream=stream,
                 timeout=timeout,
                 max_tokens=max_tokens,
-                temperature=0.7,
+                temperature=0.8,
                 extra_body={
                     "chat_template_kwargs": {"enable_thinking": False},
                     "repetition_penalty": 1.05,
@@ -329,6 +417,18 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                         print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
                     return msg
                 continue  # loop back for the model to generate the final response
+
+            # Guard against returning raw tool-call JSON to the user.
+            # If the content looks like a tool call but couldn't be parsed,
+            # ask the model to retry without tools.
+            if _looks_like_raw_tool_call(last_response):
+                if chat_ui:
+                    chat_ui.add_log("Model returned unparseable raw tool-call JSON, retrying without tools.", level="warning")
+                elif verbose:
+                    print("Model returned unparseable raw tool-call JSON, retrying without tools.")
+                messages.append({"role": "assistant", "content": last_response})
+                messages.append({"role": "user", "content": "Please provide your answer as plain text, not as a JSON tool call."})
+                continue
 
             if "</think>" in last_response:
                 last_response = last_response.split("</think>")[1]
