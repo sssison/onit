@@ -135,7 +135,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     chat_ui = kwargs['chat_ui'] if 'chat_ui' in kwargs else None
     verbose = kwargs['verbose'] if 'verbose' in kwargs else False
     data_path = kwargs.get('data_path', '')
-    max_tokens = kwargs.get('max_tokens', 262144)
+    max_tokens = kwargs.get('max_tokens', 2048)
     memories = kwargs.get('memories', None)
     prompt_intro = kwargs.get('prompt_intro', "I am a helpful AI assistant. My name is OnIt.")
 
@@ -229,6 +229,12 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 messages=messages,
                 stream=stream,
                 timeout=timeout,
+                max_tokens=max_tokens,
+                temperature=0.7,
+                extra_body={
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "repetition_penalty": 1.05,
+                },
             )
             if tools: # and not images_bytes:  # vLLM doesn't support tools + images in the same message, so only include tools if no images are present
                 completion_kwargs["tools"] = tools

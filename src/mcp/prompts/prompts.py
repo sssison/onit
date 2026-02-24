@@ -52,7 +52,6 @@ Think step by step on how to complete the following task enclosed in <task> and 
 Execute the step by step action plan to complete the task.
 If you need additional information or the task is unclear given the context and previous interactions, ask for clarification.
 If you know the answer, provide it right away. Else, use the tools to complete the action plan.
-Avoid repeated tool call sequences that do not lead to progress.
 Today is `{current_date}`.
 For any date-related questions, assume the user is asking about the next upcoming
 occurrence relative to today unless a past date, year, or keywords like **last**,
@@ -102,8 +101,9 @@ When using create_presentation, create_excel, or create_document tools, always p
 
    if documents_path and documents_path != "null":
       instruction += f"""
-   Find and read all relevant documents (PDF, TXT, DOCX, XLSX, PPTX, and Markdown (MD)) in `{documents_path}` before searching the web.
-   """
+Find and read all relevant documents (PDF, TXT, DOCX, XLSX, PPTX, and Markdown (MD)) in `{documents_path}`.
+Search the web if you can't find the answer in the documents.
+"""
 
    return instruction
 
