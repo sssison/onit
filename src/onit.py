@@ -466,7 +466,7 @@ class OnIt(BaseModel):
             except Exception:
                 pass
             return response
-        return f"I am sorry 😊. Could you try rephrasing or providing additional details?"
+        return f"I am sorry 😊. Could you try to rephrase or provide additional details?"
 
     async def run_loop(self) -> None:
         """Run the OnIt agent in loop mode, executing a task repeatedly."""
