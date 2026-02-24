@@ -13,6 +13,7 @@ import tempfile
 
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -47,6 +48,8 @@ def _split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
 class TelegramGateway:
     """Telegram bot that routes messages through an OnIt agent instance."""
 
+    MAX_RETRIES = 3
+
     def __init__(self, onit, token: str, show_logs: bool = False):
         self.onit = onit
         self.token = token
@@ -73,10 +76,25 @@ class TelegramGateway:
             logger.info("Created new session %s for Telegram chat %s", session_id, chat_id)
         return self._chat_sessions[chat_id]
 
+    async def _reply_with_retry(self, message, text):
+        """Send a reply, retrying on Telegram network/timeout errors."""
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                await message.reply_text(text)
+                return
+            except (TimedOut, NetworkError) as e:
+                logger.warning("Telegram send failed (attempt %d/%d): %s",
+                               attempt + 1, self.MAX_RETRIES, e)
+                if attempt < self.MAX_RETRIES - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    logger.error("Gave up sending message after %d attempts", self.MAX_RETRIES)
+
     async def _start_command(self, update: Update, context) -> None:
         """Handle /start command."""
         name = "Assistant"
-        await update.message.reply_text(
+        await self._reply_with_retry(
+            update.message,
             f"Hey there! I'm {name}, your friendly AI assistant. "
             f"Feel free to send me a message or a photo and I'll be happy to help!\n\n"
             f"⚠️ May produce inaccurate information. Verify important details independently."
@@ -97,7 +115,10 @@ class TelegramGateway:
             print(f"[MSG] {name}: {text}")
 
         # Show typing indicator
-        await update.message.chat.send_action(ChatAction.TYPING)
+        try:
+            await update.message.chat.send_action(ChatAction.TYPING)
+        except (TimedOut, NetworkError):
+            pass
 
         # Keep sending typing action while processing
         stop_typing = asyncio.Event()
@@ -135,7 +156,7 @@ class TelegramGateway:
 
         # Send response, splitting if needed
         for chunk in _split_message(response):
-            await update.message.reply_text(chunk)
+            await self._reply_with_retry(update.message, chunk)
 
     async def _handle_photo(self, update: Update, context) -> None:
         """Handle incoming photo messages (for vision models)."""
@@ -150,13 +171,27 @@ class TelegramGateway:
             print(f"[IMG] {name}: {caption}")
 
         # Show typing indicator
-        await update.message.chat.send_action(ChatAction.TYPING)
+        try:
+            await update.message.chat.send_action(ChatAction.TYPING)
+        except (TimedOut, NetworkError):
+            pass
 
         # Download the highest resolution photo
         photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
         image_path = os.path.join(session["data_path"], f"telegram_{photo.file_unique_id}.jpg")
-        await file.download_to_drive(image_path)
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                file = await context.bot.get_file(photo.file_id)
+                await file.download_to_drive(image_path)
+                break
+            except (TimedOut, NetworkError) as e:
+                logger.warning("Photo download failed (attempt %d/%d): %s",
+                               attempt + 1, self.MAX_RETRIES, e)
+                if attempt < self.MAX_RETRIES - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    await self._reply_with_retry(update.message, "Sorry, failed to download the photo. Please try again.")
+                    return
 
         # Keep sending typing action while processing
         stop_typing = asyncio.Event()
@@ -194,7 +229,7 @@ class TelegramGateway:
             print(f"[BOT] {response}")
 
         for chunk in _split_message(response):
-            await update.message.reply_text(chunk)
+            await self._reply_with_retry(update.message, chunk)
 
     def run_sync(self) -> None:
         """Start the Telegram bot with its own event loop via run_polling().
