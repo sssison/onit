@@ -7,6 +7,9 @@ Usage: onit --gateway  (requires TELEGRAM_BOT_TOKEN env var)
 import asyncio
 import logging
 import os
+import uuid
+from pathlib import Path
+import tempfile
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -47,11 +50,34 @@ class TelegramGateway:
     def __init__(self, onit, token: str):
         self.onit = onit
         self.token = token
+        # Per-chat session state: chat_id -> {session_id, session_path, data_path}
+        self._chat_sessions: dict[int, dict] = {}
+
+    def _get_chat_session(self, chat_id: int) -> dict:
+        """Get or create session state for a Telegram chat."""
+        if chat_id not in self._chat_sessions:
+            session_id = str(uuid.uuid4())
+            sessions_dir = os.path.dirname(self.onit.session_path)
+            session_path = os.path.join(sessions_dir, f"{session_id}.jsonl")
+            if not os.path.exists(session_path):
+                with open(session_path, "w", encoding="utf-8") as f:
+                    f.write("")
+            data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / session_id)
+            os.makedirs(data_path, exist_ok=True)
+            self._chat_sessions[chat_id] = {
+                "session_id": session_id,
+                "session_path": session_path,
+                "data_path": data_path,
+            }
+            logger.info("Created new session %s for Telegram chat %s", session_id, chat_id)
+        return self._chat_sessions[chat_id]
 
     async def _start_command(self, update: Update, context) -> None:
         """Handle /start command."""
+        name = self.onit.persona.capitalize() if self.onit.persona else "Assistant"
         await update.message.reply_text(
-            "Hello! I'm an OnIt agent. Send me a message and I'll help you out."
+            f"Hey there! I'm {name}, your friendly AI assistant. "
+            f"Feel free to send me a message or a photo and I'll be happy to help!"
         )
 
     async def _handle_message(self, update: Update, context) -> None:
@@ -59,6 +85,9 @@ class TelegramGateway:
         text = update.message.text
         if not text:
             return
+
+        chat_id = update.message.chat.id
+        session = self._get_chat_session(chat_id)
 
         # Show typing indicator
         await update.message.chat.send_action(ChatAction.TYPING)
@@ -77,7 +106,12 @@ class TelegramGateway:
         typing_task = asyncio.create_task(typing_loop())
 
         try:
-            response = await self.onit.process_task(text)
+            response = await self.onit.process_task(
+                text,
+                session_id=session["session_id"],
+                session_path=session["session_path"],
+                data_path=session["data_path"],
+            )
         except Exception as e:
             logger.error("Error processing task: %s", e)
             response = f"Error: {e}"
@@ -97,13 +131,16 @@ class TelegramGateway:
         """Handle incoming photo messages (for vision models)."""
         caption = update.message.caption or "Describe this image."
 
+        chat_id = update.message.chat.id
+        session = self._get_chat_session(chat_id)
+
         # Show typing indicator
         await update.message.chat.send_action(ChatAction.TYPING)
 
         # Download the highest resolution photo
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
-        image_path = os.path.join(self.onit.data_path, f"telegram_{photo.file_unique_id}.jpg")
+        image_path = os.path.join(session["data_path"], f"telegram_{photo.file_unique_id}.jpg")
         await file.download_to_drive(image_path)
 
         # Keep sending typing action while processing
@@ -120,7 +157,13 @@ class TelegramGateway:
         typing_task = asyncio.create_task(typing_loop())
 
         try:
-            response = await self.onit.process_task(caption, images=[image_path])
+            response = await self.onit.process_task(
+                caption,
+                images=[image_path],
+                session_id=session["session_id"],
+                session_path=session["session_path"],
+                data_path=session["data_path"],
+            )
         except Exception as e:
             logger.error("Error processing image task: %s", e)
             response = f"Error: {e}"

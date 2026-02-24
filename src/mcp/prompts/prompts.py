@@ -31,7 +31,8 @@ async def assistant_instruction(task: str,
                                 session_id: str = None,
                                 template_path: str = None,
                                 file_server_url: str = None,
-                                documents_path: str = None) -> str:
+                                documents_path: str = None,
+                                topic: str = None) -> str:
    import tempfile
 
    if session_id is None:
@@ -51,11 +52,11 @@ Think step by step on how to complete the following task enclosed in <task> and 
 Execute the step by step action plan to complete the task.
 If you need additional information or the task is unclear given the context and previous interactions, ask for clarification.
 If you know the answer, provide it right away. Else, use the tools to complete the action plan.
-Avoid repeated tool call sequences that do not lead to progress. 
+Avoid repeated tool call sequences that do not lead to progress.
 Today is `{current_date}`.
 For any date-related questions, assume the user is asking about the next upcoming
 occurrence relative to today unless a past date, year, or keywords like **last**,
- **previous**, or **when was** are explicitly mentioned.
+**previous**, or **when was** are explicitly mentioned.
 
 ## File Operations Policy
 - **Working directory**: `{data_path}` — all file operations must use this directory.
@@ -82,6 +83,11 @@ occurrence relative to today unless a past date, year, or keywords like **last**
       data_path=data_path,
       session_id=session_id
    )
+
+   if topic and topic != "null":
+      instruction += f"""
+Unless specified, assume that the topic is about `{topic}`.
+"""
 
    if file_server_url and file_server_url != "null":
       instruction += f"""

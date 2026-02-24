@@ -323,6 +323,7 @@ class OnIt(BaseModel):
             self.file_server_url = f"http://{local_ip}:{a2a_port}"
         self.template_path = self.config_data.get('template_path', None)
         self.documents_path = self.config_data.get('documents_path', None)
+        self.topic = self.config_data.get('topic', None)
         self.timeout = self.config_data.get('timeout', None)  # default timeout 300 seconds
         if self.timeout is not None and self.timeout < 0:
             self.timeout = None  # no timeout
@@ -347,19 +348,21 @@ class OnIt(BaseModel):
         self.a2a_description = self.config_data.get('a2a_description', 'An intelligent agent for task automation and assistance.')
         self.gateway = self.config_data.get('gateway', False)
         self.gateway_token = self.config_data.get('gateway_token', None)
-    def load_session_history(self, max_turns: int = 20) -> list[dict]:
+    def load_session_history(self, max_turns: int = 20, session_path: str | None = None) -> list[dict]:
         """Load recent session history from the JSONL session file.
 
         Args:
             max_turns: Maximum number of recent task/response pairs to return.
+            session_path: Optional override path to the session file.
 
         Returns:
             A list of dicts with 'task' and 'response' keys, oldest first.
         """
+        effective_path = session_path or self.session_path
         history = []
         try:
-            if os.path.exists(self.session_path):
-                with open(self.session_path, "r", encoding="utf-8") as f:
+            if os.path.exists(effective_path):
+                with open(effective_path, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if line:
@@ -397,8 +400,24 @@ class OnIt(BaseModel):
         finally:
             self.status = "stopped"
 
-    async def process_task(self, task: str, images: list[str] | None = None) -> str:
-        """Process a single task and return the response string."""
+    async def process_task(self, task: str, images: list[str] | None = None,
+                           session_id: str | None = None,
+                           session_path: str | None = None,
+                           data_path: str | None = None) -> str:
+        """Process a single task and return the response string.
+
+        Args:
+            task: The user task/message to process.
+            images: Optional list of image file paths.
+            session_id: Optional override for session_id (e.g. per-chat in Telegram).
+            session_path: Optional override for session history file path.
+            data_path: Optional override for data directory path.
+        """
+        # Use per-chat overrides if provided, otherwise fall back to instance defaults
+        effective_session_id = session_id or self.session_id
+        effective_session_path = session_path or self.session_path
+        effective_data_path = data_path or self.data_path
+
         while not self.safety_queue.empty():
             self.safety_queue.get_nowait()
 
@@ -406,10 +425,11 @@ class OnIt(BaseModel):
         async with prompt_client:
             instruction = await prompt_client.get_prompt(self.persona, {
                 "task": task,
-                "session_id": self.session_id,
+                "session_id": effective_session_id,
                 "template_path": self.template_path,
                 "file_server_url": self.file_server_url,
                 "documents_path": self.documents_path,
+                "topic": self.topic,
             })
             instruction = instruction.messages[0].content.text
 
@@ -417,9 +437,9 @@ class OnIt(BaseModel):
             'console': None, 'chat_ui': None,
             'cursor': AGENT_CURSOR, 'memories': None,
             'verbose': self.verbose,
-            'data_path': self.data_path,
+            'data_path': effective_data_path,
             'max_tokens': self.model_serving.get('max_tokens', 262144),
-            'session_history': self.load_session_history(),
+            'session_history': self.load_session_history(session_path=effective_session_path),
         }
         last_response = await chat(
             host=self.model_serving["host"],
@@ -437,7 +457,7 @@ class OnIt(BaseModel):
         if last_response is not None:
             response = remove_tags(last_response)
             try:
-                with open(self.session_path, "a", encoding="utf-8") as f:
+                with open(effective_session_path, "a", encoding="utf-8") as f:
                     session_data = {
                         "task": task,
                         "response": response,
@@ -474,7 +494,8 @@ class OnIt(BaseModel):
                                                                                 "session_id": self.session_id,
                                                                                 "template_path": self.template_path,
                                                                                 "file_server_url": self.file_server_url,
-                                                                                "documents_path": self.documents_path})
+                                                                                "documents_path": self.documents_path,
+                                                                                "topic": self.topic})
                     instruction = instruction.messages[0]
                     instruction = instruction.content.text
 
@@ -673,7 +694,8 @@ class OnIt(BaseModel):
                                                                             "session_id": self.session_id,
                                                                             "template_path": self.template_path,
                                                                             "file_server_url": self.file_server_url,
-                                                                            "documents_path": self.documents_path})
+                                                                            "documents_path": self.documents_path,
+                                                                            "topic": self.topic})
                 instruction = instruction.messages[0]
                 instruction = instruction.content.text
                 
