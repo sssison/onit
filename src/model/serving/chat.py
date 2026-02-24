@@ -410,7 +410,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
                 tool_call_history.append(call_key)
                 if tool_call_history.count(call_key) >= MAX_REPEATED_TOOL_CALLS:
-                    msg = f"I noticed I'm in an endless loop trying to provide an answer. Please try rephrasing your question or providing additional details."
+                    msg = f"I am sorry 😊. Could you try rephrasing or providing additional details?"
                     if chat_ui:
                         chat_ui.add_log(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", level="warning")
                     elif verbose:
@@ -490,7 +490,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
             tool_call_history.append(call_key)
             if tool_call_history.count(call_key) >= MAX_REPEATED_TOOL_CALLS:
-                msg = f"I noticed I'm in an endless loop trying to provide an answer. Please try rephrasing your question or providing additional details."
+                msg = f"I am sorry 😊. Could you try rephrasing or providing additional details?"
                 if chat_ui:
                     chat_ui.add_log(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", level="warning")
                 elif verbose:
