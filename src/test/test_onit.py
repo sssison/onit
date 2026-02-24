@@ -247,7 +247,7 @@ class TestProcessTask:
              patch("src.onit.chat", new_callable=AsyncMock, return_value=None):
             result = await onit.process_task("fail")
 
-        assert "Error" in result
+        assert "rephrase" in result
 
 
 # ── OnItA2AExecutor ─────────────────────────────────────────────────────────
