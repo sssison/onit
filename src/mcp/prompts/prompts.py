@@ -102,8 +102,9 @@ When using create_presentation, create_excel, or create_document tools, always p
 
    if documents_path and documents_path != "null":
       instruction += f"""
-Find and read relevant documents to this task in `{documents_path}` before searching the web.
-"""
+   Find and read relevant documents to this task in `{documents_path}` before searching the web.
+   Supported document formats: PDF, TXT, DOCX, XLSX, PPTX, and Markdown (MD).
+   """
 
    return instruction
 

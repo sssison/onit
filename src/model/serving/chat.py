@@ -80,6 +80,8 @@ def _parse_tool_call_from_content(content: str, tool_registry) -> Optional[dict]
     except json.JSONDecodeError:
         return None
     if isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+        if obj["name"] not in tool_registry.tools:
+            return None
         return obj
     return None
 
@@ -253,7 +255,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 function_arguments = raw_tool["arguments"]
                 synthetic_id = f"call_{uuid.uuid4().hex[:24]}"
                 if chat_ui:
-                    chat_ui.add_log(f"Calling: {function_name} (parsed from content)", level="info")
+                    chat_ui.add_log(f"Calling: {function_name}({function_arguments})", level="info")
                     chat_ui.render()
                 elif verbose:
                     print(f"{function_name}({function_arguments})")
@@ -278,16 +280,16 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                                 tool_response = _extract_base64_file(tool_response, data_path)
                             tool_message = {'role': 'tool', 'content': tool_response, 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
                             messages.append(tool_message)
-                            truncated = tool_response[:200] + "..." if len(tool_response) > 200 else tool_response
+                            truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
                             if chat_ui:
-                                chat_ui.add_log(f"{function_name} returned: {truncated}", level="debug")
+                                chat_ui.add_log(f"{function_name}({function_arguments}) returned: {truncated}", level="debug")
                             elif verbose:
-                                print(f"{function_name} returned: {truncated}")
+                                print(f"{function_name}({function_arguments}) returned: {truncated}")
                         except Exception as e:
                             if chat_ui:
-                                chat_ui.add_log(f"{function_name} error: {e}", level="error")
+                                chat_ui.add_log(f"{function_name}({function_arguments}) error: {e}", level="error")
                             elif verbose:
-                                print(f"{function_name} encountered an error: {e}")
+                                print(f"{function_name}({function_arguments}) encountered an error: {e}")
                             tool_message = {'role': 'tool', 'content': f'Error: {e}', 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
                             messages.append(tool_message)
                         break
@@ -311,7 +313,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             function_name = tool.function.name
             function_arguments = json.loads(tool.function.arguments)
             if chat_ui:
-                chat_ui.add_log(f"Calling: {function_name}", level="info")
+                chat_ui.add_log(f"Calling: {function_name}({function_arguments})", level="info")
                 chat_ui.render()
             elif verbose:
                 print(f"{function_name}({function_arguments})")
@@ -340,7 +342,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                         # Log tool response (truncated for display)
                         truncated_response = tool_response[:200] + "..." if len(tool_response) > 200 else tool_response
                         if chat_ui:
-                            chat_ui.add_log(f"{function_name} returned: {truncated_response}", level="debug")
+                            chat_ui.add_log(f"{function_name}({function_arguments}) returned: {truncated_response}", level="debug")
                     except Exception as e:
                         if chat_ui:
                             chat_ui.add_log(f"{tool_name} error: {e}", level="error")
