@@ -155,7 +155,6 @@ class OnIt(BaseModel):
     messages: dict[str, str] = Field(default_factory=dict)
     stop_commands: list[str] = Field(default_factory=lambda: ['\\goodbye', '\\bye', '\\quit', '\\exit'])
     model_serving: dict[str, Any] = Field(default_factory=dict)
-    persona: str = Field(default="assistant")
     user_id: str = Field(default="default_user")
     input_queue: asyncio.Queue | None = Field(default=None, exclude=True)
     output_queue: asyncio.Queue | None = Field(default=None, exclude=True)
@@ -270,7 +269,6 @@ class OnIt(BaseModel):
                     "  - --host CLI flag\n"
                     "  - serving.host in the config YAML"
                 )
-        self.persona = self.config_data.get('persona', 'assistant')
         self.user_id = self.config_data.get('user_id', 'default_user')
         self.status = "initialized"
         self.verbose = self.config_data.get('verbose', False)
@@ -424,7 +422,7 @@ class OnIt(BaseModel):
 
         prompt_client = Client(self.prompt_url)
         async with prompt_client:
-            instruction = await prompt_client.get_prompt(self.persona, {
+            instruction = await prompt_client.get_prompt("assistant", {
                 "task": task,
                 "session_id": effective_session_id,
                 "template_path": self.template_path,
@@ -491,7 +489,7 @@ class OnIt(BaseModel):
                 # build instruction via MCP prompt
                 print(f"--- Iteration {iteration} ---")
                 async with prompt_client:
-                    instruction = await prompt_client.get_prompt(self.persona, {"task": self.task,
+                    instruction = await prompt_client.get_prompt("assistant", {"task": self.task,
                                                                                 "session_id": self.session_id,
                                                                                 "template_path": self.template_path,
                                                                                 "file_server_url": self.file_server_url,
@@ -691,7 +689,7 @@ class OnIt(BaseModel):
 
             # prompt engineering
             async with prompt_client:
-                instruction = await prompt_client.get_prompt(self.persona, {"task": task,
+                instruction = await prompt_client.get_prompt("assistant", {"task": task,
                                                                             "session_id": self.session_id,
                                                                             "template_path": self.template_path,
                                                                             "file_server_url": self.file_server_url,

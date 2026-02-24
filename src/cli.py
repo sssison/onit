@@ -302,9 +302,6 @@ def main():
                         help='Path to local documents directory. The model will search here before the web.')
     parser.add_argument('--topic', type=str, default=None,
                         help='Default topic context (e.g. "machine learning"). The model will assume this topic unless specified otherwise.')
-    parser.add_argument('--persona', type=str, default=None,
-                        help='Agent persona/name (default: "assistant"). Used as the agent identity in prompts and greetings.')
-
     # Text UI options
     parser.add_argument('--text-theme', type=str, default=None,
                         help='Text UI theme (e.g. "white", "dark").')
@@ -404,7 +401,6 @@ def main():
         'template_path': 'template_path',
         'documents_path': 'documents_path',
         'topic': 'topic',
-        'persona': 'persona',
         'a2a': 'a2a',
         'a2a_port': 'a2a_port',
         'gateway': 'gateway',

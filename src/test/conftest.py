@@ -43,7 +43,6 @@ def sample_config_dict(tmp_path):
         },
         "session_path": str(tmp_path / "sessions"),
         "theme": "white",
-        "persona": "assistant",
         "verbose": False,
     }
 

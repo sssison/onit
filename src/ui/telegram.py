@@ -74,7 +74,7 @@ class TelegramGateway:
 
     async def _start_command(self, update: Update, context) -> None:
         """Handle /start command."""
-        name = self.onit.persona.capitalize() if self.onit.persona else "Assistant"
+        name = "Assistant"
         await update.message.reply_text(
             f"Hey there! I'm {name}, your friendly AI assistant. "
             f"Feel free to send me a message or a photo and I'll be happy to help!"

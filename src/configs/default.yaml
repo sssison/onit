@@ -13,7 +13,6 @@ verbose: false
 show_logs: false
 
 theme: dark
-persona: "assistant"
 session_path: "~/.onit/sessions"
 
 # see template examples in the `src/mcp/prompts/prompt_templates` folder

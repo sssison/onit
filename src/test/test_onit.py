@@ -37,7 +37,6 @@ def _make_config(tmp_path, overrides=None):
         },
         "session_path": str(tmp_path / "sessions"),
         "theme": "white",
-        "persona": "assistant",
         "verbose": False,
     }
     if overrides:
@@ -59,7 +58,7 @@ class TestOnItInit:
         with _mock_discover():
             onit = OnIt(config=cfg)
         assert onit.status == "initialized"
-        assert onit.persona == "assistant"
+        assert onit.status == "initialized"
 
     def test_init_from_yaml_path(self, tmp_path):
         import yaml

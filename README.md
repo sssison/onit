@@ -77,7 +77,6 @@ serving:
   think: true
   max_tokens: 262144
 
-persona: "assistant"
 verbose: false
 timeout: 600
 
