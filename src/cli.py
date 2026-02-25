@@ -302,6 +302,8 @@ def main():
                         help='Path to local documents directory. The model will search here before the web.')
     parser.add_argument('--topic', type=str, default=None,
                         help='Default topic context (e.g. "machine learning"). The model will assume this topic unless specified otherwise.')
+    parser.add_argument('--prompt-intro', type=str, default=None,
+                        help='Custom system prompt intro for the model (default: "I am a helpful AI assistant. My name is OnIt.").')
     # Text UI options
     parser.add_argument('--text-theme', type=str, default=None,
                         help='Text UI theme (e.g. "white", "dark").')
@@ -403,6 +405,7 @@ def main():
         'template_path': 'template_path',
         'documents_path': 'documents_path',
         'topic': 'topic',
+        'prompt_intro': 'prompt_intro',
         'a2a': 'a2a',
         'a2a_port': 'a2a_port',
         'gateway': 'gateway',

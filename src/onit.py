@@ -166,6 +166,7 @@ class OnIt(BaseModel):
     template_path: str | None = Field(default=None)
     documents_path: str | None = Field(default=None)
     topic: str | None = Field(default=None)
+    prompt_intro: str | None = Field(default=None)
     timeout: int | None = Field(default=None)
     show_logs: bool = Field(default=False)
     loop: bool = Field(default=False)
@@ -324,6 +325,7 @@ class OnIt(BaseModel):
         self.template_path = self.config_data.get('template_path', None)
         self.documents_path = self.config_data.get('documents_path', None)
         self.topic = self.config_data.get('topic', None)
+        self.prompt_intro = self.config_data.get('prompt_intro', None)
         self.timeout = self.config_data.get('timeout', None)  # default timeout 300 seconds
         if self.timeout is not None and self.timeout < 0:
             self.timeout = None  # no timeout
@@ -442,6 +444,8 @@ class OnIt(BaseModel):
             'max_tokens': self.model_serving.get('max_tokens', 262144),
             'session_history': self.load_session_history(session_path=effective_session_path),
         }
+        if self.prompt_intro:
+            kwargs['prompt_intro'] = self.prompt_intro
         last_response = await chat(
             host=self.model_serving["host"],
             host_key=self.model_serving.get("host_key", "EMPTY"),
@@ -795,6 +799,8 @@ class OnIt(BaseModel):
                           'data_path': self.data_path,
                           'max_tokens': self.model_serving.get('max_tokens', 262144),
                           'session_history': self.load_session_history()}
+                if self.prompt_intro:
+                    kwargs['prompt_intro'] = self.prompt_intro
                 last_response = await chat(host=self.model_serving["host"],
                                             host_key=self.model_serving.get("host_key", "EMPTY"),
                                             model=self.model_serving["model"],

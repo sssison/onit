@@ -249,39 +249,34 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             elif verbose:
                 print(f"Image file {image_path} not found, proceeding without this image.")
 
-    session_history = kwargs.get('session_history', None)
-
-    # FIXME: see do_image_task() correct API use for messages with images
-    if memories:
-        assistant_prompt = f"{prompt_intro} Answer the question based on query and memories.\nMemories:\n{memories}\n"
-        messages = [{"role": "assistant", "content": assistant_prompt}]
-    else:
-        messages = [{"role": "assistant", "content": prompt_intro}]
-
-    # inject session history as prior conversation turns
-    if session_history:
-        for entry in session_history:
-            messages.append({"role": "user", "content": entry["task"]})
-            messages.append({"role": "assistant", "content": entry["response"]})
-
     if images_bytes:
-        messages.append({
+        messages = [{
             "role": "system", 
             "content": (
+                f"{prompt_intro} "
                 "You are an expert vision-language assistant. Your task is to analyze images with high precision, "
                 "reasoning step-by-step about visual elements and their spatial relationships (e.g., coordinates, "
                 "relative positions like left/right/center). Always verify visual evidence before concluding. "
                 "If a task requires external data, calculation, or specific actions beyond visual description, "
                 "use the provided tools. Be concise, objective, and format your tool calls strictly according to schema."
-            )})
+            )
+        }]
         messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": instruction},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{images_bytes[0]}"}}
-                    ],})
+            "role": "user",
+            "content": [
+                {"type": "text", "text": instruction},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{images_bytes[0]}"}}
+            ]
+        })
     else:
+        messages = [{"role": "system", "content": prompt_intro}]
         messages.append({"role": "user", "content": instruction})
+    
+    session_history = kwargs.get('session_history', None)
+    if session_history:
+        for entry in session_history:
+            messages.append({"role": "user", "content": entry["task"]})
+            messages.append({"role": "assistant", "content": entry["response"]})   
         
     if not memories and not session_history:
         message = {'role': 'tool', 'content': '', 'name': '', 'parameters': {}, "tool_call_id": ''}

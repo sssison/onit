@@ -126,6 +126,18 @@ class TestOnItInitialize:
             onit = OnIt(config=cfg)
         assert onit.timeout is None
 
+    def test_prompt_intro_from_config(self, tmp_path):
+        cfg = _make_config(tmp_path, {"prompt_intro": "I am a custom bot."})
+        with _mock_discover():
+            onit = OnIt(config=cfg)
+        assert onit.prompt_intro == "I am a custom bot."
+
+    def test_prompt_intro_default_none(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        with _mock_discover():
+            onit = OnIt(config=cfg)
+        assert onit.prompt_intro is None
+
     def test_placeholder_credentials_nullified(self, tmp_path):
         cfg = _make_config(tmp_path)
         cfg["web_google_client_id"] = "YOUR_GOOGLE_CLIENT_ID_HERE"
@@ -248,6 +260,29 @@ class TestProcessTask:
             result = await onit.process_task("fail")
 
         assert "rephrase" in result
+
+    @pytest.mark.asyncio
+    async def test_prompt_intro_passed_to_chat(self, tmp_path):
+        onit = _make_onit_for_async(tmp_path, {"prompt_intro": "I am a custom bot."})
+        onit.safety_queue = asyncio.Queue()
+
+        mock_prompt_msg = MagicMock()
+        mock_prompt_msg.content.text = "Instruction text"
+        mock_prompt_result = MagicMock()
+        mock_prompt_result.messages = [mock_prompt_msg]
+
+        mock_client = AsyncMock()
+        mock_client.get_prompt = AsyncMock(return_value=mock_prompt_result)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        mock_chat = AsyncMock(return_value="answer")
+        with patch("src.onit.Client", return_value=mock_client), \
+             patch("src.onit.chat", mock_chat):
+            await onit.process_task("test")
+
+        call_kwargs = mock_chat.call_args.kwargs
+        assert call_kwargs.get("prompt_intro") == "I am a custom bot."
 
 
 # ── OnItA2AExecutor ─────────────────────────────────────────────────────────

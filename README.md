@@ -79,6 +79,7 @@ serving:
 
 verbose: false
 timeout: 600
+# prompt_intro: "I am a helpful AI assistant. My name is OnIt."
 
 web: false
 web_port: 9000
@@ -107,6 +108,7 @@ The LLM provider is auto-detected from the host URL. If it contains `openrouter.
 | `--verbose` | Enable verbose logging | `false` |
 | `--timeout` | Request timeout in seconds (`-1` = none) | `600` |
 | `--template-path` | Path to custom prompt template YAML file | — |
+| `--prompt-intro` | Custom system prompt intro for the model | `"I am a helpful AI assistant. My name is OnIt."` |
 
 **Text UI:**
 

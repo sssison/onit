@@ -251,3 +251,26 @@ class TestChat:
         contents = [m.get("content", "") for m in messages if isinstance(m, dict)]
         assert "prior question" in contents
         assert "prior answer" in contents
+
+    @pytest.mark.asyncio
+    async def test_custom_prompt_intro(self):
+        """Custom prompt_intro overrides the default system message."""
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_completion("ok")
+        )
+
+        with patch("model.serving.chat.AsyncOpenAI", return_value=mock_client):
+            await chat(
+                host="http://localhost:8000/v1",
+                model="test",
+                instruction="hello",
+                safety_queue=asyncio.Queue(),
+                prompt_intro="I am a custom bot.",
+            )
+
+        call_args = mock_client.chat.completions.create.call_args
+        messages = call_args.kwargs["messages"]
+        system_content = messages[0]["content"]
+        assert "custom bot" in system_content
+        assert "OnIt" not in system_content
