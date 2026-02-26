@@ -237,7 +237,6 @@ class OnIt(BaseModel):
     a2a_description: str = Field(default="An intelligent agent for task automation and assistance.")
     gateway: str | None = Field(default=None)
     gateway_token: str | None = Field(default=None, exclude=True)
-    gateway_show_logs: bool = Field(default=False)
     viber_webhook_url: str | None = Field(default=None)
     viber_port: int = Field(default=8443)
     prompt_url: str | None = Field(default=None, exclude=True)
@@ -406,7 +405,6 @@ class OnIt(BaseModel):
         self.a2a_description = self.config_data.get('a2a_description', 'An intelligent agent for task automation and assistance.')
         self.gateway = self.config_data.get('gateway', None) or None
         self.gateway_token = self.config_data.get('gateway_token', None)
-        self.gateway_show_logs = self.config_data.get('gateway_show_logs', False)
         self.viber_webhook_url = self.config_data.get('viber_webhook_url', None)
         self.viber_port = self.config_data.get('viber_port', 8443)
     def load_session_history(self, max_turns: int = 20, session_path: str | None = None) -> list[dict]:
@@ -739,7 +737,7 @@ class OnIt(BaseModel):
                 self, self.gateway_token,
                 webhook_url=self.viber_webhook_url,
                 port=self.viber_port,
-                show_logs=self.gateway_show_logs,
+                show_logs=self.show_logs,
             )
         else:
             from .ui.telegram import TelegramGateway
@@ -749,7 +747,7 @@ class OnIt(BaseModel):
                     "Telegram gateway requires a bot token. Set TELEGRAM_BOT_TOKEN "
                     "environment variable or gateway_token in config."
                 )
-            gw = TelegramGateway(self, self.gateway_token, show_logs=self.gateway_show_logs)
+            gw = TelegramGateway(self, self.gateway_token, show_logs=self.show_logs)
 
         gw.run_sync()
 

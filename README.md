@@ -115,7 +115,7 @@ The LLM provider is auto-detected from the host URL. If it contains `openrouter.
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--text-theme` | Text UI theme (`white` or `dark`) | `dark` |
-| `--text-show-logs` | Show execution logs panel | `false` |
+| `--show-logs` | Show execution logs | `false` |
 
 **Web UI:**
 
@@ -131,7 +131,6 @@ The LLM provider is auto-detected from the host URL. If it contains `openrouter.
 | `--gateway` | Auto-detect gateway (Telegram or Viber based on env vars) | — |
 | `--gateway telegram` | Run as a Telegram bot gateway (requires `TELEGRAM_BOT_TOKEN`) | — |
 | `--gateway viber` | Run as a Viber bot gateway (requires `VIBER_BOT_TOKEN`) | — |
-| `--gateway-show-logs` | Print messages and replies to terminal | `false` |
 | `--viber-webhook-url` | Public HTTPS URL for Viber webhook | — |
 | `--viber-port` | Local port for Viber webhook server | `8443` |
 

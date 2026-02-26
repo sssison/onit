@@ -307,8 +307,8 @@ def main():
     # Text UI options
     parser.add_argument('--text-theme', type=str, default=None,
                         help='Text UI theme (e.g. "white", "dark").')
-    parser.add_argument('--text-show-logs', action='store_true', default=None,
-                        help='Show execution logs in text UI.')
+    parser.add_argument('--show-logs', action='store_true', default=None,
+                        help='Show execution logs.')
 
     # Web UI options
     parser.add_argument('--web', action='store_true', default=None,
@@ -342,8 +342,6 @@ def main():
                         choices=['telegram', 'viber', 'auto'],
                         help='Run as a messaging gateway. Options: telegram, viber, auto '
                              '(auto-detect from env vars). Default when flag used alone: auto.')
-    parser.add_argument('--gateway-show-logs', action='store_true', default=None,
-                        help='Show received messages and bot replies in the terminal (gateway mode only).')
     parser.add_argument('--viber-webhook-url', type=str, default=None,
                         help='Public HTTPS URL for Viber webhook (or set VIBER_WEBHOOK_URL env var).')
     parser.add_argument('--viber-port', type=int, default=None,
@@ -405,7 +403,7 @@ def main():
         'verbose': 'verbose',
         'text_theme': 'theme',
         'timeout': 'timeout',
-        'text_show_logs': 'show_logs',
+        'show_logs': 'show_logs',
         'web': 'web',
         'web_port': 'web_port',
         'template_path': 'template_path',
@@ -415,7 +413,6 @@ def main():
         'a2a': 'a2a',
         'a2a_port': 'a2a_port',
         'gateway': 'gateway',
-        'gateway_show_logs': 'gateway_show_logs',
         'viber_webhook_url': 'viber_webhook_url',
         'viber_port': 'viber_port',
     }

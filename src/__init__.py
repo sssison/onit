@@ -1,3 +1,3 @@
-__version__ = "0.1.2"
+__version__ = "0.1.3b"
 
 from .onit import OnIt
