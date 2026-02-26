@@ -330,13 +330,27 @@ Serve models locally with [vLLM](https://github.com/vllm-project/vllm):
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-30B-A3B-Instruct-2507 \
   --max-model-len 262144 --port 8000 \
-  --enable-auto-tool-choice --tool-call-parser qwen3_xml \
+  --enable-auto-tool-choice --tool-call-parser hermes \
   --reasoning-parser qwen3 --tensor-parallel-size 4 \
   --chat-template-content-format string
 ```
 
 ```bash
 export ONIT_HOST=http://localhost:8000/v1
+onit
+```
+
+For vision-language models (VLM), serve on a separate port:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3.5-35B-A3B \
+  --port 8001 --max-model-len 262144 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 --tensor-parallel-size 4
+```
+
+```bash
+export ONIT_HOST=http://localhost:8001/v1
 onit
 ```
 
