@@ -110,27 +110,7 @@ The V2 configuration keeps legacy TurtleBot MCP entries disabled and enables:
 - `TurtlebotVisionServerV2`
 - `TurtlebotLidarServerV2`
 
-## Distance Estimation Mode
+### 8) Some observations
 
-Use this mode when your primary objective is measuring distances and preventing collisions.
-
-Enabled MCP servers in default config:
-- `PromptsMCPServer`
-- `TurtlebotCameraServerV2`
-- `TurtlebotLidarServerV2`
-
-Disabled by default in this profile:
-- `WebSearchHandler`
-- `TurtlebotMotionServerV2`
-- `TurtlebotVisionServerV2`
-
-Recommended distance-estimation tools:
-- `tbot_lidar_sector_stats`: best wall/object proximity summary in a direction band (`min/mean/p10/p50/p90`)
-- `tbot_lidar_distance_at_angle`: best single-bearing distance query (e.g., straight ahead)
-- `tbot_lidar_check_collision`: best safety gate (`clear/caution/stop/unknown`)
-- `tbot_camera_get_decoded_frame`: visual sanity check for ambiguous LiDAR returns
-- `tbot_lidar_health`, `tbot_camera_health`: readiness checks before decisions
-
-Tool discovery behavior:
-- Only true MCP tools from `list_tools()` are discovered.
-- MCP prompts/resources are no longer registered as callable tools.
+- When asking the agent to "look around and find an object", the agent performs repeated actions particularly turning->looking, turning->looking, so-on. It would be beneficial to create a "pipeline" for repeatedly paired actions.
+- Explore also the possibility of using asynchronous tool cooling such that the robot can access vision tools, while using motion tools.
