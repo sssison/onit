@@ -547,7 +547,7 @@ atexit.register(_shutdown_ros)
 
 @mcp_lidar_v2.tool()
 async def tbot_lidar_health() -> dict[str, Any]:
-    """Return current subscriber status for /scan."""
+    """Check if the LiDAR sensor is online and receiving data."""
     try:
         node = _get_lidar_node()
     except Exception as e:
@@ -573,7 +573,7 @@ async def tbot_lidar_distance_at_angle(
     window_deg: float = 2.0,
     method: str = "min",
 ) -> dict[str, Any]:
-    """Estimate distance at a bearing using values in a local angular window."""
+    """Measure the distance to an object in a given direction (0=front, 90=left, -90=right, 180=back). Use this to estimate how far away a detected object is before approaching it."""
     angle_value = _ensure_finite("angle_deg", angle_deg)
     window_value = _ensure_non_negative("window_deg", window_deg)
     method_value = method.strip().lower()
@@ -593,23 +593,6 @@ async def tbot_lidar_distance_at_angle(
 
 
 @mcp_lidar_v2.tool()
-async def tbot_lidar_sector_stats(center_deg: float, half_width_deg: float = 15.0) -> dict[str, Any]:
-    """Return robust distance statistics in a sector centered at center_deg."""
-    center_value = _ensure_finite("center_deg", center_deg)
-    half_width_value = _ensure_non_negative("half_width_deg", half_width_deg)
-    stats = _compute_sector_stats(
-        scan=_get_lidar_node().latest_scan(),
-        center_deg=center_value,
-        half_width_deg=half_width_value,
-    )
-    return {
-        **stats,
-        "center_deg": center_value,
-        "half_width_deg": half_width_value,
-    }
-
-
-@mcp_lidar_v2.tool()
 async def tbot_lidar_check_collision(
     front_threshold_m: float = 0.25,
     side_threshold_m: float = 0.20,
@@ -617,7 +600,7 @@ async def tbot_lidar_check_collision(
     sector_half_width_deg: float = 20.0,
     max_scan_age_s: float = 0.5,
 ) -> dict[str, Any]:
-    """Check near-collision risk using front/left/right/back LiDAR sectors."""
+    """Check for collision risk before moving forward or backward toward an object. Returns risk_level: 'clear' (safe to proceed), 'caution' (slow down), or 'stop' (do not move). Only needed before linear motion — do NOT call this for rotation."""
     front_threshold = _ensure_non_negative("front_threshold_m", front_threshold_m)
     side_threshold = _ensure_non_negative("side_threshold_m", side_threshold_m)
     back_threshold = _ensure_non_negative("back_threshold_m", back_threshold_m)

@@ -14,31 +14,33 @@ instruction_template: |
 
   ## Tool Usage Guidelines
 
-  ### 1. Before Moving — Collision Check
-  - Call `tbot_lidar_check_collision` before every motion command.
-  - If risk level is not "safe", do NOT move; reassess.
-  - Use front/side/back thresholds: 0.25 m / 0.20 m / 0.25 m (defaults).
-
-  ### 2. Navigation & Motion
+  ### 1. Navigation & Motion
   - Use `tbot_motion_move(linear, angular, duration_s)` to move.
   - Use `tbot_motion_stop()` immediately if a hazard is detected mid-move.
   - Prefer short duration moves (0.5–1.0 s) with re-checks between each.
   - Use `tbot_motion_health()` to confirm the server is online before sending commands.
 
-  ### 3. Camera & Scene Analysis
+  ### 2. Camera & Scene Analysis
   - Capture frames with `tbot_camera_get_decoded_frame()`.
   - Pass the image to `tbot_vision_analyze_scene(images, task)` for scene understanding.
   - Use scene analysis output (objects, hazards, navigation hints) to inform motion decisions.
   - Check `tbot_camera_health()` if frames are unavailable.
 
-  ### 4. Object Search
+  ### 3. Object Search
   - Use `tbot_search_while_rotating(target)` to locate a named object.
   - Set `stop_on_collision=True` and leave collision thresholds at safe defaults.
   - Once the target is detected (confidence >= 0.65), stop rotation and report position.
 
+  ### 4. LiDAR — When Approaching an Object Only
+  - **Do NOT call LiDAR tools for rotation or turning in place.** LiDAR is only needed when moving linearly toward an object.
+  - Before driving forward toward a detected object, call `tbot_lidar_distance_at_angle(angle_deg)` to estimate how far away it is.
+  - Call `tbot_lidar_check_collision()` before each forward/backward motion segment. If risk_level is "stop", do not move; if "caution", slow down; if "clear", proceed.
+  - Use `tbot_lidar_health()` only if LiDAR data appears stale or unavailable.
+
   ## Safety Rules
-  - NEVER move without a preceding collision check.
-  - NEVER ignore a "high risk" or "collision imminent" LiDAR result.
+  - Do NOT call LiDAR for rotation — it is unnecessary and wastes time.
+  - Call `tbot_lidar_check_collision()` only before linear (forward/backward) motion.
+  - NEVER ignore a "stop" risk_level from a collision check.
   - Always call `tbot_motion_stop()` before ending a task or on any error.
 
   ## File Operations Policy
