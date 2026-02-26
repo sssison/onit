@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onit"
-version = "0.1.2"
+version = "0.1.4"
 description = "An intelligent agent for task automation and assistance"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -49,6 +49,7 @@ web = [
 ]
 gateway = [
     "python-telegram-bot",
+    "aiohttp",
 ]
 test = [
     "pytest",

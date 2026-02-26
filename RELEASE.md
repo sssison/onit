@@ -1,5 +1,38 @@
 # Release Notes
 
+## v0.1.4
+
+### New Features
+
+- **Per-Session Isolation (Web UI)** — Each browser tab now gets its own independent session with isolated chat history, file storage, and response routing. Multiple users can chat concurrently without seeing each other's messages or files. Sessions auto-cleanup after 24 hours.
+- **Per-Session Isolation (A2A Server)** — Each A2A context (client conversation) gets its own isolated session with separate chat history, data directory, and safety queue. Different A2A clients no longer share state.
+- **Concurrent Request Processing (Web UI)** — Web UI requests are now processed concurrently via `process_task()` (matching the Telegram/Viber gateway pattern), instead of sequentially through a single queue.
+
+### Improvements
+
+- **Session-Scoped File Routes** — File uploads and downloads are now scoped per session (`/uploads/{session_id}/{filename}`), preventing file conflicts between users. Legacy `/uploads/{filename}` route preserved for backward compatibility.
+- **Per-Session Stop** — The Stop button in the web UI now only cancels the current browser tab's task, not all users' tasks. A2A client disconnects similarly only cancel that client's in-flight request.
+
+## v0.1.3a
+
+### New Features
+
+- **Viber Gateway** — Chat with OnIt remotely via a Viber bot. Supports text and photo messages with vision processing. Requires a public HTTPS webhook URL (see [Gateway Quick Start](docs/GATEWAY_QUICK_START.md)).
+- **Gateway Auto-Detection** — `onit --gateway` now auto-detects Telegram or Viber based on which environment variable is set (`TELEGRAM_BOT_TOKEN` or `VIBER_BOT_TOKEN`).
+- **Tunnel Documentation** — Comprehensive guide for tunneling options: Cloudflare Tunnel, ngrok, localtunnel, Tailscale Funnel, and SSH reverse tunnel.
+
+### Improvements
+
+- **Friendly Error Messages** — All user-facing interfaces (terminal, web, Telegram, Viber, A2A) now return friendly messages instead of exposing internal error details. Server errors are logged via `logger.error()` for debugging.
+- **Webhook Registration Timing** — Fixed race condition where Viber webhook was registered before uvicorn started accepting connections.
+- **Logging** — Added `logger` to `chat.py` and `onit.py` so API errors (timeouts, connection failures) are always logged regardless of `verbose` setting.
+
+### Bug Fixes
+
+- Fixed `chat()` returning raw error strings to users on `APITimeoutError` and `OpenAIError` — now returns `None` so callers handle it consistently.
+- Fixed `agent_session()` sending raw exception text to the output queue — now sends `None` to trigger the retry prompt.
+- Fixed Telegram and Viber gateways exposing `f"Error: {e}"` to users on exceptions.
+
 ## v0.1.2
 
 ### New Features

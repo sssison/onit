@@ -9,7 +9,7 @@ OnIt is an intelligent agent framework for task automation and assistance. It is
 ### 1. Install
 
 ```bash
-pip install onit==0.1.2
+pip install onit==0.1.4
 ```
 
 Or from source:
@@ -54,7 +54,7 @@ That's it. MCP servers start automatically, and you get an interactive terminal 
 
 ```bash
 onit --web                          # Gradio web UI on port 9000
-onit --gateway                      # Telegram bot gateway
+onit --gateway                      # Telegram/Viber bot gateway
 onit --a2a                          # A2A server on port 9001
 onit --client --task "your task"    # Send a task to an A2A server and print the answer
 ```
@@ -124,11 +124,16 @@ The LLM provider is auto-detected from the host URL. If it contains `openrouter.
 | `--web` | Launch Gradio web UI | `false` |
 | `--web-port` | Gradio web UI port | `9000` |
 
-**Telegram Gateway:**
+**Gateway (Telegram / Viber):**
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--gateway` | Run as a Telegram bot gateway (requires `TELEGRAM_BOT_TOKEN` env var) | `false` |
+| `--gateway` | Auto-detect gateway (Telegram or Viber based on env vars) | — |
+| `--gateway telegram` | Run as a Telegram bot gateway (requires `TELEGRAM_BOT_TOKEN`) | — |
+| `--gateway viber` | Run as a Viber bot gateway (requires `VIBER_BOT_TOKEN`) | — |
+| `--gateway-show-logs` | Print messages and replies to terminal | `false` |
+| `--viber-webhook-url` | Public HTTPS URL for Viber webhook | — |
+| `--viber-port` | Local port for Viber webhook server | `8443` |
 
 **A2A (Agent-to-Agent):**
 
@@ -182,23 +187,26 @@ Connect to additional external MCP servers:
 onit --mcp-sse http://localhost:8080/sse --mcp-sse http://192.168.1.50:9090/sse
 ```
 
-### Telegram Gateway
+### Messaging Gateways (Telegram & Viber)
 
-Chat with OnIt remotely from the Telegram mobile app using a Telegram bot.
+Chat with OnIt remotely from **Telegram** or **Viber** using a bot.
 
-**Setup:**
-
-1. Create a bot with [BotFather](https://t.me/BotFather) on Telegram (`/newbot`) and copy the token.
-2. Set the token and start the gateway:
+**Telegram:**
 
 ```bash
 export TELEGRAM_BOT_TOKEN=your-bot-token-here
-onit --gateway
+onit --gateway telegram
 ```
 
-3. Open Telegram, find your bot, and send a message. OnIt will respond using the full agent with all its tools.
+**Viber** (requires a public HTTPS webhook URL — see [Gateway Quick Start](docs/GATEWAY_QUICK_START.md)):
 
-You can also send photos — the bot will pass them to the LLM for vision processing (if your model supports it). The photo caption is used as the prompt (defaults to "Describe this image." if no caption is provided).
+```bash
+export VIBER_BOT_TOKEN=your-viber-token
+export VIBER_WEBHOOK_URL=https://your-domain.com/viber
+onit --gateway viber
+```
+
+Both gateways support text and photo messages. The photo caption is used as the prompt (defaults to "Describe this image." if no caption is provided). Use `--gateway` without a type to auto-detect based on which token is set.
 
 **Install the gateway dependency separately if not using `[all]`:**
 
@@ -365,10 +373,10 @@ Browse available models at [openrouter.ai/models](https://openrouter.ai/models) 
 ┌─────────────────────────────────────────────────────┐
 │                     OnIt (src/onit.py)              │
 │                                                     │
-│  ┌─────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
-│  │ ChatUI  │ │ WebChatUI│ │ Telegram │ │ A2A      │  │
-│  │(terminal│ │ (Gradio) │ │ Gateway  │ │ Server   │  │
-│  └────┬────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘  │
+│  ┌─────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐ ┌──────┐ │
+│  │ ChatUI  │ │ WebChatUI│ │ Telegram │ │ Viber  │ │ A2A  │ │
+│  │(terminal│ │ (Gradio) │ │ Gateway  │ │Gateway │ │Server│ │
+│  └────┬────┘ └────┬─────┘ └────┬─────┘ └───┬────┘ └──┬───┘ │
 │       └─────────┬─┘            │             │       │
 │                 ▼                 ▼                 │
 │          client_to_agent()  /  process_task()       │
@@ -411,12 +419,14 @@ onit/
 │   ├── ui/
 │   │   ├── text.py             # Rich terminal UI
 │   │   ├── web.py              # Gradio web UI
-│   │   └── telegram.py         # Telegram bot gateway
+│   │   ├── telegram.py         # Telegram bot gateway
+│   │   └── viber.py            # Viber bot gateway
 │   └── test/                   # Test suite (pytest)
 ```
 
 ## Documentation
 
+- [Gateway Quick Start](docs/GATEWAY_QUICK_START.md) — Telegram and Viber bot setup
 - [Testing](docs/TESTING.md) — Running the test suite
 - [Docker](docs/DOCKER.md) — Docker and Docker Compose setup
 - [Web Authentication](docs/WEB_AUTHENTICATION.md) — Web UI authentication reference

@@ -142,7 +142,7 @@ class TelegramGateway:
             )
         except Exception as e:
             logger.error("Error processing task: %s", e)
-            response = f"Error: {e}"
+            response = "I am sorry \U0001f614. Could you please rephrase your question?"
         finally:
             stop_typing.set()
             typing_task.cancel()
@@ -216,7 +216,7 @@ class TelegramGateway:
             )
         except Exception as e:
             logger.error("Error processing image task: %s", e)
-            response = f"Error: {e}"
+            response = "I am sorry \U0001f614. Could you please rephrase your question?"
         finally:
             stop_typing.set()
             typing_task.cancel()

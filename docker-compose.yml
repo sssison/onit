@@ -17,6 +17,8 @@ services:
     env_file: .env
     depends_on:
       - onit-mcp
+    volumes:
+      - web-sessions:/root/.onit/sessions
     command: ["--web", "--web-port", "9000", "--mcp-host", "onit-mcp"]
 
   onit-a2a:
@@ -26,6 +28,8 @@ services:
     env_file: .env
     depends_on:
       - onit-mcp
+    volumes:
+      - a2a-sessions:/root/.onit/sessions
     command: ["--a2a", "--a2a-port", "9001", "--mcp-host", "onit-mcp"]
 
   onit-gateway:
@@ -33,4 +37,11 @@ services:
     env_file: .env
     depends_on:
       - onit-mcp
+    volumes:
+      - gateway-sessions:/root/.onit/sessions
     command: ["--gateway", "--mcp-host", "onit-mcp"]
+
+volumes:
+  web-sessions:
+  a2a-sessions:
+  gateway-sessions:

@@ -338,10 +338,16 @@ def main():
                         help='Period in seconds between A2A loop iterations (default: 10).')
 
     # Gateway options
-    parser.add_argument('--gateway', action='store_true', default=None,
-                        help='Run as a Telegram bot gateway (requires TELEGRAM_BOT_TOKEN env var).')
+    parser.add_argument('--gateway', nargs='?', const='auto', default=None,
+                        choices=['telegram', 'viber', 'auto'],
+                        help='Run as a messaging gateway. Options: telegram, viber, auto '
+                             '(auto-detect from env vars). Default when flag used alone: auto.')
     parser.add_argument('--gateway-show-logs', action='store_true', default=None,
                         help='Show received messages and bot replies in the terminal (gateway mode only).')
+    parser.add_argument('--viber-webhook-url', type=str, default=None,
+                        help='Public HTTPS URL for Viber webhook (or set VIBER_WEBHOOK_URL env var).')
+    parser.add_argument('--viber-port', type=int, default=None,
+                        help='Local port for Viber webhook server (default: 8443).')
 
     # MCP options
     parser.add_argument('--mcp-host', type=str, default=None,
@@ -410,6 +416,8 @@ def main():
         'a2a_port': 'a2a_port',
         'gateway': 'gateway',
         'gateway_show_logs': 'gateway_show_logs',
+        'viber_webhook_url': 'viber_webhook_url',
+        'viber_port': 'viber_port',
     }
     for arg_name, config_key in arg_to_config.items():
         value = getattr(args, arg_name, None)
@@ -482,14 +490,46 @@ def main():
               file=sys.stderr)
         os.environ['ONIT_DISABLE_WEATHER'] = '1'
 
-    # Check TELEGRAM_BOT_TOKEN for gateway mode
-    if config_data.get('gateway'):
-        gateway_token = os.environ.get('TELEGRAM_BOT_TOKEN')
-        if not gateway_token:
-            print("Error: --gateway requires TELEGRAM_BOT_TOKEN environment variable.",
-                  file=sys.stderr)
-            sys.exit(1)
-        config_data['gateway_token'] = gateway_token
+    # Resolve gateway type and token
+    gateway_type = config_data.get('gateway')
+    if gateway_type:
+        telegram_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+        viber_token = os.environ.get('VIBER_BOT_TOKEN')
+
+        if gateway_type == 'auto':
+            # Auto-detect: prefer Telegram for backward compat, fall back to Viber
+            if telegram_token:
+                gateway_type = 'telegram'
+            elif viber_token:
+                gateway_type = 'viber'
+            else:
+                print("Error: --gateway requires TELEGRAM_BOT_TOKEN or VIBER_BOT_TOKEN "
+                      "environment variable.", file=sys.stderr)
+                sys.exit(1)
+
+        if gateway_type == 'viber':
+            if not viber_token:
+                print("Error: --gateway viber requires VIBER_BOT_TOKEN environment variable.",
+                      file=sys.stderr)
+                sys.exit(1)
+            config_data['gateway_token'] = viber_token
+            # Resolve webhook URL
+            webhook_url = (config_data.get('viber_webhook_url')
+                           or os.environ.get('VIBER_WEBHOOK_URL'))
+            if not webhook_url:
+                print("Error: Viber gateway requires a webhook URL. "
+                      "Set VIBER_WEBHOOK_URL env var or --viber-webhook-url.",
+                      file=sys.stderr)
+                sys.exit(1)
+            config_data['viber_webhook_url'] = webhook_url
+        else:  # telegram
+            if not telegram_token:
+                print("Error: --gateway telegram requires TELEGRAM_BOT_TOKEN "
+                      "environment variable.", file=sys.stderr)
+                sys.exit(1)
+            config_data['gateway_token'] = telegram_token
+
+        config_data['gateway'] = gateway_type
 
     # Auto-start MCP servers if not already running
     _ensure_mcp_servers(

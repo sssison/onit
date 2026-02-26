@@ -19,12 +19,15 @@ Provider is auto-detected from the host URL.
 
 import asyncio
 import base64
+import logging
 import os
 import json
 import re
 import uuid
 from openai import AsyncOpenAI, OpenAIError, APITimeoutError
 from typing import List, Optional, Any
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_api_key(host: str, host_key: str = "EMPTY") -> str:
@@ -251,7 +254,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
 
     if images_bytes:
         messages = [{
-            "role": "system", 
+            "role": "system",
             "content": (
                 f"{prompt_intro} "
                 "You are an expert vision-language assistant. Your task is to analyze images with high precision, "
@@ -261,6 +264,20 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 "use the provided tools. Be concise, objective, and format your tool calls strictly according to schema."
             )
         }]
+    else:
+        messages = [{"role": "system", "content": prompt_intro}]
+
+    # Inject session history BEFORE the current instruction so the model
+    # sees prior context first and treats the latest user message as the
+    # one to respond to.
+    session_history = kwargs.get('session_history', None)
+    if session_history:
+        for entry in session_history:
+            messages.append({"role": "user", "content": entry["task"]})
+            messages.append({"role": "assistant", "content": entry["response"]})
+
+    # Current instruction goes last so the model responds to it
+    if images_bytes:
         messages.append({
             "role": "user",
             "content": [
@@ -269,14 +286,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             ]
         })
     else:
-        messages = [{"role": "system", "content": prompt_intro}]
-        messages.append({"role": "user", "content": instruction})
-    
-    session_history = kwargs.get('session_history', None)
-    if session_history:
-        for entry in session_history:
-            messages.append({"role": "user", "content": entry["task"]})
-            messages.append({"role": "assistant", "content": entry["response"]})   
+        messages.append({"role": "user", "content": instruction})   
         
     if not memories and not session_history:
         message = {'role': 'tool', 'content': '', 'name': '', 'parameters': {}, "tool_call_id": ''}
@@ -305,6 +315,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
 
         try:
             if not safety_queue.empty():
+                logger.warning("Safety queue triggered before API call, exiting chat loop.")
                 return None
 
             completion_kwargs = dict(
@@ -328,9 +339,11 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
 
             await asyncio.sleep(0.1)
             if not safety_queue.empty():
+                logger.warning("Safety queue triggered after API call, exiting chat loop.")
                 return None
         except APITimeoutError as e:
             error_message = f"Request to {host} timed out after {timeout} seconds."
+            logger.error(error_message)
             if chat_ui:
                 chat_ui.add_log(error_message, level="error")
             elif verbose:
@@ -338,6 +351,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             return None
         except OpenAIError as e:
             error_message = f"Error communicating with {host}: {e}."
+            logger.error(error_message)
             if chat_ui:
                 chat_ui.add_log(error_message, level="warning")
             elif verbose:
@@ -345,11 +359,12 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             return None
         except Exception as e:
             error_message = f"Unexpected error: {e}"
+            logger.error(error_message)
             if chat_ui:
                 chat_ui.add_log(error_message, level="error")
             elif verbose:
                 print(error_message)
-            return error_message
+            return None
             
         tool_calls = chat_completion.choices[0].message.tool_calls
         if tool_calls is None or len(tool_calls) == 0:
