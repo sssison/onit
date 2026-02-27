@@ -39,6 +39,7 @@ DEFAULT_VISION_API_KEY = os.getenv("TBOT_VISION_API_KEY", "EMPTY")
 
 CAMERA_MCP_URL = os.getenv("TBOT_CAMERA_MCP_URL", "http://127.0.0.1:18206/turtlebot-camera-v2")
 MOTION_MCP_URL = os.getenv("TBOT_MOTION_MCP_URL", "http://127.0.0.1:18205/turtlebot-motion-v2")
+CAMERA_HFOV_DEG = _env_float("CAMERA_HFOV_DEG", 62.0)
 
 
 def _resolve_api_key(host: str) -> str:
@@ -346,6 +347,69 @@ async def _detect_object_in_image(
     return _normalize_detection({"matched": False, "confidence": 0.0, "evidence": raw_response}, raw_response)
 
 
+def _normalize_detection_with_position(parsed: dict[str, Any] | None, raw_text: str) -> dict[str, Any]:
+    base = _normalize_detection(parsed, raw_text)
+    parsed = parsed or {}
+    x_center: float | None = None
+    in_frame_offset_deg: float | None = None
+
+    if base["matched"]:
+        raw_x = parsed.get("x_center")
+        if isinstance(raw_x, (int, float)) and math.isfinite(float(raw_x)):
+            x_center = max(0.0, min(1.0, float(raw_x)))
+            in_frame_offset_deg = (x_center - 0.5) * CAMERA_HFOV_DEG
+
+    return {**base, "x_center": x_center, "in_frame_offset_deg": in_frame_offset_deg}
+
+
+async def _detect_object_with_position(
+    vision_client: AsyncOpenAI,
+    target: str,
+    image_base64: str,
+    timeout_s: float,
+    model: str,
+) -> dict[str, Any]:
+    system_prompt = (
+        "You are a strict robot object detector. "
+        "Return only JSON with keys: matched (boolean), confidence (number 0..1), evidence (string), "
+        "x_center (number 0..1, horizontal center of object: "
+        "0=left edge, 0.5=frame center, 1=right edge; null if not matched). "
+        "No markdown."
+    )
+    user_prompt = f"Is the target object '{target}' visible in this image?"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
+            ],
+        },
+    ]
+
+    raw_response = ""
+    try:
+        completion = await vision_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            timeout=timeout_s,
+        )
+        raw_response = completion.choices[0].message.content or ""
+        parsed = _extract_first_json_object(raw_response)
+        return _normalize_detection_with_position(parsed, raw_response)
+    except APITimeoutError:
+        raw_response = f"Vision request timed out after {timeout_s:.2f}s."
+    except OpenAIError as e:
+        raw_response = f"Vision request failed: {e}"
+    except Exception as e:
+        raw_response = f"Unexpected vision error: {e}"
+
+    return _normalize_detection_with_position(
+        {"matched": False, "confidence": 0.0, "evidence": raw_response}, raw_response
+    )
+
+
 @mcp_vision_v2.tool()
 async def tbot_vision_capture_and_analyze(
     prompt: str = "Analyze scene for navigation, obstacles, objects, and visible text.",
@@ -459,6 +523,7 @@ async def tbot_vision_analyze_frames_for_object(
 
     best_heading: float | None = None
     best_confidence = 0.0
+    best_in_frame_offset_deg: float | None = None
     frames_analyzed = 0
 
     for frame in frames:
@@ -469,7 +534,7 @@ async def tbot_vision_analyze_frames_for_object(
         if not isinstance(image_b64, str) or not image_b64.strip():
             continue
 
-        detection = await _detect_object_in_image(
+        detection = await _detect_object_with_position(
             vision_client=vision_client,
             target=object_name_clean,
             image_base64=image_b64.strip(),
@@ -483,12 +548,14 @@ async def tbot_vision_analyze_frames_for_object(
 
         if detection["matched"] and detection["confidence"] >= threshold:
             best_heading = float(heading_offset)
+            best_in_frame_offset_deg = detection["in_frame_offset_deg"]
             break
 
     if best_heading is not None:
         return {
             "status": "found",
             "heading_offset_deg": best_heading,
+            "in_frame_offset_deg": best_in_frame_offset_deg,
             "frames_analyzed": frames_analyzed,
             "best_confidence": best_confidence,
             "object_name": object_name_clean,
@@ -497,6 +564,7 @@ async def tbot_vision_analyze_frames_for_object(
     return {
         "status": "not_found",
         "heading_offset_deg": None,
+        "in_frame_offset_deg": None,
         "frames_analyzed": frames_analyzed,
         "best_confidence": best_confidence,
         "object_name": object_name_clean,

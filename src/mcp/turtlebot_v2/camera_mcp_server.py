@@ -9,6 +9,7 @@ import asyncio
 import atexit
 import base64
 import io
+import json
 import logging
 import math
 import os
@@ -63,6 +64,9 @@ def _env_float(name: str, default: float) -> float:
 CAMERA_TOPIC = os.getenv("CAMERA_TOPIC", "/camera/image_raw/compressed")
 NODE_NAME = os.getenv("CAMERA_NODE_NAME", "camera_mcp_server_node_v2")
 MOTION_MCP_URL = os.getenv("TBOT_MOTION_MCP_URL", "http://127.0.0.1:18205/turtlebot-motion-v2")
+VISION_MCP_URL = os.getenv("TBOT_VISION_MCP_URL", "http://127.0.0.1:18207/turtlebot-vision-v2")
+REORIENT_THRESHOLD_DEG = _env_float("REORIENT_THRESHOLD_DEG", 8.0)
+REORIENT_MAX_ITERATIONS = 6
 FRAME_LOG_EVERY = max(1, int(_env_float("CAMERA_FRAME_LOG_EVERY", 30)))
 
 DEFAULT_FRAME_MAX_BYTES = max(1, int(_env_float("CAMERA_FRAME_MAX_BYTES", 1_500_000)))
@@ -418,6 +422,100 @@ async def tbot_camera_capture_frames_during_rotation(
         "total_degrees_rotated": round(cumulative_deg, 4),
         "num_frames": len(captured_frames),
         "step_deg": round(step_deg, 4),
+    }
+
+
+def _extract_tool_dict(tool_result: Any) -> dict[str, Any]:
+    """Extract a dict from a FastMCP Client.call_tool() ToolResult."""
+    if isinstance(tool_result, dict):
+        return tool_result
+    structured = getattr(tool_result, "structured_content", None)
+    if isinstance(structured, dict):
+        return structured
+    structured_camel = getattr(tool_result, "structuredContent", None)
+    if isinstance(structured_camel, dict):
+        return structured_camel
+    content = getattr(tool_result, "content", None)
+    if isinstance(content, list):
+        for part in content:
+            text = getattr(part, "text", None)
+            if isinstance(text, str):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+    return {}
+
+
+@mcp_camera_v2.tool()
+async def tbot_camera_reorient_to_object(
+    object_name: str,
+    threshold_deg: float = REORIENT_THRESHOLD_DEG,
+    max_iterations: int = REORIENT_MAX_ITERATIONS,
+) -> dict[str, Any]:
+    """Run a closed-loop fine-tuning pass to center the robot on a target object. Captures a frame, detects in-frame offset, rotates to correct, and repeats until centered or the object is lost."""
+    object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
+    if not object_name_clean:
+        raise ValueError("object_name must be a non-empty string")
+
+    node = _get_camera_node()
+    iterations = 0
+    final_in_frame_offset_deg: float | None = None
+
+    for _ in range(max_iterations):
+        iterations += 1
+
+        snapshot = node.snapshot()
+        initial_count = snapshot["frame_count"]
+        await asyncio.to_thread(node.wait_for_frame, DEFAULT_CURRENT_VIEW_WAIT_S, initial_count)
+
+        frame = node.latest_frame()
+        encoded_bytes, _, _, _ = _decode_and_reencode_jpeg(frame["bytes"])
+        b64 = base64.b64encode(encoded_bytes).decode("ascii")
+
+        async with Client(VISION_MCP_URL) as vision:
+            result = await vision.call_tool(
+                "tbot_vision_analyze_frames_for_object",
+                {
+                    "frames": [{"heading_offset_deg": 0.0, "image_base64": b64}],
+                    "object_name": object_name_clean,
+                },
+            )
+        data = _extract_tool_dict(result)
+
+        status = data.get("status")
+        in_frame_offset_deg = data.get("in_frame_offset_deg")
+        if isinstance(in_frame_offset_deg, (int, float)):
+            final_in_frame_offset_deg = float(in_frame_offset_deg)
+        else:
+            final_in_frame_offset_deg = None
+
+        if status == "not_found" or final_in_frame_offset_deg is None:
+            return {
+                "status": "lost",
+                "iterations": iterations,
+                "final_in_frame_offset_deg": final_in_frame_offset_deg,
+                "object_name": object_name_clean,
+            }
+
+        if abs(final_in_frame_offset_deg) <= threshold_deg:
+            return {
+                "status": "centered",
+                "iterations": iterations,
+                "final_in_frame_offset_deg": final_in_frame_offset_deg,
+                "object_name": object_name_clean,
+            }
+
+        async with Client(MOTION_MCP_URL) as motion:
+            await motion.call_tool("tbot_motion_scan_rotate", {"degrees": final_in_frame_offset_deg})
+
+    return {
+        "status": "max_iterations_reached",
+        "iterations": iterations,
+        "final_in_frame_offset_deg": final_in_frame_offset_deg,
+        "object_name": object_name_clean,
     }
 
 
