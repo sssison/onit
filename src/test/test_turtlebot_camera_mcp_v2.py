@@ -103,17 +103,6 @@ def test_get_decoded_frame_rejects_oversized_output():
             )
 
 
-def test_wait_for_frame_timeout_no_frame():
-    fake_node = _FakeCameraNode(frame_bytes=b"", frame_present=False, frame_count=0, wait_result=False)
-
-    with patch.object(camera_v2, "_get_camera_node", return_value=fake_node):
-        result = asyncio.run(camera_v2.tbot_camera_wait_for_frame(timeout_s=0.2))
-
-    assert result["frame_arrived"] is False
-    assert result["status"] == "waiting_for_frames"
-    assert result["frame_present"] is False
-
-
 def test_get_decoded_frame_no_frame_after_wait_raises():
     fake_node = _FakeCameraNode(frame_bytes=b"", frame_present=False, frame_count=0, wait_result=False)
 

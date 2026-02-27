@@ -178,7 +178,7 @@ if RCLPY_AVAILABLE:
                 if self._latest_bytes is None:
                     raise RuntimeError(
                         f"No frame received yet on topic '{self._topic_name}'. "
-                        "Use tbot_camera_wait_for_frame() or confirm the publisher is active."
+                        "Confirm the camera publisher is active or check tbot_camera_health()."
                     )
                 frame_age = None
                 if self._latest_rx_mono_s is not None:
@@ -288,28 +288,6 @@ async def tbot_camera_health() -> dict[str, Any]:
     snapshot = node.snapshot()
     status = "online" if snapshot["frame_present"] else "waiting_for_frames"
     return {"status": status, "ros_available": RCLPY_AVAILABLE, **snapshot}
-
-
-@mcp_camera_v2.tool()
-async def tbot_camera_wait_for_frame(timeout_s: float = 5.0) -> dict[str, Any]:
-    """Wait up to timeout_s for a newer frame and return subscriber status."""
-    timeout_value = _ensure_finite("timeout_s", timeout_s)
-    if timeout_value <= 0:
-        raise ValueError("timeout_s must be > 0")
-
-    node = _get_camera_node()
-    initial_frame_count = node.snapshot()["frame_count"]
-    frame_arrived = await asyncio.to_thread(node.wait_for_frame, timeout_value, initial_frame_count)
-    snapshot = node.snapshot()
-    status = "online" if snapshot["frame_present"] else "waiting_for_frames"
-    return {
-        "status": status,
-        "ros_available": RCLPY_AVAILABLE,
-        "frame_arrived": frame_arrived,
-        "wait_timeout_s": timeout_value,
-        "initial_frame_count": initial_frame_count,
-        **snapshot,
-    }
 
 
 @mcp_camera_v2.tool(

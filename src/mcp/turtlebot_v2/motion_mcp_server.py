@@ -5,14 +5,16 @@ Controls TurtleBot motion via the HTTP API exposed by motion_server_tbot.py.
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
 import threading
+import time
 from typing import Any, Optional
 
 import httpx
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,8 @@ HTTP_TIMEOUT_S = _env_float("MOTION_TIMEOUT_S", 2.0)
 MAX_LINEAR = abs(_env_float("MOTION_MAX_LINEAR", 0.2))
 MAX_ANGULAR = abs(_env_float("MOTION_MAX_ANGULAR", 1.0))
 ANGULAR_SIGN = _env_float("MOTION_ANGULAR_SIGN", -1.0)
+
+LIDAR_MCP_URL = os.getenv("TBOT_LIDAR_MCP_URL", "http://127.0.0.1:18208/turtlebot-lidar-v2")
 
 MOVE_PATH = "/move"
 STOP_PATH = "/stop"
@@ -259,6 +263,121 @@ async def tbot_motion_move(
         "endpoint": MOVE_PATH,
         "verification": verification,
         "physical_motion_confirmed": False,
+    }
+
+
+def _extract_tool_dict(tool_result: Any) -> dict[str, Any]:
+    """Extract a dict from a FastMCP Client.call_tool() ToolResult."""
+    if isinstance(tool_result, dict):
+        return tool_result
+    structured = getattr(tool_result, "structured_content", None)
+    if isinstance(structured, dict):
+        return structured
+    structured_camel = getattr(tool_result, "structuredContent", None)
+    if isinstance(structured_camel, dict):
+        return structured_camel
+    content = getattr(tool_result, "content", None)
+    if isinstance(content, list):
+        for part in content:
+            text = getattr(part, "text", None)
+            if isinstance(text, str):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+    return {}
+
+
+@mcp_motion_v2.tool()
+async def tbot_motion_scan_rotate(
+    degrees: float,
+    speed: float = 0.5,
+) -> dict[str, Any]:
+    """Rotate the robot by a fixed angle in degrees. Positive=left/CCW, negative=right/CW. Blocks until rotation is complete or preempted."""
+    degrees_f = _validate_finite("degrees", degrees)
+    speed_f = _validate_finite("speed", speed)
+
+    clamped_speed = abs(_clamp(abs(speed_f), MAX_ANGULAR))
+    if clamped_speed == 0.0 or degrees_f == 0.0:
+        return {"status": "completed", "degrees": degrees_f, "duration_s": 0.0, "angular_cmd": 0.0}
+
+    duration_s = abs(degrees_f * math.pi / 180.0) / clamped_speed
+    angular_cmd = math.copysign(clamped_speed, degrees_f) * ANGULAR_SIGN
+
+    command_version = _reserve_motion_command()
+    await _post_json(MOVE_PATH, {"linear": 0.0, "angular": angular_cmd})
+    await asyncio.sleep(duration_s)
+
+    if _is_latest_motion_command(command_version):
+        await _post_json(STOP_PATH)
+        return {"status": "completed", "degrees": degrees_f, "duration_s": duration_s, "angular_cmd": angular_cmd}
+
+    return {"status": "preempted", "degrees": degrees_f, "duration_s": duration_s, "angular_cmd": angular_cmd}
+
+
+@mcp_motion_v2.tool()
+async def tbot_motion_forward_until_close(
+    target_distance_m: float,
+    speed: float = 0.1,
+    timeout_s: float = 30.0,
+) -> dict[str, Any]:
+    """Move forward until the nearest obstacle in front is within target_distance_m, or until timeout_s is reached."""
+    target_dist = _validate_finite("target_distance_m", target_distance_m)
+    speed_f = _validate_finite("speed", speed)
+    timeout_f = _validate_finite("timeout_s", timeout_s)
+
+    if target_dist <= 0:
+        raise ValueError("target_distance_m must be > 0")
+    if timeout_f <= 0:
+        raise ValueError("timeout_s must be > 0")
+
+    clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
+    if clamped_speed == 0.0:
+        clamped_speed = 0.05
+
+    command_version = _reserve_motion_command()
+    await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
+
+    start_mono = time.monotonic()
+    stop_reason = "timeout"
+    final_distance_m: float | None = None
+
+    try:
+        async with Client(LIDAR_MCP_URL) as lidar:
+            while True:
+                elapsed = time.monotonic() - start_mono
+                if elapsed >= timeout_f:
+                    stop_reason = "timeout"
+                    break
+                if not _is_latest_motion_command(command_version):
+                    stop_reason = "preempted"
+                    break
+                try:
+                    result = await lidar.call_tool("tbot_lidar_nearest_obstacle", {"sector": "front"})
+                    data = _extract_tool_dict(result)
+                    dist = data.get("distance_m")
+                    if dist is not None:
+                        final_distance_m = float(dist)
+                        if final_distance_m <= target_dist:
+                            stop_reason = "obstacle_reached"
+                            break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
+    finally:
+        if _is_latest_motion_command(command_version):
+            try:
+                await _post_json(STOP_PATH)
+            except Exception:
+                pass
+
+    elapsed_s = time.monotonic() - start_mono
+    return {
+        "status": stop_reason,
+        "elapsed_s": elapsed_s,
+        "final_distance_m": final_distance_m,
     }
 
 

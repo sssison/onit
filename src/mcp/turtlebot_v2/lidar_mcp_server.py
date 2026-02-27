@@ -222,57 +222,6 @@ def _compute_sector_stats(scan: dict[str, Any], center_deg: float, half_width_de
     }
 
 
-def _distance_at_angle_from_scan(scan: dict[str, Any], angle_deg: float, window_deg: float, method: str) -> dict[str, Any]:
-    extracted = _sector_valid_ranges(scan, center_deg=angle_deg, half_width_deg=max(0.0, window_deg / 2.0))
-
-    if extracted["status"] == "angle_out_of_range":
-        return {
-            "status": "angle_out_of_range",
-            "distance_m": None,
-            "closest_angle_deg": None,
-            "samples_considered": 0,
-            "samples_valid": 0,
-        }
-
-    if extracted["status"] == "no_data":
-        return {
-            "status": "no_data",
-            "distance_m": None,
-            "closest_angle_deg": None,
-            "samples_considered": extracted["total_count"],
-            "samples_valid": extracted["valid_count"],
-        }
-
-    valid_values = extracted["valid_values"]
-    valid_angles = extracted["valid_angles_deg"]
-
-    if method == "min":
-        distance = min(valid_values)
-    elif method == "median":
-        sorted_values = sorted(valid_values)
-        length = len(sorted_values)
-        middle = length // 2
-        if length % 2 == 1:
-            distance = sorted_values[middle]
-        else:
-            distance = (sorted_values[middle - 1] + sorted_values[middle]) / 2.0
-    elif method == "mean":
-        distance = sum(valid_values) / len(valid_values)
-    else:
-        raise ValueError("method must be one of: min, median, mean")
-
-    min_value = min(valid_values)
-    min_index = valid_values.index(min_value)
-
-    return {
-        "status": "ok",
-        "distance_m": distance,
-        "closest_angle_deg": valid_angles[min_index],
-        "samples_considered": extracted["total_count"],
-        "samples_valid": extracted["valid_count"],
-    }
-
-
 def _collision_from_scan(
     scan: dict[str, Any],
     front_threshold_m: float,
@@ -567,28 +516,62 @@ async def tbot_lidar_health() -> dict[str, Any]:
     return {"status": status, "ros_available": RCLPY_AVAILABLE, **snapshot}
 
 
-@mcp_lidar_v2.tool()
-async def tbot_lidar_distance_at_angle(
-    angle_deg: float = 0.0,
-    window_deg: float = 2.0,
-    method: str = "min",
-) -> dict[str, Any]:
-    """Measure the distance to an object in a given direction (0=front, 90=left, -90=right, 180=back). Use this to estimate how far away a detected object is before approaching it."""
-    angle_value = _ensure_finite("angle_deg", angle_deg)
-    window_value = _ensure_non_negative("window_deg", window_deg)
-    method_value = method.strip().lower()
+_SECTOR_CENTERS: dict[str, float] = {
+    "front": 0.0,
+    "left": 90.0,
+    "right": -90.0,
+    "rear": 180.0,
+}
 
-    result = _distance_at_angle_from_scan(
-        scan=_get_lidar_node().latest_scan(),
-        angle_deg=angle_value,
-        window_deg=window_value,
-        method=method_value,
-    )
+
+@mcp_lidar_v2.tool()
+async def tbot_lidar_nearest_obstacle(sector: str = "front") -> dict[str, Any]:
+    """Return the distance to the nearest obstacle in a named sector: front, left, right, rear, or all."""
+    sector_clean = sector.strip().lower() if isinstance(sector, str) else "front"
+
+    try:
+        scan = _get_lidar_node().latest_scan()
+    except Exception as e:
+        return {
+            "status": "no_scan",
+            "distance_m": None,
+            "sector": sector_clean,
+            "closest_angle_deg": None,
+            "error": str(e),
+        }
+
+    if sector_clean == "all":
+        best_dist: float | None = None
+        best_angle: float | None = None
+        for _, center_deg in _SECTOR_CENTERS.items():
+            stats = _compute_sector_stats(scan, center_deg=center_deg, half_width_deg=30.0)
+            if stats["status"] == "ok" and stats["min_m"] is not None:
+                if best_dist is None or float(stats["min_m"]) < best_dist:
+                    best_dist = float(stats["min_m"])
+                    best_angle = stats["closest_angle_deg"]
+        if best_dist is None:
+            return {"status": "no_valid_ranges", "distance_m": None, "sector": sector_clean, "closest_angle_deg": None}
+        return {"status": "ok", "distance_m": best_dist, "sector": sector_clean, "closest_angle_deg": best_angle}
+
+    if sector_clean not in _SECTOR_CENTERS:
+        raise ValueError(f"sector must be one of: front, left, right, rear, all. Got: {sector!r}")
+
+    center_deg = _SECTOR_CENTERS[sector_clean]
+    stats = _compute_sector_stats(scan, center_deg=center_deg, half_width_deg=30.0)
+
+    if stats["status"] != "ok":
+        return {
+            "status": "no_valid_ranges",
+            "distance_m": None,
+            "sector": sector_clean,
+            "closest_angle_deg": None,
+        }
+
     return {
-        **result,
-        "angle_deg": angle_value,
-        "window_deg": window_value,
-        "method": method_value,
+        "status": "ok",
+        "distance_m": stats["min_m"],
+        "sector": sector_clean,
+        "closest_angle_deg": stats["closest_angle_deg"],
     }
 
 

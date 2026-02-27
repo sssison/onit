@@ -82,11 +82,3 @@ servers:
     path : /turtlebot-lidar-v2
     transport : 'sse'
 
-  - name: TurtlebotSearchMCPServerV2
-    module: src.mcp.turtlebot_v2.search_mcp_server
-    description: "TurtleBot composite search MCP server V2"
-    enabled: true
-    host : 0.0.0.0
-    port : 18209
-    path : /turtlebot-search-v2
-    transport : 'sse'
