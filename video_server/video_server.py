@@ -5,6 +5,8 @@ from sensor_msgs.msg import CompressedImage
 import cv2
 import numpy as np
 import threading
+import os
+import time
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
@@ -65,6 +67,30 @@ def generate_frames():
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
+def frame_saver_loop():
+    output_path = '/dev/shm/latest_frame.jpg'
+    tmp_path = '/dev/shm/latest_frame.jpg.tmp'
+    period = 1.0 / 30.0
+    next_tick = time.monotonic()
+
+    while True:
+        with lock:
+            frame = last_frame
+
+        if frame is not None:
+            with open(tmp_path, 'wb') as f:
+                f.write(frame)
+            os.replace(tmp_path, output_path)
+
+        next_tick += period
+        now = time.monotonic()
+        sleep_time = next_tick - now
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        else:
+            missed = int((now - next_tick) // period) + 1
+            next_tick += missed * period
+
 @app.get('/video_feed')
 async def video_feed():
     return StreamingResponse(
@@ -91,6 +117,7 @@ def run_ros_spin():
 if __name__ == '__main__':
     # Start ROS in background
     threading.Thread(target=run_ros_spin, daemon=True).start()
+    threading.Thread(target=frame_saver_loop, daemon=True).start()
     
     # Start FastAPI with Uvicorn
     # host '0.0.0.0' allows access from your dashboard laptop

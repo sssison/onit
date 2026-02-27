@@ -119,3 +119,18 @@ mcp:
       description: Connects to TurtleBot composite search MCP server V2
       url: "http://localhost:18209/turtlebot-search-v2"
       enabled: false
+
+    - name: TurtlebotMotionServerV3
+      description: Connects to TurtleBot motion MCP server V3
+      url: "http://localhost:18210/turtlebot-motion-v3"
+      enabled: false   # set true to use v3 instead of v2
+
+    - name: TurtlebotVisionServerV3
+      description: Connects to TurtleBot vision MCP server V3 (reads /dev/shm/latest_frame.jpg)
+      url: "http://localhost:18211/turtlebot-vision-v3"
+      enabled: false
+
+    - name: TurtlebotLidarServerV3
+      description: Connects to TurtleBot LiDAR MCP server V3
+      url: "http://localhost:18212/turtlebot-lidar-v3"
+      enabled: false

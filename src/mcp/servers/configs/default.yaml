@@ -82,3 +82,30 @@ servers:
     path : /turtlebot-lidar-v2
     transport : 'streamable-http'
 
+  - name: TurtlebotMotionMCPServerV3
+    module: src.mcp.turtlebot_v3.motion_mcp_server
+    description: "TurtleBot motion MCP server V3"
+    enabled: true
+    host : 0.0.0.0
+    port : 18210
+    path : /turtlebot-motion-v3
+    transport : 'streamable-http'
+
+  - name: TurtlebotVisionMCPServerV3
+    module: src.mcp.turtlebot_v3.vision_mcp_server
+    description: "TurtleBot vision MCP server V3 (no ROS, reads /dev/shm/latest_frame.jpg)"
+    enabled: true
+    host : 0.0.0.0
+    port : 18211
+    path : /turtlebot-vision-v3
+    transport : 'streamable-http'
+
+  - name: TurtlebotLidarMCPServerV3
+    module: src.mcp.turtlebot_v3.lidar_mcp_server
+    description: "TurtleBot LiDAR MCP server V3 (short-lived ROS nodes)"
+    enabled: true
+    host : 0.0.0.0
+    port : 18212
+    path : /turtlebot-lidar-v3
+    transport : 'streamable-http'
+
