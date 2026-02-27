@@ -382,7 +382,7 @@ async def tbot_motion_forward_until_close(
 
 
 def run(
-    transport: str = "sse",
+    transport: str = "streamable-http",
     host: str = "0.0.0.0",
     port: int = 18205,
     path: str = "/turtlebot-motion-v2",

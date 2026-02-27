@@ -438,7 +438,7 @@ async def tbot_vision_scan_for_object(
 
 
 def run(
-    transport: str = "sse",
+    transport: str = "streamable-http",
     host: str = "0.0.0.0",
     port: int = 18207,
     path: str = "/turtlebot-vision-v2",
