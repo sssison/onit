@@ -61,12 +61,27 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"Invalid {name}={raw!r}; expected a float") from e
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise ValueError(f"Invalid {name}={raw!r}; expected an integer") from e
+
+
 CAMERA_TOPIC = os.getenv("CAMERA_TOPIC", "/camera/image_raw/compressed")
 NODE_NAME = os.getenv("CAMERA_NODE_NAME", "camera_mcp_server_node_v2")
 MOTION_MCP_URL = os.getenv("TBOT_MOTION_MCP_URL", "http://127.0.0.1:18205/turtlebot-motion-v2")
 VISION_MCP_URL = os.getenv("TBOT_VISION_MCP_URL", "http://127.0.0.1:18207/turtlebot-vision-v2")
 REORIENT_THRESHOLD_DEG = _env_float("REORIENT_THRESHOLD_DEG", 8.0)
 REORIENT_MAX_ITERATIONS = 6
+CAMERA_HFOV_DEG = _env_float("CAMERA_HFOV_DEG", 62.0)
+REORIENT_CORRECTION_SIGN = _env_float("REORIENT_CORRECTION_SIGN", -1.0)
+REORIENT_MAX_STEP_DEG = abs(_env_float("REORIENT_MAX_STEP_DEG", 15.0))
+REORIENT_IMPROVEMENT_EPS_DEG = max(0.0, _env_float("REORIENT_IMPROVEMENT_EPS_DEG", 1.0))
+REORIENT_MAX_NO_PROGRESS = max(1, _env_int("REORIENT_MAX_NO_PROGRESS", 2))
 FRAME_LOG_EVERY = max(1, int(_env_float("CAMERA_FRAME_LOG_EVERY", 30)))
 
 DEFAULT_FRAME_MAX_BYTES = max(1, int(_env_float("CAMERA_FRAME_MAX_BYTES", 1_500_000)))
@@ -452,20 +467,54 @@ def _extract_tool_dict(tool_result: Any) -> dict[str, Any]:
     return {}
 
 
+def _normalize_bbox(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+
+    normalized: dict[str, float] = {}
+    for key in ("cx", "cy", "w", "h"):
+        raw = value.get(key)
+        if not isinstance(raw, (int, float)):
+            return None
+        parsed = float(raw)
+        if not math.isfinite(parsed):
+            return None
+        normalized[key] = max(0.0, min(1.0, parsed))
+    return normalized
+
+
+def _clamp(value: float, limit: float) -> float:
+    if limit <= 0.0:
+        return 0.0
+    if value > limit:
+        return limit
+    if value < -limit:
+        return -limit
+    return value
+
+
 @mcp_camera_v2.tool()
 async def tbot_camera_reorient_to_object(
     object_name: str,
     threshold_deg: float = REORIENT_THRESHOLD_DEG,
     max_iterations: int = REORIENT_MAX_ITERATIONS,
 ) -> dict[str, Any]:
-    """Run a closed-loop fine-tuning pass to center the robot on a target object. Captures a frame, detects in-frame offset, rotates to correct, and repeats until centered or the object is lost."""
+    """Run a closed-loop fine-tuning pass to center the robot on a target object using its bounding box center."""
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
         raise ValueError("object_name must be a non-empty string")
+    threshold = _ensure_non_negative("threshold_deg", threshold_deg)
+    if not isinstance(max_iterations, int) or max_iterations < 1:
+        raise ValueError("max_iterations must be a positive integer")
 
     node = _get_camera_node()
     iterations = 0
     final_in_frame_offset_deg: float | None = None
+    final_bbox: dict[str, float] | None = None
+    error_history_deg: list[float] = []
+    last_command_deg: float | None = None
+    previous_abs_error_deg: float | None = None
+    no_progress_count = 0
 
     for _ in range(max_iterations):
         iterations += 1
@@ -489,35 +538,78 @@ async def tbot_camera_reorient_to_object(
         data = _extract_tool_dict(result)
 
         status = data.get("status")
-        in_frame_offset_deg = data.get("in_frame_offset_deg")
-        if isinstance(in_frame_offset_deg, (int, float)):
-            final_in_frame_offset_deg = float(in_frame_offset_deg)
+        final_bbox = _normalize_bbox(data.get("bbox"))
+        if final_bbox is not None:
+            final_in_frame_offset_deg = (final_bbox["cx"] - 0.5) * CAMERA_HFOV_DEG
         else:
-            final_in_frame_offset_deg = None
+            in_frame_offset_deg = data.get("in_frame_offset_deg")
+            if isinstance(in_frame_offset_deg, (int, float)):
+                final_in_frame_offset_deg = float(in_frame_offset_deg)
+            else:
+                final_in_frame_offset_deg = None
 
         if status == "not_found" or final_in_frame_offset_deg is None:
             return {
                 "status": "lost",
+                "reason": "lost",
+                "ready_to_approach": False,
                 "iterations": iterations,
                 "final_in_frame_offset_deg": final_in_frame_offset_deg,
+                "final_bbox": final_bbox,
+                "error_history_deg": error_history_deg,
+                "last_command_deg": last_command_deg,
                 "object_name": object_name_clean,
             }
 
-        if abs(final_in_frame_offset_deg) <= threshold_deg:
+        error_history_deg.append(final_in_frame_offset_deg)
+        abs_error_deg = abs(final_in_frame_offset_deg)
+
+        if abs_error_deg <= threshold:
             return {
                 "status": "centered",
+                "reason": "centered",
+                "ready_to_approach": True,
                 "iterations": iterations,
                 "final_in_frame_offset_deg": final_in_frame_offset_deg,
+                "final_bbox": final_bbox,
+                "error_history_deg": error_history_deg,
+                "last_command_deg": last_command_deg,
                 "object_name": object_name_clean,
             }
 
+        if previous_abs_error_deg is not None:
+            improved = abs_error_deg <= (previous_abs_error_deg - REORIENT_IMPROVEMENT_EPS_DEG)
+            no_progress_count = 0 if improved else (no_progress_count + 1)
+            if no_progress_count >= REORIENT_MAX_NO_PROGRESS:
+                return {
+                    "status": "no_progress",
+                    "reason": "no_progress",
+                    "ready_to_approach": False,
+                    "iterations": iterations,
+                    "final_in_frame_offset_deg": final_in_frame_offset_deg,
+                    "final_bbox": final_bbox,
+                    "error_history_deg": error_history_deg,
+                    "last_command_deg": last_command_deg,
+                    "object_name": object_name_clean,
+                }
+        previous_abs_error_deg = abs_error_deg
+
+        correction_deg = final_in_frame_offset_deg * REORIENT_CORRECTION_SIGN
+        command_deg = _clamp(correction_deg, REORIENT_MAX_STEP_DEG)
+        last_command_deg = command_deg
+
         async with Client(MOTION_MCP_URL) as motion:
-            await motion.call_tool("tbot_motion_scan_rotate", {"degrees": final_in_frame_offset_deg})
+            await motion.call_tool("tbot_motion_scan_rotate", {"degrees": command_deg})
 
     return {
         "status": "max_iterations_reached",
+        "reason": "max_iterations",
+        "ready_to_approach": False,
         "iterations": iterations,
         "final_in_frame_offset_deg": final_in_frame_offset_deg,
+        "final_bbox": final_bbox,
+        "error_history_deg": error_history_deg,
+        "last_command_deg": last_command_deg,
         "object_name": object_name_clean,
     }
 
@@ -549,4 +641,3 @@ def run(
 
 if __name__ == "__main__":
     run()
-

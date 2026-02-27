@@ -98,3 +98,50 @@ def test_vision_analyze_scene_uses_first_image_only():
     image_url = call_kwargs["messages"][1]["content"][1]["image_url"]["url"]
     assert first in image_url
     assert second not in image_url
+
+
+def test_normalize_detection_with_position_uses_bbox_center():
+    parsed = {
+        "matched": True,
+        "confidence": 0.9,
+        "evidence": "object found",
+        "bbox": {"cx": 0.8, "cy": 0.4, "w": 0.2, "h": 0.3},
+    }
+
+    result = vision_v2._normalize_detection_with_position(parsed, raw_text=json.dumps(parsed))
+
+    assert result["bbox"] == {"cx": 0.8, "cy": 0.4, "w": 0.2, "h": 0.3}
+    assert result["x_center"] == pytest.approx(0.8)
+    assert result["in_frame_offset_deg"] == pytest.approx((0.8 - 0.5) * vision_v2.CAMERA_HFOV_DEG)
+
+
+def test_normalize_detection_with_position_selects_highest_confidence_bbox():
+    parsed = {
+        "matched": True,
+        "confidence": 0.7,
+        "evidence": "multiple",
+        "detections": [
+            {"confidence": 0.55, "bbox": {"cx": 0.2, "cy": 0.5, "w": 0.2, "h": 0.2}},
+            {"confidence": 0.95, "bbox": {"cx": 0.7, "cy": 0.4, "w": 0.3, "h": 0.3}},
+        ],
+    }
+
+    result = vision_v2._normalize_detection_with_position(parsed, raw_text=json.dumps(parsed))
+
+    assert result["bbox"] == {"cx": 0.7, "cy": 0.4, "w": 0.3, "h": 0.3}
+    assert result["x_center"] == pytest.approx(0.7)
+    assert result["in_frame_offset_deg"] == pytest.approx((0.7 - 0.5) * vision_v2.CAMERA_HFOV_DEG)
+
+
+def test_normalize_detection_with_position_falls_back_to_x_center():
+    parsed = {
+        "matched": True,
+        "confidence": 0.8,
+        "evidence": "legacy response",
+        "x_center": 0.1,
+    }
+
+    result = vision_v2._normalize_detection_with_position(parsed, raw_text=json.dumps(parsed))
+
+    assert result["bbox"] == {"cx": 0.1, "cy": 0.5, "w": 0.0, "h": 0.0}
+    assert result["x_center"] == pytest.approx(0.1)

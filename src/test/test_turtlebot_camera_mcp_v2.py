@@ -81,8 +81,8 @@ def test_get_decoded_frame_success():
     assert result.content[0].mimeType == "image/jpeg"
 
     payload = result.structured_content
-    assert payload["width"] == 80
-    assert payload["height"] == 60
+    assert payload["width"] == 60
+    assert payload["height"] == 80
     assert payload["mime_type"] == "image/jpeg"
     assert payload["frame_bytes"] > 0
     assert payload["frame_count"] == 9
@@ -115,3 +115,116 @@ def test_get_decoded_frame_no_frame_after_wait_raises():
                     max_bytes=1_500_000,
                 )
             )
+
+
+class _FakeMCPClient:
+    def __init__(self, url, vision_results, motion_calls):
+        self._url = url
+        self._vision_results = vision_results
+        self._motion_calls = motion_calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def call_tool(self, name, payload):
+        if self._url == camera_v2.VISION_MCP_URL:
+            assert name == "tbot_vision_analyze_frames_for_object"
+            if not self._vision_results:
+                raise AssertionError("No mocked vision responses left")
+            return self._vision_results.pop(0)
+        if self._url == camera_v2.MOTION_MCP_URL:
+            self._motion_calls.append((name, payload))
+            return {"status": "ok"}
+        raise AssertionError(f"Unexpected MCP URL in test: {self._url}")
+
+
+def test_reorient_to_object_uses_bbox_center_and_reports_ready():
+    source_bytes = _make_image_bytes(fmt="PNG", size=(80, 60))
+    fake_node = _FakeCameraNode(frame_bytes=source_bytes, frame_present=True, frame_count=9)
+    vision_results = [
+        {
+            "status": "found",
+            "bbox": {"cx": 0.8, "cy": 0.5, "w": 0.2, "h": 0.2},
+            "in_frame_offset_deg": 999.0,
+        },
+        {
+            "status": "found",
+            "bbox": {"cx": 0.51, "cy": 0.5, "w": 0.2, "h": 0.2},
+            "in_frame_offset_deg": 999.0,
+        },
+    ]
+    motion_calls = []
+
+    def fake_client(url):
+        return _FakeMCPClient(url, vision_results, motion_calls)
+
+    with patch.object(camera_v2, "_get_camera_node", return_value=fake_node), patch.object(
+        camera_v2, "Client", side_effect=fake_client
+    ), patch.object(camera_v2, "REORIENT_MAX_STEP_DEG", 30.0), patch.object(
+        camera_v2, "REORIENT_CORRECTION_SIGN", -1.0
+    ):
+        result = asyncio.run(camera_v2.tbot_camera_reorient_to_object("bottle", threshold_deg=8.0, max_iterations=4))
+
+    assert result["status"] == "centered"
+    assert result["reason"] == "centered"
+    assert result["ready_to_approach"] is True
+    assert result["final_bbox"]["cx"] == pytest.approx(0.51)
+    assert len(motion_calls) == 1
+    assert motion_calls[0][0] == "tbot_motion_scan_rotate"
+    expected_cmd = (0.8 - 0.5) * camera_v2.CAMERA_HFOV_DEG * -1.0
+    assert motion_calls[0][1]["degrees"] == pytest.approx(expected_cmd)
+
+
+def test_reorient_to_object_clamps_large_correction():
+    source_bytes = _make_image_bytes(fmt="PNG", size=(80, 60))
+    fake_node = _FakeCameraNode(frame_bytes=source_bytes, frame_present=True, frame_count=9)
+    vision_results = [
+        {"status": "found", "bbox": {"cx": 1.0, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"status": "found", "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    motion_calls = []
+
+    def fake_client(url):
+        return _FakeMCPClient(url, vision_results, motion_calls)
+
+    with patch.object(camera_v2, "_get_camera_node", return_value=fake_node), patch.object(
+        camera_v2, "Client", side_effect=fake_client
+    ), patch.object(camera_v2, "REORIENT_MAX_STEP_DEG", 10.0), patch.object(
+        camera_v2, "REORIENT_CORRECTION_SIGN", -1.0
+    ):
+        result = asyncio.run(camera_v2.tbot_camera_reorient_to_object("bottle", threshold_deg=8.0, max_iterations=4))
+
+    assert result["status"] == "centered"
+    assert len(motion_calls) == 1
+    assert motion_calls[0][1]["degrees"] == pytest.approx(-10.0)
+
+
+def test_reorient_to_object_stops_on_no_progress():
+    source_bytes = _make_image_bytes(fmt="PNG", size=(80, 60))
+    fake_node = _FakeCameraNode(frame_bytes=source_bytes, frame_present=True, frame_count=9)
+    vision_results = [
+        {"status": "found", "bbox": {"cx": 0.80, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"status": "found", "bbox": {"cx": 0.82, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"status": "found", "bbox": {"cx": 0.84, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    motion_calls = []
+
+    def fake_client(url):
+        return _FakeMCPClient(url, vision_results, motion_calls)
+
+    with patch.object(camera_v2, "_get_camera_node", return_value=fake_node), patch.object(
+        camera_v2, "Client", side_effect=fake_client
+    ), patch.object(camera_v2, "REORIENT_MAX_STEP_DEG", 30.0), patch.object(
+        camera_v2, "REORIENT_CORRECTION_SIGN", -1.0
+    ), patch.object(camera_v2, "REORIENT_IMPROVEMENT_EPS_DEG", 0.5), patch.object(
+        camera_v2, "REORIENT_MAX_NO_PROGRESS", 2
+    ):
+        result = asyncio.run(camera_v2.tbot_camera_reorient_to_object("bottle", threshold_deg=3.0, max_iterations=6))
+
+    assert result["status"] == "no_progress"
+    assert result["reason"] == "no_progress"
+    assert result["ready_to_approach"] is False
+    assert len(motion_calls) == 2

@@ -29,20 +29,22 @@ instruction_template: |
 
   ### 3. Object Search & Navigation
 
-  **Scan + stop workflow** (`tbt_vision_scan_for_object`):
-  - Call `tbt_vision_scan_for_object(object_name, rotation_budget_degrees, step_degrees)` to rotate in steps until the object is found.
+  **Scan + stop workflow** (`tbot_vision_scan_for_object`):
+  - Call `tbot_vision_scan_for_object(object_name, rotation_budget_degrees, step_degrees)` to rotate in steps until the object is found.
   - When `status="found"`, the robot has ALREADY stopped facing the object — `heading_offset_deg` is how far it rotated during the scan. **Do NOT rotate by heading_offset_deg.**
-  - Next step: call `tbt_camera_reorient_to_object(object_name)` to center the object in frame, then `tbt_motion_forward_until_close(target_distance_m)` to approach.
+  - Next step: call `tbot_camera_reorient_to_object(object_name)` to center the object in frame using the detected bounding box, then approach.
+  - If `ready_to_approach=true`, use normal approach speed.
+  - If `ready_to_approach=false`, cautious approach is allowed: use slow speed and short forward segments with repeated visual re-checks.
   - If `status="not_found"`, the full budget was used; the object is not visible.
 
-  **Full-sweep workflow** (`tbt_camera_capture_frames_during_rotation` + `tbt_vision_analyze_frames_for_object`):
-  - Call `tbt_camera_capture_frames_during_rotation(degrees=360, num_frames=8)` to rotate a full circle and collect frames with heading metadata.
-  - Pass the returned `frames` list to `tbt_vision_analyze_frames_for_object(frames, object_name)`.
-  - When `status="found"`, the robot has completed the full rotation and is back at its starting heading. **You must rotate by heading_offset_deg** (call `tbt_motion_scan_rotate(degrees=heading_offset_deg)`) to face the object.
-  - Then call `tbt_camera_reorient_to_object(object_name)` to fine-tune, then `tbt_motion_forward_until_close(target_distance_m)` to approach.
+  **Full-sweep workflow** (`tbot_camera_capture_frames_during_rotation` + `tbot_vision_analyze_frames_for_object`):
+  - Call `tbot_camera_capture_frames_during_rotation(degrees=360, num_frames=8)` to rotate a full circle and collect frames with heading metadata.
+  - Pass the returned `frames` list to `tbot_vision_analyze_frames_for_object(frames, object_name)`.
+  - When `status="found"`, the robot has completed the full rotation and is back at its starting heading. **You must rotate by heading_offset_deg** (call `tbot_motion_scan_rotate(degrees=heading_offset_deg)`) to face the object.
+  - Then call `tbot_camera_reorient_to_object(object_name)` to fine-tune with bbox centering, then approach.
 
   **Fine-tuning**:
-  - `tbt_camera_reorient_to_object(object_name)` captures a live frame, measures how far off-center the object is, and issues small rotations until centered (or times out). Always use this before moving forward.
+  - `tbot_camera_reorient_to_object(object_name)` captures a live frame, reads the target bounding box center, and issues bounded correction rotations until centered (or exits with lost/no-progress/max-iterations). Always use this before moving forward.
 
   ### 4. LiDAR — When Approaching an Object Only
   - **Do NOT call LiDAR tools for rotation or turning in place.** LiDAR is only needed when moving linearly toward an object.

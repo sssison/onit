@@ -130,6 +130,64 @@ def _normalize_confidence(value: Any) -> float | None:
     return max(0.0, min(1.0, parsed))
 
 
+def _normalize_unit_float(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return max(0.0, min(1.0, parsed))
+
+
+def _normalize_bbox(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+    keys = ("cx", "cy", "w", "h")
+    parsed: dict[str, float] = {}
+    for key in keys:
+        normalized = _normalize_unit_float(value.get(key))
+        if normalized is None:
+            return None
+        parsed[key] = normalized
+    return parsed
+
+
+def _select_best_bbox(parsed: dict[str, Any]) -> dict[str, float] | None:
+    raw_detections = parsed.get("detections")
+    if isinstance(raw_detections, list):
+        best_bbox: dict[str, float] | None = None
+        best_conf = -1.0
+        for item in raw_detections:
+            if not isinstance(item, dict):
+                continue
+            bbox = _normalize_bbox(item.get("bbox"))
+            if bbox is None:
+                continue
+            conf = _normalize_confidence(item.get("confidence"))
+            conf_score = conf if conf is not None else 0.0
+            if best_bbox is None or conf_score > best_conf:
+                best_bbox = bbox
+                best_conf = conf_score
+        if best_bbox is not None:
+            return best_bbox
+
+    top_level_bbox = _normalize_bbox(parsed.get("bbox"))
+    if top_level_bbox is not None:
+        return top_level_bbox
+
+    # Backward compatibility with older x_center-only output.
+    x_center = _normalize_unit_float(parsed.get("x_center"))
+    if x_center is None:
+        return None
+    return {"cx": x_center, "cy": 0.5, "w": 0.0, "h": 0.0}
+
+
 def _normalize_output(parsed: dict[str, Any] | None, raw_response: str, model_info: dict[str, Any]) -> dict[str, Any]:
     parsed = parsed or {}
 
@@ -352,14 +410,15 @@ def _normalize_detection_with_position(parsed: dict[str, Any] | None, raw_text: 
     parsed = parsed or {}
     x_center: float | None = None
     in_frame_offset_deg: float | None = None
+    bbox: dict[str, float] | None = None
 
     if base["matched"]:
-        raw_x = parsed.get("x_center")
-        if isinstance(raw_x, (int, float)) and math.isfinite(float(raw_x)):
-            x_center = max(0.0, min(1.0, float(raw_x)))
+        bbox = _select_best_bbox(parsed)
+        if bbox is not None:
+            x_center = bbox["cx"]
             in_frame_offset_deg = (x_center - 0.5) * CAMERA_HFOV_DEG
 
-    return {**base, "x_center": x_center, "in_frame_offset_deg": in_frame_offset_deg}
+    return {**base, "x_center": x_center, "bbox": bbox, "in_frame_offset_deg": in_frame_offset_deg}
 
 
 async def _detect_object_with_position(
@@ -372,8 +431,8 @@ async def _detect_object_with_position(
     system_prompt = (
         "You are a strict robot object detector. "
         "Return only JSON with keys: matched (boolean), confidence (number 0..1), evidence (string), "
-        "x_center (number 0..1, horizontal center of object: "
-        "0=left edge, 0.5=frame center, 1=right edge; null if not matched). "
+        "bbox (object with normalized cx, cy, w, h values in range 0..1 for the matched target, or null if not matched). "
+        "If multiple target instances are visible, return detections array and use the highest-confidence instance as bbox. "
         "No markdown."
     )
     user_prompt = f"Is the target object '{target}' visible in this image?"
@@ -433,7 +492,7 @@ async def tbot_vision_scan_for_object(
 
     When status="found", the robot has ALREADY stopped at heading_offset_deg —
     it is already facing the object. Do NOT rotate by heading_offset_deg again.
-    Use tbt_camera_reorient_to_object to fine-tune centering, then move forward.
+    Use tbot_camera_reorient_to_object to fine-tune centering, then move forward.
 
     heading_offset_deg records how far the robot rotated during the scan (informational).
     """
@@ -531,6 +590,7 @@ async def tbot_vision_analyze_frames_for_object(
     best_heading: float | None = None
     best_confidence = 0.0
     best_in_frame_offset_deg: float | None = None
+    best_bbox: dict[str, float] | None = None
     frames_analyzed = 0
 
     for frame in frames:
@@ -556,12 +616,15 @@ async def tbot_vision_analyze_frames_for_object(
         if detection["matched"] and detection["confidence"] >= threshold:
             best_heading = float(heading_offset)
             best_in_frame_offset_deg = detection["in_frame_offset_deg"]
+            if isinstance(detection.get("bbox"), dict):
+                best_bbox = detection["bbox"]
             break
 
     if best_heading is not None:
         return {
             "status": "found",
             "heading_offset_deg": best_heading,
+            "bbox": best_bbox,
             "in_frame_offset_deg": best_in_frame_offset_deg,
             "frames_analyzed": frames_analyzed,
             "best_confidence": best_confidence,
@@ -571,6 +634,7 @@ async def tbot_vision_analyze_frames_for_object(
     return {
         "status": "not_found",
         "heading_offset_deg": None,
+        "bbox": None,
         "in_frame_offset_deg": None,
         "frames_analyzed": frames_analyzed,
         "best_confidence": best_confidence,
@@ -605,4 +669,3 @@ def run(
 
 if __name__ == "__main__":
     run()
-
