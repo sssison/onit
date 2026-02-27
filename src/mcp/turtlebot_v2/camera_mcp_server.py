@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Any, Optional
 
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
 from fastmcp.tools import ToolResult
 from mcp.types import ImageContent, TextContent
 
@@ -62,6 +62,7 @@ def _env_float(name: str, default: float) -> float:
 
 CAMERA_TOPIC = os.getenv("CAMERA_TOPIC", "/camera/image_raw/compressed")
 NODE_NAME = os.getenv("CAMERA_NODE_NAME", "camera_mcp_server_node_v2")
+MOTION_MCP_URL = os.getenv("TBOT_MOTION_MCP_URL", "http://127.0.0.1:18205/turtlebot-motion-v2")
 FRAME_LOG_EVERY = max(1, int(_env_float("CAMERA_FRAME_LOG_EVERY", 30)))
 
 DEFAULT_FRAME_MAX_BYTES = max(1, int(_env_float("CAMERA_FRAME_MAX_BYTES", 1_500_000)))
@@ -372,6 +373,52 @@ async def tbot_camera_get_decoded_frame(
         ],
         structured_content=response,
     )
+
+
+@mcp_camera_v2.tool()
+async def tbot_camera_capture_frames_during_rotation(
+    degrees: float = 360.0,
+    num_frames: int = 8,
+) -> dict[str, Any]:
+    """Rotate the robot while capturing frames at evenly spaced angular intervals. Returns all frames with their heading offsets for use with tbot_vision_analyze_frames_for_object."""
+    degrees_f = _ensure_finite("degrees", degrees)
+    if not isinstance(num_frames, int) or num_frames < 1:
+        raise ValueError("num_frames must be a positive integer")
+
+    step_deg = degrees_f / num_frames
+    node = _get_camera_node()
+
+    captured_frames: list[dict[str, Any]] = []
+    cumulative_deg = 0.0
+
+    async with Client(MOTION_MCP_URL) as motion:
+        for _ in range(num_frames):
+            await motion.call_tool("tbot_motion_scan_rotate", {"degrees": step_deg})
+            cumulative_deg += step_deg
+
+            snapshot = node.snapshot()
+            initial_count = snapshot["frame_count"]
+            await asyncio.to_thread(node.wait_for_frame, DEFAULT_CURRENT_VIEW_WAIT_S, initial_count)
+
+            frame = node.latest_frame()
+            encoded_bytes, width, height, _ = _decode_and_reencode_jpeg(frame["bytes"])
+            image_b64 = base64.b64encode(encoded_bytes).decode("ascii")
+
+            captured_frames.append({
+                "heading_offset_deg": round(cumulative_deg, 4),
+                "image_base64": image_b64,
+                "width": width,
+                "height": height,
+                "frame_count": frame["frame_count"],
+            })
+
+    return {
+        "status": "ok",
+        "frames": captured_frames,
+        "total_degrees_rotated": round(cumulative_deg, 4),
+        "num_frames": len(captured_frames),
+        "step_deg": round(step_deg, 4),
+    }
 
 
 def run(

@@ -437,6 +437,72 @@ async def tbot_vision_scan_for_object(
     }
 
 
+@mcp_vision_v2.tool()
+async def tbot_vision_analyze_frames_for_object(
+    frames: list[dict],
+    object_name: str,
+    confidence_threshold: float = 0.65,
+) -> dict[str, Any]:
+    """Analyze a list of frames with heading metadata (from tbot_camera_capture_frames_during_rotation) to find a target object. Returns the heading offset where the object was found, or not_found."""
+    object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
+    if not object_name_clean:
+        raise ValueError("object_name must be a non-empty string")
+    if not frames:
+        raise ValueError("frames must be a non-empty list")
+
+    threshold = max(0.0, min(1.0, float(confidence_threshold)))
+
+    vision_host = os.getenv("TBOT_VISION_HOST", DEFAULT_VISION_HOST)
+    vision_model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
+    vision_api_key = _resolve_api_key(vision_host)
+    vision_client = AsyncOpenAI(base_url=vision_host, api_key=vision_api_key)
+
+    best_heading: float | None = None
+    best_confidence = 0.0
+    frames_analyzed = 0
+
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        image_b64 = frame.get("image_base64", "")
+        heading_offset = frame.get("heading_offset_deg", 0.0)
+        if not isinstance(image_b64, str) or not image_b64.strip():
+            continue
+
+        detection = await _detect_object_in_image(
+            vision_client=vision_client,
+            target=object_name_clean,
+            image_base64=image_b64.strip(),
+            timeout_s=VISION_TIMEOUT_S,
+            model=vision_model,
+        )
+        frames_analyzed += 1
+
+        if detection["confidence"] > best_confidence:
+            best_confidence = detection["confidence"]
+
+        if detection["matched"] and detection["confidence"] >= threshold:
+            best_heading = float(heading_offset)
+            break
+
+    if best_heading is not None:
+        return {
+            "status": "found",
+            "heading_offset_deg": best_heading,
+            "frames_analyzed": frames_analyzed,
+            "best_confidence": best_confidence,
+            "object_name": object_name_clean,
+        }
+
+    return {
+        "status": "not_found",
+        "heading_offset_deg": None,
+        "frames_analyzed": frames_analyzed,
+        "best_confidence": best_confidence,
+        "object_name": object_name_clean,
+    }
+
+
 def run(
     transport: str = "streamable-http",
     host: str = "0.0.0.0",
