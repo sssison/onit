@@ -105,6 +105,9 @@ def _decode_and_reencode_jpeg(compressed_bytes: bytes) -> tuple[bytes, int, int,
             if image.mode not in ("RGB", "L"):
                 image = image.convert("RGB")
 
+            image = image.transpose(Image.Transpose.ROTATE_270)
+            width, height = image.size
+
             encoded_buffer = io.BytesIO()
             image.save(encoded_buffer, format="JPEG", quality=90, optimize=False)
             encoded_bytes = encoded_buffer.getvalue()
