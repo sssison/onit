@@ -1,5 +1,7 @@
-"""Tests for src/ui/web.py — SessionManager, OAuthFlowManager, GoogleAuthenticator."""
+"""Tests for src/ui/web.py — WebSession, WebChatUI, SessionManager, OAuthFlowManager, GoogleAuthenticator."""
 
+import asyncio
+import json
 import os
 import sys
 import time
@@ -12,7 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 gradio = pytest.importorskip("gradio", reason="gradio not installed")
 
-from ui.web import SessionManager, OAuthFlowManager, GoogleAuthenticator, NullConsole
+from ui.web import (
+    SessionManager, OAuthFlowManager, GoogleAuthenticator, NullConsole,
+    WebSession, WebChatUI,
+)
 
 
 # ── NullConsole ─────────────────────────────────────────────────────────────
@@ -202,3 +207,117 @@ class TestGoogleAuthenticator:
         with patch("ui.web.http_requests.post", return_value=mock_resp):
             result = authenticator.exchange_code_for_token("code", "verifier", "http://localhost/callback")
         assert result is None
+
+
+# ── WebSession ─────────────────────────────────────────────────────────────
+
+class TestWebSession:
+    def test_default_fields(self):
+        s = WebSession()
+        assert isinstance(s.session_id, str)
+        assert len(s.session_id) > 0
+        assert s.pending_responses == []
+        assert s.processing is False
+        assert s.spinner_shown is False
+        assert isinstance(s.safety_queue, asyncio.Queue)
+
+    def test_unique_ids(self):
+        s1 = WebSession()
+        s2 = WebSession()
+        assert s1.session_id != s2.session_id
+
+    def test_independent_state(self):
+        s1 = WebSession()
+        s2 = WebSession()
+        s1.processing = True
+        s1.pending_responses.append("msg")
+        assert s2.processing is False
+        assert s2.pending_responses == []
+
+
+# ── WebChatUI session management ──────────────────────────────────────────
+
+class TestWebChatUISessionManagement:
+    def _make_ui(self, tmp_path):
+        session_path = str(tmp_path / "sessions" / "main.jsonl")
+        os.makedirs(os.path.dirname(session_path), exist_ok=True)
+        ui = WebChatUI(session_path=session_path)
+        return ui
+
+    def test_creates_new_session(self, tmp_path):
+        ui = self._make_ui(tmp_path)
+        sess_id, session = ui._get_or_create_session()
+        assert isinstance(sess_id, str)
+        assert os.path.exists(session.session_path)
+        assert os.path.isdir(session.data_path)
+        assert sess_id in ui._web_sessions
+
+    def test_returns_existing_session(self, tmp_path):
+        ui = self._make_ui(tmp_path)
+        sid1, s1 = ui._get_or_create_session()
+        sid2, s2 = ui._get_or_create_session(sid1)
+        assert sid1 == sid2
+        assert s1 is s2
+
+    def test_different_ids_get_different_sessions(self, tmp_path):
+        ui = self._make_ui(tmp_path)
+        sid1, s1 = ui._get_or_create_session()
+        sid2, s2 = ui._get_or_create_session()
+        assert sid1 != sid2
+        assert s1.session_path != s2.session_path
+        assert s1.data_path != s2.data_path
+
+    def test_unknown_id_creates_new(self, tmp_path):
+        ui = self._make_ui(tmp_path)
+        sid, session = ui._get_or_create_session("nonexistent-id")
+        assert sid != "nonexistent-id"
+        assert sid in ui._web_sessions
+
+    def test_expired_sessions_cleaned_up(self, tmp_path):
+        ui = self._make_ui(tmp_path)
+        # Create an old session
+        old_sid, old_session = ui._get_or_create_session()
+        old_session.created = datetime.now() - timedelta(hours=25)
+
+        # Creating a new session should clean up the old one
+        new_sid, _ = ui._get_or_create_session()
+        assert old_sid not in ui._web_sessions
+        assert new_sid in ui._web_sessions
+
+    def test_load_chat_from_session_with_path(self, tmp_path):
+        ui = self._make_ui(tmp_path)
+        sid, session = ui._get_or_create_session()
+
+        # Write some entries to the session file
+        with open(session.session_path, "w") as f:
+            f.write(json.dumps({"task": "hello", "response": "hi there"}) + "\n")
+            f.write(json.dumps({"task": "q2", "response": "a2"}) + "\n")
+
+        messages = ui._load_chat_from_session(
+            session_path=session.session_path,
+            data_path=session.data_path,
+            session_id=sid,
+        )
+        # 2 exchanges = 4 messages (user + assistant each)
+        assert len(messages) == 4
+
+    def test_extract_file_paths_session_scoped(self, tmp_path):
+        ui = self._make_ui(tmp_path)
+        sid, session = ui._get_or_create_session()
+
+        # Create a test file in the session data_path
+        test_file = os.path.join(session.data_path, "report.pdf")
+        with open(test_file, "w") as f:
+            f.write("fake pdf")
+
+        text = "Here is the file: report.pdf"
+        cleaned, found = ui._extract_file_paths(
+            text, data_path=session.data_path, session_id=sid
+        )
+        assert len(found) == 1
+        assert f"/uploads/{sid}/report.pdf" in cleaned
+
+    def test_add_message_noop(self, tmp_path):
+        """add_message is a no-op for web UI (responses go through per-session state)."""
+        ui = self._make_ui(tmp_path)
+        ui.add_message("assistant", "hello")  # should not raise

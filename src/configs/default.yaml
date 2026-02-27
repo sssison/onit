@@ -3,10 +3,8 @@ serving:
   host: http://202.92.159.240:8000/v1
   host_key: EMPTY  # API key. For OpenRouter set here or via OPENROUTER_API_KEY env var
   model: Qwen/Qwen3-30B-A3B-Instruct-2507
-  #model: Qwen/Qwen3-VL-8B-Instruct
-  #model: nvidia/Cosmos-Reason2-8B
-  think: true
-  max_tokens: 262144
+  think: false
+  max_tokens: 8192
 
 messages:
   safety_warning:  "Press 'Enter' key to stop all tasks."
@@ -15,20 +13,18 @@ verbose: false
 show_logs: false
 
 theme: dark
-persona: "assistant"
 session_path: "~/.onit/sessions"
 
 # see template examples in the `src/mcp/prompts/prompt_templates` folder
 template_path:
 
 # number of seconds before a request times out; -1 for no timeout
-timeout: 600
+timeout: -1
 
 # Web UI settings
 web_title: "OnIt Chat"
 web: false
 web_port: 9000
-web_share: false
 
 # Google OAuth2 Authentication (Full Redirect Flow)
 # To set up Google OAuth2, follow these steps:
@@ -62,9 +58,13 @@ mcp:
   servers:
     - name: PromptsMCPServer
       description: Provides prompt templates for instruction generation
-      url: http://127.0.0.1:18200/prompts
+      url: http://127.0.0.1:18200/sse
       enabled: true
 
+    - name: ToolsMCPServer
+      description: Web search, bash commands, file operations, and document tools
+      url: http://127.0.0.1:18201/sse
+      enabled: true
     - name: WebSearchHandler
       description: Handles web, news and weather search queries
       url: http://127.0.0.1:18201/search

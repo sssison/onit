@@ -63,7 +63,7 @@ def _mock_client(tools=None, resources=None, prompts=None):
 class TestDiscoverServerTools:
     @pytest.mark.asyncio
     async def test_discovers_tools_with_input_schema(self):
-        server = {"name": "TestServer", "url": "http://127.0.0.1:18201/test", "enabled": True}
+        server = {"name": "ToolsMCPServer", "url": "http://127.0.0.1:18201/sse", "enabled": True}
         mock = _mock_client(tools=[_fake_tool("search")])
         with patch("lib.tools.Client", return_value=mock):
             handlers = await _discover_server_tools(server)
@@ -71,17 +71,9 @@ class TestDiscoverServerTools:
         assert handlers[0].tool_item["function"]["name"] == "search"
 
     @pytest.mark.asyncio
-    async def test_ignores_prompts_and_resources(self):
-        server = {"name": "Prompts", "url": "http://127.0.0.1:18200/prompts", "enabled": True}
-        mock = _mock_client(prompts=[_fake_prompt("assistant")], resources=[_fake_resource("docs")])
-        with patch("lib.tools.Client", return_value=mock):
-            handlers = await _discover_server_tools(server)
-        assert len(handlers) == 0
-
-    @pytest.mark.asyncio
-    async def test_returns_zero_when_only_prompts_and_resources_exist(self):
-        server = {"name": "Mixed", "url": "http://127.0.0.1:18200/mixed", "enabled": True}
-        mock = _mock_client(tools=[], prompts=[_fake_prompt("assistant")], resources=[_fake_resource("docs")])
+    async def test_discovers_prompts_with_arguments(self):
+        server = {"name": "Prompts", "url": "http://127.0.0.1:18200/sse", "enabled": True}
+        mock = _mock_client(prompts=[_fake_prompt("assistant")])
         with patch("lib.tools.Client", return_value=mock):
             handlers = await _discover_server_tools(server)
         assert handlers == []
@@ -105,15 +97,15 @@ class TestDiscoverTools:
     @pytest.mark.asyncio
     async def test_discovers_from_multiple_servers(self):
         servers = [
-            {"name": "A", "url": "http://127.0.0.1:18201/a", "enabled": True},
-            {"name": "B", "url": "http://127.0.0.1:18202/b", "enabled": True},
+            {"name": "Prompts", "url": "http://127.0.0.1:18200/sse", "enabled": True},
+            {"name": "Tools", "url": "http://127.0.0.1:18201/sse", "enabled": True},
         ]
 
         mock_a = _mock_client(tools=[_fake_tool("search")])
         mock_b = _mock_client(tools=[_fake_tool("bash")])
 
         def client_factory(url):
-            return mock_a if "18201" in url else mock_b
+            return mock_a if "18200" in url else mock_b
 
         with patch("lib.tools.Client", side_effect=client_factory):
             registry = await discover_tools(servers)
@@ -125,7 +117,7 @@ class TestDiscoverTools:
     @pytest.mark.asyncio
     async def test_handles_connection_error(self):
         servers = [
-            {"name": "Good", "url": "http://127.0.0.1:18201/ok", "enabled": True},
+            {"name": "Good", "url": "http://127.0.0.1:18201/sse", "enabled": True},
             {"name": "Bad", "url": "http://127.0.0.1:9999/bad", "enabled": True},
         ]
 

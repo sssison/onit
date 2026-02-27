@@ -5,17 +5,17 @@ servers:
     enabled: true
     host : 0.0.0.0
     port : 18200
-    path : /prompts
-    transport : 'streamable-http'
+    path : /sse
+    transport : 'sse'
 
-  - name: WebSearchMCPServer
-    module: tasks.web.search
-    description: "MCP server for general web search tasks"
+  - name: ToolsMCPServer
+    module: tasks.tools
+    description: "MCP server for web search, bash commands, file I/O, and document operations"
     enabled: true
     host : 0.0.0.0
     port : 18201
-    path : /search
-    transport : 'streamable-http'
+    path : /sse
+    transport : 'sse'
 
   - name: BashMCPServer
     module: tasks.os.bash

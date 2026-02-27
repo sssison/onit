@@ -30,14 +30,13 @@ def _make_config(tmp_path, overrides=None):
             "servers": [
                 {
                     "name": "PromptsMCPServer",
-                    "url": "http://127.0.0.1:18200/prompts",
+                    "url": "http://127.0.0.1:18200/sse",
                     "enabled": True,
                 },
             ],
         },
         "session_path": str(tmp_path / "sessions"),
         "theme": "white",
-        "persona": "assistant",
         "verbose": False,
     }
     if overrides:
@@ -59,7 +58,7 @@ class TestOnItInit:
         with _mock_discover():
             onit = OnIt(config=cfg)
         assert onit.status == "initialized"
-        assert onit.persona == "assistant"
+        assert onit.status == "initialized"
 
     def test_init_from_yaml_path(self, tmp_path):
         import yaml
@@ -126,6 +125,18 @@ class TestOnItInitialize:
         with _mock_discover():
             onit = OnIt(config=cfg)
         assert onit.timeout is None
+
+    def test_prompt_intro_from_config(self, tmp_path):
+        cfg = _make_config(tmp_path, {"prompt_intro": "I am a custom bot."})
+        with _mock_discover():
+            onit = OnIt(config=cfg)
+        assert onit.prompt_intro == "I am a custom bot."
+
+    def test_prompt_intro_default_none(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        with _mock_discover():
+            onit = OnIt(config=cfg)
+        assert onit.prompt_intro is None
 
     def test_placeholder_credentials_nullified(self, tmp_path):
         cfg = _make_config(tmp_path)
@@ -266,21 +277,48 @@ class TestProcessTask:
              patch("src.onit.chat", new_callable=AsyncMock, return_value=None):
             result = await onit.process_task("fail")
 
-        assert "Error" in result
+        assert "rephrase" in result
+
+    @pytest.mark.asyncio
+    async def test_prompt_intro_passed_to_chat(self, tmp_path):
+        onit = _make_onit_for_async(tmp_path, {"prompt_intro": "I am a custom bot."})
+        onit.safety_queue = asyncio.Queue()
+
+        mock_prompt_msg = MagicMock()
+        mock_prompt_msg.content.text = "Instruction text"
+        mock_prompt_result = MagicMock()
+        mock_prompt_result.messages = [mock_prompt_msg]
+
+        mock_client = AsyncMock()
+        mock_client.get_prompt = AsyncMock(return_value=mock_prompt_result)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        mock_chat = AsyncMock(return_value="answer")
+        with patch("src.onit.Client", return_value=mock_client), \
+             patch("src.onit.chat", mock_chat):
+            await onit.process_task("test")
+
+        call_kwargs = mock_chat.call_args.kwargs
+        assert call_kwargs.get("prompt_intro") == "I am a custom bot."
 
 
 # ── OnItA2AExecutor ─────────────────────────────────────────────────────────
 
 class TestOnItA2AExecutor:
     @pytest.mark.asyncio
-    async def test_execute_calls_process_task(self):
+    async def test_execute_calls_process_task(self, tmp_path):
         mock_onit = MagicMock()
         mock_onit.process_task = AsyncMock(return_value="result text")
+        mock_onit.session_path = str(tmp_path / "sessions" / "test.jsonl")
+        os.makedirs(os.path.dirname(mock_onit.session_path), exist_ok=True)
 
         executor = OnItA2AExecutor(mock_onit)
 
         context = MagicMock()
         context.get_user_input.return_value = "test task"
+        context.context_id = "ctx-123"
+        context.task_id = "task-456"
         context.message = MagicMock()
         context.message.parts = []
 
@@ -289,7 +327,14 @@ class TestOnItA2AExecutor:
 
         await executor.execute(context, event_queue)
 
-        mock_onit.process_task.assert_awaited_once_with("test task", images=None)
+        mock_onit.process_task.assert_awaited_once()
+        call_kwargs = mock_onit.process_task.call_args
+        assert call_kwargs[0][0] == "test task"
+        assert call_kwargs[1]["images"] is None
+        assert "session_id" in call_kwargs[1]
+        assert "session_path" in call_kwargs[1]
+        assert "data_path" in call_kwargs[1]
+        assert "safety_queue" in call_kwargs[1]
         event_queue.enqueue_event.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -304,15 +349,65 @@ class TestOnItA2AExecutor:
             await executor.execute(context, MagicMock())
 
     @pytest.mark.asyncio
-    async def test_cancel_signals_safety_queue(self):
+    async def test_cancel_signals_safety_queue(self, tmp_path):
         mock_onit = MagicMock()
-        mock_onit.safety_queue = asyncio.Queue()
+        mock_onit.session_path = str(tmp_path / "sessions" / "test.jsonl")
+        os.makedirs(os.path.dirname(mock_onit.session_path), exist_ok=True)
 
         executor = OnItA2AExecutor(mock_onit)
-        await executor.cancel(MagicMock(), MagicMock())
 
-        assert not mock_onit.safety_queue.empty()
-        assert mock_onit.safety_queue.get_nowait() == STOP_TAG
+        context = MagicMock()
+        context.context_id = "ctx-123"
+        context.task_id = "task-456"
+
+        await executor.cancel(context, MagicMock())
+
+        # The per-session safety_queue should have the stop signal
+        session = executor._sessions["ctx-123"]
+        assert not session["safety_queue"].empty()
+        assert session["safety_queue"].get_nowait() == STOP_TAG
+
+    @pytest.mark.asyncio
+    async def test_sessions_isolated_by_context(self, tmp_path):
+        """Different context_ids get different sessions."""
+        mock_onit = MagicMock()
+        mock_onit.session_path = str(tmp_path / "sessions" / "test.jsonl")
+        os.makedirs(os.path.dirname(mock_onit.session_path), exist_ok=True)
+
+        executor = OnItA2AExecutor(mock_onit)
+
+        ctx1 = MagicMock()
+        ctx1.context_id = "ctx-aaa"
+        ctx1.task_id = "task-1"
+
+        ctx2 = MagicMock()
+        ctx2.context_id = "ctx-bbb"
+        ctx2.task_id = "task-2"
+
+        s1 = executor._get_session(ctx1)
+        s2 = executor._get_session(ctx2)
+
+        assert s1["session_id"] != s2["session_id"]
+        assert s1["session_path"] != s2["session_path"]
+        assert s1["data_path"] != s2["data_path"]
+
+    @pytest.mark.asyncio
+    async def test_same_context_reuses_session(self, tmp_path):
+        """Same context_id returns the same session."""
+        mock_onit = MagicMock()
+        mock_onit.session_path = str(tmp_path / "sessions" / "test.jsonl")
+        os.makedirs(os.path.dirname(mock_onit.session_path), exist_ok=True)
+
+        executor = OnItA2AExecutor(mock_onit)
+
+        ctx = MagicMock()
+        ctx.context_id = "ctx-same"
+        ctx.task_id = "task-1"
+
+        s1 = executor._get_session(ctx)
+        s2 = executor._get_session(ctx)
+
+        assert s1["session_id"] == s2["session_id"]
 
 
 # ── ClientDisconnectMiddleware ──────────────────────────────────────────────
@@ -321,8 +416,9 @@ class TestClientDisconnectMiddleware:
     @pytest.mark.asyncio
     async def test_passes_through_non_http(self):
         mock_app = AsyncMock()
-        mock_onit = MagicMock()
-        mw = ClientDisconnectMiddleware(mock_app, mock_onit)
+        mock_executor = MagicMock(spec=OnItA2AExecutor)
+        mock_executor._active_safety_queues = {}
+        mw = ClientDisconnectMiddleware(mock_app, mock_executor)
 
         scope = {"type": "websocket"}
         await mw(scope, AsyncMock(), AsyncMock())
@@ -336,9 +432,9 @@ class TestClientDisconnectMiddleware:
             msg = await receive()
             calls.append(msg)
 
-        mock_onit = MagicMock()
-        mock_onit.safety_queue = asyncio.Queue()
-        mw = ClientDisconnectMiddleware(fake_app, mock_onit)
+        mock_executor = MagicMock(spec=OnItA2AExecutor)
+        mock_executor._active_safety_queues = {}
+        mw = ClientDisconnectMiddleware(fake_app, mock_executor)
 
         body_content = b'{"test": true}'
         messages = [

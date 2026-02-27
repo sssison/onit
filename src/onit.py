@@ -33,6 +33,8 @@ import logging
 import warnings
 warnings.filterwarnings("ignore", message="Pydantic serializer warnings:.*")
 
+logger = logging.getLogger(__name__)
+
 # Suppress noisy HTTP request logs from httpx/httpcore (used by FastMCP client)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -53,17 +55,51 @@ STOP_TAG = "<stop></stop>"
 
 
 class OnItA2AExecutor(AgentExecutor):
-    """A2A executor that delegates task processing to an OnIt instance."""
+    """A2A executor that delegates task processing to an OnIt instance.
+
+    Each A2A context (client conversation) gets its own isolated session
+    with separate chat history, data directory, and safety queue — following
+    the same pattern as the Telegram and Viber gateways.
+    """
 
     def __init__(self, onit):
         self.onit = onit
+        # Per-context session state: context_key -> {session_id, session_path, data_path, safety_queue}
+        self._sessions: dict[str, dict] = {}
+        # Track active safety_queue per asyncio task for disconnect middleware
+        self._active_safety_queues: dict[int, asyncio.Queue] = {}
+
+    def _get_session(self, context: 'RequestContext') -> dict:
+        """Get or create session state for an A2A context."""
+        # Use context_id to group related tasks from the same client,
+        # fall back to task_id for one-off requests
+        key = context.context_id or context.task_id or str(uuid.uuid4())
+        if key not in self._sessions:
+            session_id = str(uuid.uuid4())
+            sessions_dir = os.path.dirname(self.onit.session_path)
+            session_path = os.path.join(sessions_dir, f"{session_id}.jsonl")
+            if not os.path.exists(session_path):
+                with open(session_path, "w", encoding="utf-8") as f:
+                    f.write("")
+            data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / session_id)
+            os.makedirs(data_path, exist_ok=True)
+            self._sessions[key] = {
+                "session_id": session_id,
+                "session_path": session_path,
+                "data_path": data_path,
+                "safety_queue": asyncio.Queue(maxsize=10),
+            }
+            logger.info("Created new A2A session %s for context %s", session_id, key)
+        return self._sessions[key]
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         task = context.get_user_input()
         if not context.message:
             raise Exception('No message provided')
 
-        # Extract inline image parts from the A2A message and save to temp folder
+        session = self._get_session(context)
+
+        # Extract inline image parts from the A2A message and save to session data folder
         import base64
         image_paths = []
         for part in context.message.parts:
@@ -71,30 +107,43 @@ class OnItA2AExecutor(AgentExecutor):
                 file_obj = part.root.file
                 if file_obj.mime_type and file_obj.mime_type.startswith('image/'):
                     safe_name = os.path.basename(file_obj.name or 'image.png')
-                    filepath = os.path.join(self.onit.data_path, safe_name)
+                    filepath = os.path.join(session["data_path"], safe_name)
                     with open(filepath, 'wb') as f:
                         f.write(base64.b64decode(file_obj.bytes))
                     image_paths.append(filepath)
 
+        # Register safety_queue for disconnect middleware
+        current_task_id = id(asyncio.current_task())
+        self._active_safety_queues[current_task_id] = session["safety_queue"]
+
         try:
             result = await self.onit.process_task(
-                task, images=image_paths if image_paths else None
+                task,
+                images=image_paths if image_paths else None,
+                session_id=session["session_id"],
+                session_path=session["session_path"],
+                data_path=session["data_path"],
+                safety_queue=session["safety_queue"],
             )
         except asyncio.CancelledError:
-            self.onit.safety_queue.put_nowait(STOP_TAG)
+            session["safety_queue"].put_nowait(STOP_TAG)
             raise
+        finally:
+            self._active_safety_queues.pop(current_task_id, None)
+
         await event_queue.enqueue_event(new_agent_text_message(result))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        self.onit.safety_queue.put_nowait(STOP_TAG)
+        session = self._get_session(context)
+        session["safety_queue"].put_nowait(STOP_TAG)
 
 
 class ClientDisconnectMiddleware:
     """ASGI middleware that signals safety_queue when a client disconnects mid-request."""
 
-    def __init__(self, app, onit):
+    def __init__(self, app, executor: OnItA2AExecutor):
         self.app = app
-        self.onit = onit
+        self.executor = executor
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -132,7 +181,11 @@ class ClientDisconnectMiddleware:
         async def disconnect_watcher():
             msg = await receive()
             if msg.get("type") == "http.disconnect":
-                self.onit.safety_queue.put_nowait(STOP_TAG)
+                # Signal the safety_queue for the current request's task
+                task_id = id(asyncio.current_task())
+                sq = self.executor._active_safety_queues.get(task_id)
+                if sq:
+                    sq.put_nowait(STOP_TAG)
 
         watcher = asyncio.create_task(disconnect_watcher())
         try:
@@ -155,7 +208,6 @@ class OnIt(BaseModel):
     messages: dict[str, str] = Field(default_factory=dict)
     stop_commands: list[str] = Field(default_factory=lambda: ['\\goodbye', '\\bye', '\\quit', '\\exit'])
     model_serving: dict[str, Any] = Field(default_factory=dict)
-    persona: str = Field(default="assistant")
     user_id: str = Field(default="default_user")
     input_queue: asyncio.Queue | None = Field(default=None, exclude=True)
     output_queue: asyncio.Queue | None = Field(default=None, exclude=True)
@@ -165,6 +217,9 @@ class OnIt(BaseModel):
     session_path: str = Field(default="~/.onit/sessions")
     data_path: str = Field(default="")
     template_path: str | None = Field(default=None)
+    documents_path: str | None = Field(default=None)
+    topic: str | None = Field(default=None)
+    prompt_intro: str | None = Field(default=None)
     timeout: int | None = Field(default=None)
     show_logs: bool = Field(default=False)
     loop: bool = Field(default=False)
@@ -172,7 +227,6 @@ class OnIt(BaseModel):
     task: str | None = Field(default=None)
     web: bool = Field(default=False)
     web_port: int = Field(default=9000)
-    web_share: bool = Field(default=False)
     web_google_client_id: str | None = Field(default=None)
     web_google_client_secret: str | None = Field(default=None)
     web_allowed_emails: list[str] | None = Field(default=None)
@@ -181,6 +235,10 @@ class OnIt(BaseModel):
     a2a_port: int = Field(default=9001)
     a2a_name: str = Field(default="OnIt")
     a2a_description: str = Field(default="An intelligent agent for task automation and assistance.")
+    gateway: str | None = Field(default=None)
+    gateway_token: str | None = Field(default=None, exclude=True)
+    viber_webhook_url: str | None = Field(default=None)
+    viber_port: int = Field(default=8443)
     prompt_url: str | None = Field(default=None, exclude=True)
     file_server_url: str | None = Field(default=None, exclude=True)
     chat_ui: Any | None = Field(default=None, exclude=True)
@@ -209,7 +267,6 @@ class OnIt(BaseModel):
                     data_path=self.data_path,
                     show_logs=self.show_logs,
                     server_port=self.web_port,
-                    share=self.web_share,
                     google_client_id=self.web_google_client_id,
                     google_client_secret=self.web_google_client_secret,
                     allowed_emails=self.web_allowed_emails,
@@ -217,8 +274,14 @@ class OnIt(BaseModel):
                     title=self.web_title,
                     verbose=self.verbose,
                 )
+                self.chat_ui._onit = self
             else:
-                banner = "OnIt Agent to Agent Server" if self.a2a else "OnIt Chat Interface"
+                if self.a2a:
+                    banner = "OnIt Agent to Agent Server"
+                elif self.gateway:
+                    banner = f"OnIt {self.gateway.capitalize()} Gateway"
+                else:
+                    banner = "OnIt Chat Interface"
                 self.chat_ui = ChatUI(self.theme, show_logs=self.show_logs, banner_title=banner)
         
     def initialize(self):
@@ -263,15 +326,16 @@ class OnIt(BaseModel):
                     "  - --host CLI flag\n"
                     "  - serving.host in the config YAML"
                 )
-        self.persona = self.config_data.get('persona', 'assistant')
         self.user_id = self.config_data.get('user_id', 'default_user')
         self.status = "initialized"
         self.verbose = self.config_data.get('verbose', False)
-        # Suppress tool discovery and MCP client logs unless verbose
+        # Suppress noisy logs unless verbose
         if not self.verbose:
             logging.getLogger("src.lib.tools").setLevel(logging.WARNING)
             logging.getLogger("lib.tools").setLevel(logging.WARNING)
             logging.getLogger("type.tools").setLevel(logging.WARNING)
+            logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+            logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
         # append session id to sessions path
         self.session_id = str(uuid.uuid4())
         self.session_path = os.path.join(self.config_data.get('session_path', '~/.onit/sessions'), f"{self.session_id}.jsonl")
@@ -314,6 +378,9 @@ class OnIt(BaseModel):
                 local_ip = "127.0.0.1"
             self.file_server_url = f"http://{local_ip}:{a2a_port}"
         self.template_path = self.config_data.get('template_path', None)
+        self.documents_path = self.config_data.get('documents_path', None)
+        self.topic = self.config_data.get('topic', None)
+        self.prompt_intro = self.config_data.get('prompt_intro', None)
         self.timeout = self.config_data.get('timeout', None)  # default timeout 300 seconds
         if self.timeout is not None and self.timeout < 0:
             self.timeout = None  # no timeout
@@ -323,7 +390,6 @@ class OnIt(BaseModel):
         self.task = self.config_data.get('task', None)
         self.web = self.config_data.get('web', False)
         self.web_port = self.config_data.get('web_port', 9000)
-        self.web_share = self.config_data.get('web_share', False)
         self.web_google_client_id = self.config_data.get('web_google_client_id', None)
         self.web_google_client_secret = self.config_data.get('web_google_client_secret', None)
         # Nullify placeholder credentials so auth is cleanly disabled
@@ -337,19 +403,25 @@ class OnIt(BaseModel):
         self.a2a_port = self.config_data.get('a2a_port', 9001)
         self.a2a_name = self.config_data.get('a2a_name', 'OnIt')
         self.a2a_description = self.config_data.get('a2a_description', 'An intelligent agent for task automation and assistance.')
-    def load_session_history(self, max_turns: int = 20) -> list[dict]:
+        self.gateway = self.config_data.get('gateway', None) or None
+        self.gateway_token = self.config_data.get('gateway_token', None)
+        self.viber_webhook_url = self.config_data.get('viber_webhook_url', None)
+        self.viber_port = self.config_data.get('viber_port', 8443)
+    def load_session_history(self, max_turns: int = 20, session_path: str | None = None) -> list[dict]:
         """Load recent session history from the JSONL session file.
 
         Args:
             max_turns: Maximum number of recent task/response pairs to return.
+            session_path: Optional override path to the session file.
 
         Returns:
             A list of dicts with 'task' and 'response' keys, oldest first.
         """
+        effective_path = session_path or self.session_path
         history = []
         try:
-            if os.path.exists(self.session_path):
-                with open(self.session_path, "r", encoding="utf-8") as f:
+            if os.path.exists(effective_path):
+                with open(effective_path, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if line:
@@ -370,8 +442,7 @@ class OnIt(BaseModel):
             self.input_queue = asyncio.Queue(maxsize=10)
             self.output_queue = asyncio.Queue(maxsize=10)
             self.safety_queue = asyncio.Queue(maxsize=10)
-            if self.web and self.chat_ui:
-                self.chat_ui.safety_queue = self.safety_queue
+            # safety_queue is used by non-web modes; web uses per-session queues
             self.status = "running"
             if self.a2a:
                 await self.run_a2a()
@@ -380,25 +451,50 @@ class OnIt(BaseModel):
             else:
                 if self.web and hasattr(self.chat_ui, 'launch'):
                     self.chat_ui.launch(asyncio.get_event_loop())
-                client_to_agent_task = asyncio.create_task(self.client_to_agent())
-                await asyncio.gather(client_to_agent_task)
+                    # Web sessions call process_task() directly; keep loop alive
+                    while self.status == "running":
+                        await asyncio.sleep(1)
+                else:
+                    client_to_agent_task = asyncio.create_task(self.client_to_agent())
+                    await asyncio.gather(client_to_agent_task)
         except Exception:
             pass
         finally:
             self.status = "stopped"
 
-    async def process_task(self, task: str, images: list[str] | None = None) -> str:
-        """Process a single task and return the response string."""
-        while not self.safety_queue.empty():
-            self.safety_queue.get_nowait()
+    async def process_task(self, task: str, images: list[str] | None = None,
+                           session_id: str | None = None,
+                           session_path: str | None = None,
+                           data_path: str | None = None,
+                           safety_queue: asyncio.Queue | None = None) -> str:
+        """Process a single task and return the response string.
+
+        Args:
+            task: The user task/message to process.
+            images: Optional list of image file paths.
+            session_id: Optional override for session_id (e.g. per-chat in Telegram).
+            session_path: Optional override for session history file path.
+            data_path: Optional override for data directory path.
+            safety_queue: Optional per-session safety queue (e.g. per-tab in web UI).
+        """
+        # Use per-chat overrides if provided, otherwise fall back to instance defaults
+        effective_session_id = session_id or self.session_id
+        effective_session_path = session_path or self.session_path
+        effective_data_path = data_path or self.data_path
+        effective_safety_queue = safety_queue or self.safety_queue
+
+        while not effective_safety_queue.empty():
+            effective_safety_queue.get_nowait()
 
         prompt_client = Client(self.prompt_url)
         async with prompt_client:
-            instruction = await prompt_client.get_prompt(self.persona, {
+            instruction = await prompt_client.get_prompt("assistant", {
                 "task": task,
-                "session_id": self.session_id,
+                "session_id": effective_session_id,
                 "template_path": self.template_path,
                 "file_server_url": self.file_server_url,
+                "documents_path": self.documents_path,
+                "topic": self.topic,
             })
             instruction = instruction.messages[0].content.text
 
@@ -406,9 +502,12 @@ class OnIt(BaseModel):
             'console': None, 'chat_ui': None,
             'cursor': AGENT_CURSOR, 'memories': None,
             'verbose': self.verbose,
+            'data_path': effective_data_path,
             'max_tokens': self.model_serving.get('max_tokens', 262144),
-            'session_history': self.load_session_history(),
+            'session_history': self.load_session_history(session_path=effective_session_path),
         }
+        if self.prompt_intro:
+            kwargs['prompt_intro'] = self.prompt_intro
         last_response = await chat(
             host=self.model_serving["host"],
             host_key=self.model_serving.get("host_key", "EMPTY"),
@@ -416,26 +515,29 @@ class OnIt(BaseModel):
             instruction=instruction,
             images=images,
             tool_registry=self.tool_registry,
-            safety_queue=self.safety_queue,
+            safety_queue=effective_safety_queue,
             think=self.model_serving["think"],
             timeout=self.timeout,
             **kwargs,
         )
 
-        if last_response is not None:
-            response = remove_tags(last_response)
-            try:
-                with open(self.session_path, "a", encoding="utf-8") as f:
-                    session_data = {
-                        "task": task,
-                        "response": response,
-                        "timestamp": asyncio.get_event_loop().time(),
-                    }
-                    f.write(json.dumps(session_data) + "\n")
-            except Exception:
-                pass
-            return response
-        return "Error: No response from model."
+        if last_response is None:
+            logger.error("chat() returned None — likely a safety queue trigger or unhandled error. "
+                         "Host: %s, Model: %s", self.model_serving["host"], self.model_serving["model"])
+            return "I am sorry \U0001f614. Could you please rephrase your question?"
+
+        response = remove_tags(last_response)
+        try:
+            with open(effective_session_path, "a", encoding="utf-8") as f:
+                session_data = {
+                    "task": task,
+                    "response": response,
+                    "timestamp": asyncio.get_event_loop().time(),
+                }
+                f.write(json.dumps(session_data) + "\n")
+        except Exception:
+            pass
+        return response
 
     async def run_loop(self) -> None:
         """Run the OnIt agent in loop mode, executing a task repeatedly."""
@@ -458,10 +560,12 @@ class OnIt(BaseModel):
                 # build instruction via MCP prompt
                 print(f"--- Iteration {iteration} ---")
                 async with prompt_client:
-                    instruction = await prompt_client.get_prompt(self.persona, {"task": self.task,
+                    instruction = await prompt_client.get_prompt("assistant", {"task": self.task,
                                                                                 "session_id": self.session_id,
                                                                                 "template_path": self.template_path,
-                                                                                "file_server_url": self.file_server_url})
+                                                                                "file_server_url": self.file_server_url,
+                                                                                "documents_path": self.documents_path,
+                                                                                "topic": self.topic})
                     instruction = instruction.messages[0]
                     instruction = instruction.content.text
 
@@ -471,6 +575,7 @@ class OnIt(BaseModel):
                           'cursor': AGENT_CURSOR,
                           'memories': None,
                           'verbose': self.verbose,
+                          'data_path': self.data_path,
                           'max_tokens': self.model_serving.get('max_tokens', 262144),
                           'session_history': self.load_session_history()}
                 last_response = await chat(host=self.model_serving["host"],
@@ -566,7 +671,16 @@ class OnIt(BaseModel):
             safe_name = os.path.basename(filename)
             filepath = os.path.join(data_path, safe_name)
             if os.path.isfile(filepath):
-                return FileResponse(filepath)
+                # Read file content directly to avoid Content-Length mismatch
+                # if the file is still being written concurrently.
+                try:
+                    with open(filepath, "rb") as f:
+                        content = f.read()
+                    import mimetypes
+                    media_type = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
+                    return Response(content=content, media_type=media_type)
+                except OSError:
+                    return Response(content="File read error", status_code=500)
             return Response(content="File not found", status_code=404)
 
         async def receive_upload(request: Request) -> Response:
@@ -588,13 +702,54 @@ class OnIt(BaseModel):
         starlette_app.routes.insert(0, Route("/uploads/", receive_upload, methods=["POST"]))
 
         # Wrap app with disconnect detection middleware
-        wrapped_app = ClientDisconnectMiddleware(starlette_app, self)
+        wrapped_app = ClientDisconnectMiddleware(starlette_app, executor)
 
         print(f"A2A server running at http://0.0.0.0:{self.a2a_port}/ (Ctrl+C to stop)")
 
-        config = uvicorn.Config(wrapped_app, host="0.0.0.0", port=self.a2a_port, log_level="info")
+        config = uvicorn.Config(wrapped_app, host="0.0.0.0", port=self.a2a_port, log_level="info" if self.verbose else "warning", access_log=self.verbose)
         server = uvicorn.Server(config)
         await server.serve()
+
+    def run_gateway_sync(self) -> None:
+        """Run OnIt as a messaging gateway (blocking, owns the event loop).
+
+        Supports Telegram and Viber gateways based on ``self.gateway`` value.
+        """
+        self.input_queue = asyncio.Queue(maxsize=10)
+        self.output_queue = asyncio.Queue(maxsize=10)
+        self.safety_queue = asyncio.Queue(maxsize=10)
+        self.status = "running"
+
+        if self.gateway == "viber":
+            from .ui.viber import ViberGateway
+
+            if not self.gateway_token:
+                raise ValueError(
+                    "Viber gateway requires a bot token. Set VIBER_BOT_TOKEN "
+                    "environment variable or gateway_token in config."
+                )
+            if not self.viber_webhook_url:
+                raise ValueError(
+                    "Viber gateway requires a webhook URL. Set VIBER_WEBHOOK_URL "
+                    "environment variable or --viber-webhook-url CLI option."
+                )
+            gw = ViberGateway(
+                self, self.gateway_token,
+                webhook_url=self.viber_webhook_url,
+                port=self.viber_port,
+                show_logs=self.show_logs,
+            )
+        else:
+            from .ui.telegram import TelegramGateway
+
+            if not self.gateway_token:
+                raise ValueError(
+                    "Telegram gateway requires a bot token. Set TELEGRAM_BOT_TOKEN "
+                    "environment variable or gateway_token in config."
+                )
+            gw = TelegramGateway(self, self.gateway_token, show_logs=self.show_logs)
+
+        gw.run_sync()
 
     async def client_to_agent(self) -> None:
         """Handle client to agent communication"""
@@ -630,10 +785,12 @@ class OnIt(BaseModel):
 
             # prompt engineering
             async with prompt_client:
-                instruction = await prompt_client.get_prompt(self.persona, {"task": task,
+                instruction = await prompt_client.get_prompt("assistant", {"task": task,
                                                                             "session_id": self.session_id,
                                                                             "template_path": self.template_path,
-                                                                            "file_server_url": self.file_server_url})
+                                                                            "file_server_url": self.file_server_url,
+                                                                            "documents_path": self.documents_path,
+                                                                            "topic": self.topic})
                 instruction = instruction.messages[0]
                 instruction = instruction.content.text
                 
@@ -729,8 +886,11 @@ class OnIt(BaseModel):
                           'cursor': AGENT_CURSOR,
                           'memories': None,
                           'verbose': self.verbose,
+                          'data_path': self.data_path,
                           'max_tokens': self.model_serving.get('max_tokens', 262144),
                           'session_history': self.load_session_history()}
+                if self.prompt_intro:
+                    kwargs['prompt_intro'] = self.prompt_intro
                 last_response = await chat(host=self.model_serving["host"],
                                             host_key=self.model_serving.get("host_key", "EMPTY"),
                                             model=self.model_serving["model"],
@@ -749,8 +909,10 @@ class OnIt(BaseModel):
                 await self.output_queue.put(f"<answer>{last_response}</answer>")
                 return
             except asyncio.CancelledError:
-                await self.output_queue.put(f"Error: Session cancelled.")
+                logger.warning("Agent session cancelled.")
+                await self.output_queue.put(None)
                 return
             except Exception as e:
-                await self.output_queue.put(f"Error in agent session:\nInstruction:\n{instruction}\nError:\n{str(e)}")
+                logger.error("Error in agent session: %s", e)
+                await self.output_queue.put(None)
                 return

@@ -15,16 +15,13 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy dependency files first (for layer caching)
-COPY requirements.txt pyproject.toml ./
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml ./
 
 # Copy the rest of the project
 COPY . .
 
-# Install the project itself
-RUN pip install --no-cache-dir -e .
+# Install the project with all dependencies
+RUN pip install --no-cache-dir -e ".[all]"
 
 # Default port for web UI
 EXPOSE 9000

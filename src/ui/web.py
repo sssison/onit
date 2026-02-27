@@ -22,15 +22,22 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
 import shutil
+import tempfile
 import threading
 import urllib.parse
+import uuid
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Literal, Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     import gradio as gr
@@ -241,6 +248,21 @@ class GoogleAuthenticator:
             return None
 
 
+@dataclass
+class WebSession:
+    """Per-browser-tab session state for the web UI."""
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    session_path: str = ""
+    data_path: str = ""
+    pending_responses: list = field(default_factory=list)
+    processing: bool = False
+    spinner_shown: bool = False
+    spinner_step: int = 0
+    spinner_tick: int = 0
+    safety_queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=10))
+    created: datetime = field(default_factory=datetime.now)
+
+
 class WebChatUI:
     def __init__(
         self,
@@ -249,7 +271,6 @@ class WebChatUI:
         data_path: str = "~/.onit/data",
         show_logs: bool = False,
         server_port: int = 9000,
-        share: bool = False,
         google_client_id: Optional[str] = None,
         google_client_secret: Optional[str] = None,
         allowed_emails: Optional[list[str]] = None,
@@ -264,7 +285,6 @@ class WebChatUI:
         self.show_logs = show_logs
         self.verbose = verbose
         self.server_port = server_port
-        self.share = share
         self.console = NullConsole()
 
         # authentication
@@ -299,16 +319,11 @@ class WebChatUI:
         else:
             print("Authentication disabled — no Google OAuth credentials configured.")
 
-        # internal state — chat history uses gr.ChatMessage objects
-        self._chat_history: list[gr.ChatMessage] = []
+        # Per-browser-session state (replaces shared state)
+        self._web_sessions: dict[str, WebSession] = {}
+        self._onit = None  # set by OnIt after creation
         self.execution_logs: deque[dict] = deque(maxlen=100)
-        self._pending_responses: list[gr.ChatMessage] = []
-        self._user_input_queue: asyncio.Queue = asyncio.Queue()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._processing: bool = False
-        self._spinner_shown: bool = False
-        self._spinner_step: int = 0
-        self._spinner_tick: int = 0
         self._spinner_ticks_per_message: int = 6  # change message every ~3s (6 × 0.5s poll)
         self._spinner_messages: list[str] = [
             "Analyzing your request...",
@@ -324,7 +339,6 @@ class WebChatUI:
             "Diving deeper...",
             "Finalizing...",
         ]
-        self.safety_queue = None  # set by OnIt.run() when available
 
         # Store authenticated sessions with cookies
         # Format: {cookie_value: {email, session_id, expires}}
@@ -334,10 +348,51 @@ class WebChatUI:
         self.app: Optional[gr.Blocks] = None
 
     # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
+
+    def _get_or_create_session(self, session_id: str | None = None) -> tuple[str, WebSession]:
+        """Get an existing session or create a new one.
+
+        Returns (session_id, WebSession) tuple.
+        """
+        if session_id and session_id in self._web_sessions:
+            return session_id, self._web_sessions[session_id]
+
+        # Create new session
+        session = WebSession()
+        # Derive sessions dir from the configured session_path
+        if self.session_path:
+            sessions_dir = os.path.dirname(self.session_path)
+        else:
+            sessions_dir = os.path.expanduser("~/.onit/sessions")
+        os.makedirs(sessions_dir, exist_ok=True)
+        session.session_path = os.path.join(sessions_dir, f"{session.session_id}.jsonl")
+        if not os.path.exists(session.session_path):
+            with open(session.session_path, "w", encoding="utf-8") as f:
+                f.write("")
+        session.data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / session.session_id)
+        os.makedirs(session.data_path, exist_ok=True)
+
+        self._web_sessions[session.session_id] = session
+        logger.info("Created new web session %s", session.session_id)
+
+        # Cleanup old sessions (older than 24h)
+        now = datetime.now()
+        expired = [
+            sid for sid, s in self._web_sessions.items()
+            if (now - s.created) > timedelta(hours=24)
+        ]
+        for sid in expired:
+            del self._web_sessions[sid]
+
+        return session.session_id, session
+
+    # ------------------------------------------------------------------
     # Interface methods (matching ChatUI contract)
     # ------------------------------------------------------------------
 
-    def _extract_file_paths(self, text: str) -> tuple[str, list[str]]:
+    def _extract_file_paths(self, text: str, data_path: str | None = None, session_id: str | None = None) -> tuple[str, list[str]]:
         """Extract file paths from text; replace with safe download links.
 
         Handles three cases:
@@ -345,14 +400,15 @@ class WebChatUI:
         2. HTTP URLs containing /uploads/ (remote MCP callback uploads)
         3. Bare filenames that exist in data_path (model just mentions the name)
         """
+        effective_data_path = data_path or self.data_path
         found_files: list[str] = []  # absolute paths in data_path
         cleaned = text
 
         # 1. Match absolute paths under data_path
-        local_pattern = re.escape(self.data_path) + r'/[\w\-\.]+(?:\.\w+)'
+        local_pattern = re.escape(effective_data_path) + r'/[\w\-\.]+(?:\.\w+)'
         for match in re.findall(local_pattern, cleaned):
             fname = os.path.basename(match)
-            fpath = os.path.join(self.data_path, fname)
+            fpath = os.path.join(effective_data_path, fname)
             if fpath not in found_files:
                 found_files.append(fpath)
         # Replace full paths with just basenames
@@ -362,7 +418,7 @@ class WebChatUI:
         url_pattern = r'https?://[^/\s]+/uploads/([\w\-\.]+(?:\.\w+))'
         for match in re.finditer(url_pattern, cleaned):
             fname = match.group(1)
-            fpath = os.path.join(self.data_path, fname)
+            fpath = os.path.join(effective_data_path, fname)
             if fpath not in found_files:
                 found_files.append(fpath)
         # Replace full URLs with just the filename
@@ -372,18 +428,19 @@ class WebChatUI:
         cleaned = re.sub(r'(?<![:\w])/(?:[\w\.\-]+/)+(?=[\w\.\-]+)', '', cleaned)
 
         # 3. Check for bare filenames that exist in data_path
-        if os.path.isdir(self.data_path):
-            existing = set(os.listdir(self.data_path))
+        if os.path.isdir(effective_data_path):
+            existing = set(os.listdir(effective_data_path))
             for fname in existing:
                 if fname in cleaned:
-                    fpath = os.path.join(self.data_path, fname)
+                    fpath = os.path.join(effective_data_path, fname)
                     if fpath not in found_files:
                         found_files.append(fpath)
 
         # Turn found basenames into markdown download links
+        upload_prefix = f"/uploads/{session_id}" if session_id else "/uploads"
         for fpath in found_files:
             fname = os.path.basename(fpath)
-            cleaned = cleaned.replace(fname, f'[{fname}](/uploads/{fname})', 1)
+            cleaned = cleaned.replace(fname, f'[{fname}]({upload_prefix}/{fname})', 1)
 
         return cleaned, found_files
 
@@ -393,25 +450,8 @@ class WebChatUI:
         response: str,
         elapsed: str = "",
     ) -> None:
-        """Called by chat.py and onit.py to record messages."""
-        file_paths = []
-        if role == "assistant":
-            display, file_paths = self._extract_file_paths(response)
-        else:
-            display = response
-        if elapsed:
-            display = f"{display}\n\n_({elapsed})_"
-        self._pending_responses.append(gr.ChatMessage(role=role, content=display))
-        for fpath in file_paths:
-            if os.path.isfile(fpath):
-                self._pending_responses.append(
-                    gr.ChatMessage(
-                        role="assistant",
-                        content=gr.FileData(path=fpath, mime_type=None),
-                    )
-                )
-        if role in ("assistant", "system"):
-            self._processing = False
+        """No-op for web UI. Responses are routed through per-session state."""
+        pass
 
     def add_log(
         self,
@@ -432,13 +472,14 @@ class WebChatUI:
         """No-op for web UI."""
         pass
 
-    def _load_chat_from_session(self) -> list:
+    def _load_chat_from_session(self, session_path: str | None = None, data_path: str | None = None, session_id: str | None = None) -> list:
         """Load chat history from the JSONL session file for display in the chatbot."""
+        effective_path = session_path or self.session_path
         messages = []
-        if not self.session_path or not os.path.exists(self.session_path):
+        if not effective_path or not os.path.exists(effective_path):
             return messages
         try:
-            with open(self.session_path, "r", encoding="utf-8") as f:
+            with open(effective_path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -447,7 +488,7 @@ class WebChatUI:
                         entry = json.loads(line)
                         if "task" in entry and "response" in entry:
                             messages.append(gr.ChatMessage(role="user", content=entry["task"]))
-                            display, file_paths = self._extract_file_paths(entry["response"])
+                            display, file_paths = self._extract_file_paths(entry["response"], data_path=data_path, session_id=session_id)
                             messages.append(gr.ChatMessage(role="assistant", content=display))
                             for fpath in file_paths:
                                 if os.path.isfile(fpath):
@@ -462,10 +503,6 @@ class WebChatUI:
         except Exception:
             pass
         return messages
-
-    async def get_user_input_async(self) -> str:
-        """Await user input from Gradio's submit callback."""
-        return await self._user_input_queue.get()
 
     # ------------------------------------------------------------------
     # Gradio app
@@ -596,33 +633,33 @@ class WebChatUI:
             # -- callbacks --
             # Note: Authentication is handled via OAuth redirect flow in FastAPI routes
             # No Gradio callbacks needed for login/logout
-            def handle_upload(file):
+            def handle_upload(file, sess_id):
                 if file is None:
-                    return None, gr.update(value="", visible=False)
+                    return None, gr.update(value="", visible=False), sess_id
                 # Gradio 6+ returns a filepath string; older versions return a file object
                 file_path = file if isinstance(file, (str, os.PathLike)) else file.name
                 file_path = str(file_path)
-                os.makedirs(self.data_path, exist_ok=True)
+                # Use per-session data path
+                _, session = self._get_or_create_session(sess_id)
+                os.makedirs(session.data_path, exist_ok=True)
                 fname = os.path.basename(file_path)
-                dest = os.path.join(self.data_path, fname)
+                dest = os.path.join(session.data_path, fname)
                 shutil.copy2(file_path, dest)
                 indicator = f"<p style='color: #4caf50; font-size: 0.8em; margin: 2px 0;'>📎 {fname}</p>"
-                return dest, gr.update(value=indicator, visible=True)
+                return dest, gr.update(value=indicator, visible=True), sess_id
 
-            def handle_send(user_msg, uploaded_path, history, request: gr.Request = None):
+            def handle_send(user_msg, uploaded_path, history, sess_id, request: gr.Request = None):
                 hide_indicator = gr.update(value="", visible=False)
                 # Verify authentication if enabled
                 if self.auth_enabled:
-                    # Check authentication via cookie (not state, since OAuth sets cookies)
                     auth_cookie = request.cookies.get("onit_auth") if request else None
                     if not auth_cookie or auth_cookie not in self._authenticated_cookies:
                         error_msg = gr.ChatMessage(
                             role="assistant",
                             content="❌ Session expired or invalid. Please login again."
                         )
-                        return history + [error_msg], user_msg, uploaded_path, hide_indicator
+                        return history + [error_msg], user_msg, uploaded_path, hide_indicator, sess_id
 
-                    # Verify cookie hasn't expired
                     cookie_data = self._authenticated_cookies[auth_cookie]
                     if datetime.now() > cookie_data['expires']:
                         del self._authenticated_cookies[auth_cookie]
@@ -630,89 +667,127 @@ class WebChatUI:
                             role="assistant",
                             content="❌ Session expired or invalid. Please login again."
                         )
-                        return history + [error_msg], user_msg, uploaded_path, hide_indicator
+                        return history + [error_msg], user_msg, uploaded_path, hide_indicator, sess_id
 
                 if not user_msg and not uploaded_path:
-                    return history, "", None, hide_indicator
+                    return history, "", None, hide_indicator, sess_id
+
+                sess_id, session = self._get_or_create_session(sess_id)
 
                 display_msg = user_msg or ""
                 queue_msg = user_msg or ""
                 if uploaded_path:
                     fname = os.path.basename(uploaded_path)
-                    file_url = f"/uploads/{fname}"
+                    file_url = f"/uploads/{sess_id}/{fname}"
                     display_msg += f"\n📎 [{fname}]({file_url})"
                     queue_msg += f"\nRelevant files: {uploaded_path}"
 
-                # Route user message through _pending_responses so poll_response
-                # handles all chatbot updates — avoids race where the timer
-                # overwrites handle_send's returned history with stale state.
-                self._pending_responses.append(
+                # Route user message through per-session pending_responses
+                session.pending_responses.append(
                     gr.ChatMessage(role="user", content=display_msg)
                 )
 
-                # enqueue for OnIt event loop
-                self._processing = True
-                if self._loop:
-                    asyncio.run_coroutine_threadsafe(
-                        self._user_input_queue.put(queue_msg),
-                        self._loop,
-                    )
+                # Fire-and-forget: call process_task() directly (like Telegram gateway)
+                session.processing = True
+                if self._loop and self._onit:
+                    async def _run_task(s=session, task=queue_msg):
+                        try:
+                            response = await self._onit.process_task(
+                                task,
+                                session_id=s.session_id,
+                                session_path=s.session_path,
+                                data_path=s.data_path,
+                                safety_queue=s.safety_queue,
+                            )
+                            if response:
+                                display, file_paths = self._extract_file_paths(
+                                    response, data_path=s.data_path, session_id=s.session_id
+                                )
+                                s.pending_responses.append(
+                                    gr.ChatMessage(role="assistant", content=display)
+                                )
+                                for fpath in file_paths:
+                                    if os.path.isfile(fpath):
+                                        s.pending_responses.append(
+                                            gr.ChatMessage(
+                                                role="assistant",
+                                                content=gr.FileData(path=fpath, mime_type=None),
+                                            )
+                                        )
+                            else:
+                                s.pending_responses.append(
+                                    gr.ChatMessage(role="assistant", content="I'm sorry, I couldn't process your request. Please try again.")
+                                )
+                        except Exception as e:
+                            logger.error("Error processing task: %s", e)
+                            s.pending_responses.append(
+                                gr.ChatMessage(role="assistant", content=f"Error: {e}")
+                            )
+                        finally:
+                            s.processing = False
 
-                return history, "", None, hide_indicator
+                    asyncio.run_coroutine_threadsafe(_run_task(), self._loop)
 
-            def handle_stop():
-                if self._loop and self.safety_queue:
-                    self._loop.call_soon_threadsafe(
-                        self.safety_queue.put_nowait, True
-                    )
+                return history, "", None, hide_indicator, sess_id
+
+            def handle_stop(sess_id):
+                if sess_id and sess_id in self._web_sessions:
+                    session = self._web_sessions[sess_id]
+                    if self._loop:
+                        self._loop.call_soon_threadsafe(
+                            session.safety_queue.put_nowait, True
+                        )
                 return gr.update(visible=False)
 
-            def poll_response(history):
+            def poll_response(history, sess_id):
+                if not sess_id or sess_id not in self._web_sessions:
+                    logs_md = self._format_logs() if self.execution_logs else "*No execution logs yet.*"
+                    return history, gr.update(visible=False), logs_md, sess_id
+
+                session = self._web_sessions[sess_id]
+
                 # Remove spinner before appending real responses or when done
-                if self._spinner_shown and (self._pending_responses or not self._processing):
+                if session.spinner_shown and (session.pending_responses or not session.processing):
                     if history:
                         history = history[:-1]
-                    self._spinner_shown = False
-                    if not self._processing:
-                        self._spinner_step = 0
-                        self._spinner_tick = 0
+                    session.spinner_shown = False
+                    if not session.processing:
+                        session.spinner_step = 0
+                        session.spinner_tick = 0
 
-                while self._pending_responses:
-                    resp = self._pending_responses.pop(0)
+                while session.pending_responses:
+                    resp = session.pending_responses.pop(0)
                     history = history + [resp]
 
                 # Add or update spinner while processing
-                if self._processing:
+                if session.processing:
                     status_msg = self._spinner_messages[
-                        self._spinner_step % len(self._spinner_messages)
+                        session.spinner_step % len(self._spinner_messages)
                     ]
-                    self._spinner_tick += 1
-                    if self._spinner_tick >= self._spinner_ticks_per_message:
-                        self._spinner_tick = 0
-                        self._spinner_step += 1
+                    session.spinner_tick += 1
+                    if session.spinner_tick >= self._spinner_ticks_per_message:
+                        session.spinner_tick = 0
+                        session.spinner_step += 1
                     spinner_msg = gr.ChatMessage(
                         role="assistant",
                         content=f"### {status_msg}",
                         metadata={"title": "_On it_"},
                     )
-                    if self._spinner_shown:
-                        # Replace existing spinner with updated message
+                    if session.spinner_shown:
                         history = history[:-1] + [spinner_msg]
                     else:
                         history = history + [spinner_msg]
-                        self._spinner_shown = True
+                        session.spinner_shown = True
 
-                # Update execution logs display
                 logs_md = self._format_logs() if self.execution_logs else "*No execution logs yet.*"
-
-                return history, gr.update(visible=self._processing), logs_md
+                return history, gr.update(visible=session.processing), logs_md, sess_id
 
             # wire events
-            upload_btn.upload(handle_upload, [upload_btn], [uploaded_file_state, upload_indicator])
+            upload_btn.upload(handle_upload, [upload_btn, session_state], [uploaded_file_state, upload_indicator, session_state])
 
             # Note: gr.Request is automatically injected by Gradio, no need to pass it in inputs
-            send_inputs = [msg_input, uploaded_file_state, chatbot]
-            send_outputs = [chatbot, msg_input, uploaded_file_state, upload_indicator]
+            send_inputs = [msg_input, uploaded_file_state, chatbot, session_state]
+            send_outputs = [chatbot, msg_input, uploaded_file_state, upload_indicator, session_state]
 
             msg_input.submit(
                 handle_send,
@@ -720,21 +795,33 @@ class WebChatUI:
                 send_outputs,
             )
 
-            stop_btn.click(handle_stop, None, [stop_btn])
+            stop_btn.click(handle_stop, [session_state], [stop_btn])
 
             # poll for assistant responses every 0.5s
             timer = gr.Timer(value=0.5)
-            timer.tick(poll_response, [chatbot], [chatbot, stop_btn, logs_display])
+            timer.tick(poll_response, [chatbot, session_state], [chatbot, stop_btn, logs_display, session_state])
 
-            # Restore chat history and check auth on page load
-            def restore_chat():
-                return self._load_chat_from_session()
+            # Initialize session and restore chat history on page load
+            def init_session():
+                """Create a new session for each browser tab."""
+                sess_id, session = self._get_or_create_session()
+                history = self._load_chat_from_session(
+                    session_path=session.session_path,
+                    data_path=session.data_path,
+                    session_id=sess_id,
+                )
+                return history, sess_id
 
             if self.auth_enabled:
                 def check_auth_and_restore(request: gr.Request):
                     """Check auth via cookie and restore chat history."""
-                    history = self._load_chat_from_session()
-                    not_auth = (gr.update(visible=True), gr.update(visible=False), history, "")
+                    sess_id, session = self._get_or_create_session()
+                    history = self._load_chat_from_session(
+                        session_path=session.session_path,
+                        data_path=session.data_path,
+                        session_id=sess_id,
+                    )
+                    not_auth = (gr.update(visible=True), gr.update(visible=False), history, "", sess_id)
                     if not request:
                         return not_auth
 
@@ -747,14 +834,28 @@ class WebChatUI:
                         del self._authenticated_cookies[auth_cookie]
                         return not_auth
 
+                    # For authenticated users, use a stable session keyed by email
                     email = cookie_data.get('email', '')
+                    auth_sess_id = cookie_data.get('session_id')
+                    if auth_sess_id and auth_sess_id in self._web_sessions:
+                        sess_id = auth_sess_id
+                        session = self._web_sessions[sess_id]
+                    else:
+                        # Store session_id in cookie data for future lookups
+                        cookie_data['session_id'] = sess_id
+
+                    history = self._load_chat_from_session(
+                        session_path=session.session_path,
+                        data_path=session.data_path,
+                        session_id=sess_id,
+                    )
                     email_safe = email.replace("@", "&#64;")
                     email_display = f'<span style="unicode-bidi: embed; direction: ltr; pointer-events: none;">{email_safe}</span> | <a href="/auth/logout" style="color: inherit; text-decoration: none;">Logout</a>'
-                    return gr.update(visible=False), gr.update(visible=True), history, email_display
+                    return gr.update(visible=False), gr.update(visible=True), history, email_display, sess_id
 
-                app.load(check_auth_and_restore, None, [login_view, chat_view, chatbot, user_info])
+                app.load(check_auth_and_restore, None, [login_view, chat_view, chatbot, user_info, session_state])
             else:
-                app.load(restore_chat, None, [chatbot])
+                app.load(init_session, None, [chatbot, session_state])
 
         self.app = app
         return app
@@ -953,13 +1054,41 @@ class WebChatUI:
 
     def _setup_file_routes(self, fastapi_app: FastAPI):
         """Add routes to serve and receive files from data_path."""
-        @fastapi_app.get("/uploads/{filename}")
-        async def serve_upload(filename: str):
+        @fastapi_app.get("/uploads/{session_id}/{filename}")
+        async def serve_upload(session_id: str, filename: str):
             # Use basename to prevent path traversal
+            safe_name = os.path.basename(filename)
+            # Look up session's data_path
+            if session_id in self._web_sessions:
+                data_path = self._web_sessions[session_id].data_path
+            else:
+                data_path = self.data_path
+            filepath = os.path.join(data_path, safe_name)
+            if os.path.isfile(filepath):
+                try:
+                    with open(filepath, "rb") as f:
+                        content = f.read()
+                    import mimetypes
+                    media_type = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
+                    return Response(content=content, media_type=media_type)
+                except OSError:
+                    return Response(content="File read error", status_code=500)
+            return Response(content="File not found", status_code=404)
+
+        # Keep legacy route for backward compatibility
+        @fastapi_app.get("/uploads/{filename}")
+        async def serve_upload_legacy(filename: str):
             safe_name = os.path.basename(filename)
             filepath = os.path.join(self.data_path, safe_name)
             if os.path.isfile(filepath):
-                return FileResponse(filepath)
+                try:
+                    with open(filepath, "rb") as f:
+                        content = f.read()
+                    import mimetypes
+                    media_type = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
+                    return Response(content=content, media_type=media_type)
+                except OSError:
+                    return Response(content="File read error", status_code=500)
             return Response(content="File not found", status_code=404)
 
         @fastapi_app.post("/uploads/")
@@ -1004,7 +1133,8 @@ class WebChatUI:
                 fastapi_app,
                 host="0.0.0.0",
                 port=self.server_port,
-                log_level="warning"  # Changed from "info" to reduce log verbosity
+                log_level="info" if self.verbose else "warning",
+                access_log=self.verbose,
             )
 
         thread = threading.Thread(target=_run, daemon=True)

@@ -93,6 +93,17 @@ def _secure_makedirs(dir_path: str) -> None:
     os.makedirs(dir_path, mode=0o700, exist_ok=True)
 
 
+def _validate_required(**kwargs) -> str:
+    """Check for missing required arguments. Returns JSON error string or empty string."""
+    missing = [name for name, value in kwargs.items() if value is None]
+    if missing:
+        return json.dumps({
+            "error": f"Missing required argument(s): {', '.join(missing)}.",
+            "status": "error"
+        })
+    return ""
+
+
 def _get_media_dir() -> str:
     """Get the media directory path within DATA_PATH."""
     return os.path.join(os.path.abspath(os.path.expanduser(DATA_PATH)), "media")
@@ -114,6 +125,13 @@ def _read_pdf(url: str) -> str:
     """Extract text content from a PDF URL."""
     try:
         response = requests.get(url, timeout=READ_TIMEOUT)
+        response.raise_for_status()
+
+        # Verify download is complete if Content-Length was provided
+        expected = response.headers.get('Content-Length')
+        if expected and len(response.content) < int(expected):
+            return f"Error reading PDF: incomplete download ({len(response.content)}/{expected} bytes)"
+
         from pypdf import PdfReader
         pdf_file = BytesIO(response.content)
         reader = PdfReader(pdf_file)
@@ -252,9 +270,16 @@ def _download_file(url: str, output_dir: str, timeout: int = 30) -> dict:
 
         # Write to file with owner-only permissions
         fd = os.open(filepath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        bytes_written = 0
         with os.fdopen(fd, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
+                bytes_written += len(chunk)
+
+        # Verify complete download if Content-Length was provided
+        if content_length and bytes_written < int(content_length):
+            os.unlink(filepath)
+            return {"url": url, "error": f"Incomplete download ({bytes_written}/{content_length} bytes)"}
 
         return {
             "url": url,
@@ -282,10 +307,15 @@ Args:
 Returns JSON: [{title, snippet, url, source, date}]"""
 )
 def search(
-    query: str,
+    query: str = None,
     type: str = "web",
     max_results: int = 5
 ) -> str:
+    if err := _validate_required(query=query):
+        return err
+    if os.environ.get('ONIT_DISABLE_WEB_SEARCH'):
+        return json.dumps({"error": "Web search is disabled. Set OLLAMA_API_KEY or use --ollama-api-key to enable."})
+
     try:
         max_results = min(max_results, 10)
         ddgs = DDGS(timeout=10)
@@ -335,12 +365,14 @@ Args:
 Returns JSON: {title, url, content, images, videos, downloaded}"""
 )
 def fetch_content(
-    url: str,
+    url: str = None,
     extract_media: bool = True,
     download_media: bool = False,
     output_dir: str = "",
     media_limit: int = 10
 ) -> str:
+    if err := _validate_required(url=url):
+        return err
     try:
         # Normalize URL
         if not url.startswith(("http://", "https://")):
@@ -486,10 +518,17 @@ def get_weather(
 ) -> str:
     global openweather_api_key
 
+    if os.environ.get('ONIT_DISABLE_WEATHER'):
+        return json.dumps({"error": "Weather tool is disabled. Set OPENWEATHERMAP_API_KEY or use --openweathermap-api-key to enable."})
+
+    # Re-check env in case it was set via CLI after module load
+    if not openweather_api_key:
+        openweather_api_key = os.environ.get('OPENWEATHER_API_KEY') or os.environ.get('OPENWEATHERMAP_API_KEY')
+
     if not openweather_api_key:
         return json.dumps({
             "error": "OpenWeather API key not set",
-            "help": "Set OPENWEATHER_API_KEY or OPENWEATHERMAP_API_KEY environment variable"
+            "help": "Set OPENWEATHERMAP_API_KEY or use --openweathermap-api-key CLI option"
         })
 
     try:
@@ -571,10 +610,12 @@ Args:
 Returns JSON: {pdf_path, output_dir, images: [{path, width, height, format}], image_count, status}"""
 )
 def extract_pdf_images(
-    pdf_path: str,
+    pdf_path: str = None,
     output_dir: str = "",
     min_size: int = 100
 ) -> str:
+    if err := _validate_required(pdf_path=pdf_path):
+        return err
     try:
         import fitz  # PyMuPDF
     except ImportError:
@@ -596,6 +637,9 @@ def extract_pdf_images(
             # Download PDF first
             response = requests.get(pdf_path, timeout=30)
             response.raise_for_status()
+            expected = response.headers.get('Content-Length')
+            if expected and len(response.content) < int(expected):
+                return json.dumps({"error": f"Incomplete PDF download ({len(response.content)}/{expected} bytes)", "pdf_path": pdf_path})
             pdf_data = response.content
             doc = fitz.open(stream=pdf_data, filetype="pdf")
             pdf_name = os.path.basename(urlparse(pdf_path).path) or "document"
@@ -672,10 +716,10 @@ def extract_pdf_images(
 # =============================================================================
 
 def run(
-    transport: str = "streamable-http",
+    transport: str = "sse",
     host: str = "0.0.0.0",
     port: int = 18201,
-    path: str = "/search",
+    path: str = "/sse",
     options: dict = {}
 ) -> None:
     """Run the MCP server."""
@@ -696,7 +740,15 @@ def run(
     logger.info(f"Data path: {DATA_PATH}")
     logger.info("4 Core Tools: search, fetch_content, get_weather, extract_pdf_images")
 
-    mcp.run(transport=transport, host=host, port=port, path=path)
+    quiet = 'verbose' not in options
+    if quiet:
+        import uvicorn.config
+        uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn.access"]["level"] = "WARNING"
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+    mcp.run(transport=transport, host=host, port=port, path=path,
+            uvicorn_config={"access_log": False, "log_level": "warning"} if quiet else {})
 
 
 if __name__ == "__main__":

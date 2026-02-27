@@ -32,7 +32,7 @@ def run_server(name:str,
     
     Args:
         name (str): Server name for identification
-        transport (str): Transport protocol (e.g., 'streamable-http')
+        transport (str): Transport protocol (e.g., 'sse')
         host (str): Host address to bind the server
         port (int): Port number to listen on
         path (str): URL path for the server endpoint
@@ -44,17 +44,35 @@ def run_server(name:str,
         bool: True if server started successfully, False otherwise
     """
     try:
+        # Suppress noisy uvicorn logs in child processes unless verbose.
+        # Override LOGGING_CONFIG *before* uvicorn is imported so that
+        # dictConfig() never resets the access logger back to INFO.
+        if 'verbose' not in options:
+            import uvicorn.config
+            uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn.access"]["level"] = "WARNING"
+            logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+            logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
         if 'stdio' in transport:
             logger.info(f"Starting {name} server using stdio transport")
         else:
             logger.info(f"Starting {name} server at {host}:{port} with path {path} using transport {transport}")
-        
+
         if not module:
             logger.error(f"No module specified for server {name}")
             return False
-            
+
         # Import the server module dynamically
-        full_module = f"src.mcp.servers.{module}" if not module.startswith("src.") else module
+        # Built-in shorthand: names starting with "tasks." or "src." are
+        # resolved relative to the onit package.  Everything else is treated
+        # as an absolute Python import path so that pip-installed third-party
+        # packages work out of the box.
+        if module.startswith("src."):
+            full_module = module
+        elif module.startswith("tasks."):
+            full_module = f"src.mcp.servers.{module}"
+        else:
+            full_module = module  # third-party absolute module path
         server_module = __import__(full_module, fromlist=['run'])
         
         # Run the server
@@ -79,27 +97,30 @@ def run_server(name:str,
 def load_config(config_path=None):
     """
     Load server configuration from YAML file.
-    
+
     Args:
-        config_path (str, optional): Path to configuration file
-        
+        config_path (str, optional): Path to the base configuration file.
+            Defaults to the built-in ``configs/default.yaml``.
+
     Returns:
-        dict: Loaded configuration
+        dict: Configuration with a ``servers`` list.
     """
     if config_path is None:
         config_path = os.path.join(os.path.dirname(__file__), "configs", "default.yaml")
-    
+
     logger.info(f"Loading configuration from {config_path}")
-    
+
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found at {config_path}")
-        
+
     try:
         with open(config_path, 'r') as f:
-            return yaml.safe_load(f)
+            config = yaml.safe_load(f)
     except yaml.YAMLError as e:
         logger.error(f"Error parsing YAML configuration: {e}")
         raise
+
+    return config
 
 def prepare_server_args(config):
     """Extract server arguments from configuration."""
@@ -111,7 +132,7 @@ def prepare_server_args(config):
             logger.warning("Skipping server with no name defined")
             continue
             
-        transport = server.get('transport', 'streamable-http')
+        transport = server.get('transport', 'sse')
         host = server.get('host', '0.0.0.0')
         port = server.get('port', 18201)
         path = server.get('path', f'/{name.lower()}')
@@ -144,8 +165,16 @@ def run_servers(config_path=None, log_level='INFO'):
         log_level (str): Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
     """
     logging.getLogger().setLevel(getattr(logging, log_level))
+    # Suppress noisy uvicorn access logs unless in DEBUG mode
+    if log_level != 'DEBUG':
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     try:
         config = load_config(config_path)
+        # Propagate verbose flag into each server's options so child processes
+        # (which get fresh logging configs) can suppress uvicorn access logs.
+        if log_level == 'DEBUG':
+            for server in config.get('servers', []):
+                server.setdefault('options', {})['verbose'] = True
         server_args = prepare_server_args(config)
 
         if not server_args:

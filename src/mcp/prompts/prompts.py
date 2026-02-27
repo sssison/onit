@@ -15,6 +15,7 @@
 """
 
 from fastmcp import FastMCP
+from datetime import datetime
 import yaml
 import uuid
 import logging
@@ -29,7 +30,9 @@ mcp_prompts = FastMCP("Prompts MCP")
 async def assistant_instruction(task: str,
                                 session_id: str = None,
                                 template_path: str = None,
-                                file_server_url: str = None) -> str:
+                                file_server_url: str = None,
+                                documents_path: str = None,
+                                topic: str = None) -> str:
    import tempfile
 
    if session_id is None:
@@ -37,6 +40,7 @@ async def assistant_instruction(task: str,
 
    data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / session_id)
    Path(data_path).mkdir(parents=True, exist_ok=True)
+   current_date = datetime.now().strftime("%B %d, %Y")
 
    default_template = """
 Think step by step on how to complete the following task enclosed in <task> and </task> tags.
@@ -46,17 +50,14 @@ Think step by step on how to complete the following task enclosed in <task> and 
 </task>
 
 Execute the step by step action plan to complete the task.
-If you need additional information or the task is unclear given the context and previous interactions, ask for clarification.
+If you need additional information, ask for clarification.
 If you know the answer, provide it right away. Else, use the tools to complete the action plan.
-Avoid repeated tool call sequences that do not lead to progress. 
+Use date today, `{current_date}`, in reasoning requiring date information.
 
 ## File Operations Policy
 - **Working directory**: `{data_path}` — all file operations must use this directory.
 - **Session ID**: `{session_id}` — files created in this session are owned by this session only.
 - **NEVER** create files in the user home directory or any location outside `{data_path}`.
-- All temporary and output files must be saved within `{data_path}`.
-- Files are created with restricted permissions — only the session owner can access them.
-- Other sessions cannot read or write files belonging to this session.
 """
 
    template = default_template
@@ -71,11 +72,17 @@ Avoid repeated tool call sequences that do not lead to progress.
 
    instruction = template.format(
       task=task,
+      current_date=current_date,
       data_path=data_path,
       session_id=session_id
    )
 
-   if file_server_url:
+   if topic and topic != "null":
+      instruction += f"""
+Unless specified, assume that the topic is about `{topic}`.
+"""
+
+   if file_server_url and file_server_url != "null":
       instruction += f"""
 Files are served by a remote file server at {file_server_url}/uploads/.
 Before reading any file referenced in the task, first download it:
@@ -86,14 +93,20 @@ Always download before reading and upload after writing.
 When using create_presentation, create_excel, or create_document tools, always pass callback_url="{file_server_url}" so files are automatically uploaded.
 """
 
+   if documents_path and documents_path != "null":
+      instruction += f"""
+Start with documents (PDF, TXT, DOCX, XLSX, PPTX, and Markdown (MD)) in `{documents_path}`.
+Search the web for additional information if needed.
+"""
+
    return instruction
 
 
 def run(
-    transport: str = "streamable-http",
+    transport: str = "sse",
     host: str = "0.0.0.0",
     port: int = 18200,
-    path: str = "/prompts",
+    path: str = "/sse",
     options: dict = {}
 ) -> None:
     """Run the Prompts MCP server."""
@@ -102,5 +115,13 @@ def run(
     else:
         logger.setLevel(logging.ERROR)
 
+    quiet = 'verbose' not in options
+    if quiet:
+        import uvicorn.config
+        uvicorn.config.LOGGING_CONFIG["loggers"]["uvicorn.access"]["level"] = "WARNING"
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
     logger.info(f"Starting Prompts MCP Server at {host}:{port}{path}")
-    mcp_prompts.run(transport=transport, host=host, port=port, path=path)
+    mcp_prompts.run(transport=transport, host=host, port=port, path=path,
+                    uvicorn_config={"access_log": False, "log_level": "warning"} if quiet else {})
