@@ -295,7 +295,7 @@ async def tbot_motion_scan_rotate(
     degrees: float,
     speed: float = 0.5,
 ) -> dict[str, Any]:
-    """Rotate the robot by a fixed angle in degrees. Positive=left/CCW, negative=right/CW. Blocks until rotation is complete or preempted."""
+    """Rotate the robot by a fixed angle in degrees. Positive=right/CW, negative=left/CCW. Blocks until rotation is complete or preempted."""
     degrees_f = _validate_finite("degrees", degrees)
     speed_f = _validate_finite("speed", speed)
 

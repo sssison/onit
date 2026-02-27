@@ -429,7 +429,14 @@ async def tbot_vision_scan_for_object(
     speed: float = 0.3,
     confidence_threshold: float = 0.65,
 ) -> dict[str, Any]:
-    """Rotate the robot in steps and detect a target object in each captured frame. Returns the heading offset at which the object was found."""
+    """Rotate the robot in steps and detect a target object in each captured frame.
+
+    When status="found", the robot has ALREADY stopped at heading_offset_deg —
+    it is already facing the object. Do NOT rotate by heading_offset_deg again.
+    Use tbt_camera_reorient_to_object to fine-tune centering, then move forward.
+
+    heading_offset_deg records how far the robot rotated during the scan (informational).
+    """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
         raise ValueError("object_name must be a non-empty string")
