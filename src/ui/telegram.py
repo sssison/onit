@@ -248,7 +248,7 @@ class TelegramGateway:
         app = (
             Application.builder()
             .token(self.token)
-            .concurrent_updates(True)
+            .concurrent_updates(256)
             .build()
         )
 
