@@ -165,6 +165,8 @@ def test_reorient_to_object_uses_bbox_center_and_reports_ready():
         camera_v2, "Client", side_effect=fake_client
     ), patch.object(camera_v2, "REORIENT_MAX_STEP_DEG", 30.0), patch.object(
         camera_v2, "REORIENT_CORRECTION_SIGN", -1.0
+    ), patch.object(
+        camera_v2, "REORIENT_GAIN", 1.0
     ):
         result = asyncio.run(camera_v2.tbot_camera_reorient_to_object("bottle", threshold_deg=8.0, max_iterations=4))
 
@@ -194,6 +196,8 @@ def test_reorient_to_object_clamps_large_correction():
         camera_v2, "Client", side_effect=fake_client
     ), patch.object(camera_v2, "REORIENT_MAX_STEP_DEG", 10.0), patch.object(
         camera_v2, "REORIENT_CORRECTION_SIGN", -1.0
+    ), patch.object(
+        camera_v2, "REORIENT_GAIN", 1.0
     ):
         result = asyncio.run(camera_v2.tbot_camera_reorient_to_object("bottle", threshold_deg=8.0, max_iterations=4))
 
@@ -219,8 +223,12 @@ def test_reorient_to_object_stops_on_no_progress():
         camera_v2, "Client", side_effect=fake_client
     ), patch.object(camera_v2, "REORIENT_MAX_STEP_DEG", 30.0), patch.object(
         camera_v2, "REORIENT_CORRECTION_SIGN", -1.0
+    ), patch.object(
+        camera_v2, "REORIENT_GAIN", 1.0
     ), patch.object(camera_v2, "REORIENT_IMPROVEMENT_EPS_DEG", 0.5), patch.object(
         camera_v2, "REORIENT_MAX_NO_PROGRESS", 2
+    ), patch.object(
+        camera_v2, "REORIENT_MAX_SIGN_FLIPS", 0
     ):
         result = asyncio.run(camera_v2.tbot_camera_reorient_to_object("bottle", threshold_deg=3.0, max_iterations=6))
 
@@ -228,3 +236,35 @@ def test_reorient_to_object_stops_on_no_progress():
     assert result["reason"] == "no_progress"
     assert result["ready_to_approach"] is False
     assert len(motion_calls) == 2
+
+
+def test_reorient_to_object_flips_sign_when_diverging():
+    source_bytes = _make_image_bytes(fmt="PNG", size=(80, 60))
+    fake_node = _FakeCameraNode(frame_bytes=source_bytes, frame_present=True, frame_count=9)
+    vision_results = [
+        {"status": "found", "bbox": {"cx": 0.80, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"status": "found", "bbox": {"cx": 0.82, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"status": "found", "bbox": {"cx": 0.60, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    motion_calls = []
+
+    def fake_client(url):
+        return _FakeMCPClient(url, vision_results, motion_calls)
+
+    with patch.object(camera_v2, "_get_camera_node", return_value=fake_node), patch.object(
+        camera_v2, "Client", side_effect=fake_client
+    ), patch.object(camera_v2, "REORIENT_MAX_STEP_DEG", 30.0), patch.object(
+        camera_v2, "REORIENT_CORRECTION_SIGN", 1.0
+    ), patch.object(
+        camera_v2, "REORIENT_GAIN", 1.0
+    ), patch.object(camera_v2, "REORIENT_IMPROVEMENT_EPS_DEG", 0.5), patch.object(
+        camera_v2, "REORIENT_DIVERGENCE_EPS_DEG", 0.5
+    ), patch.object(camera_v2, "REORIENT_MAX_SIGN_FLIPS", 1):
+        result = asyncio.run(camera_v2.tbot_camera_reorient_to_object("bottle", threshold_deg=8.0, max_iterations=6))
+
+    assert result["status"] == "centered"
+    assert result["sign_flips"] == 1
+    assert result["correction_sign_used"] == pytest.approx(-1.0)
+    assert len(motion_calls) == 2
+    assert motion_calls[0][1]["degrees"] > 0
+    assert motion_calls[1][1]["degrees"] < 0

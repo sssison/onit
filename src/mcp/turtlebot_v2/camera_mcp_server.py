@@ -78,10 +78,14 @@ VISION_MCP_URL = os.getenv("TBOT_VISION_MCP_URL", "http://127.0.0.1:18207/turtle
 REORIENT_THRESHOLD_DEG = _env_float("REORIENT_THRESHOLD_DEG", 8.0)
 REORIENT_MAX_ITERATIONS = 6
 CAMERA_HFOV_DEG = _env_float("CAMERA_HFOV_DEG", 62.0)
-REORIENT_CORRECTION_SIGN = _env_float("REORIENT_CORRECTION_SIGN", -1.0)
+REORIENT_CORRECTION_SIGN = _env_float("REORIENT_CORRECTION_SIGN", 1.0)
+REORIENT_GAIN = max(0.1, _env_float("REORIENT_GAIN", 0.7))
 REORIENT_MAX_STEP_DEG = abs(_env_float("REORIENT_MAX_STEP_DEG", 15.0))
 REORIENT_IMPROVEMENT_EPS_DEG = max(0.0, _env_float("REORIENT_IMPROVEMENT_EPS_DEG", 1.0))
+REORIENT_DIVERGENCE_EPS_DEG = max(0.0, _env_float("REORIENT_DIVERGENCE_EPS_DEG", 0.5))
 REORIENT_MAX_NO_PROGRESS = max(1, _env_int("REORIENT_MAX_NO_PROGRESS", 2))
+REORIENT_MAX_SIGN_FLIPS = max(0, _env_int("REORIENT_MAX_SIGN_FLIPS", 1))
+REORIENT_CONFIDENCE_THRESHOLD = max(0.0, min(1.0, _env_float("REORIENT_CONFIDENCE_THRESHOLD", 0.45)))
 FRAME_LOG_EVERY = max(1, int(_env_float("CAMERA_FRAME_LOG_EVERY", 30)))
 
 DEFAULT_FRAME_MAX_BYTES = max(1, int(_env_float("CAMERA_FRAME_MAX_BYTES", 1_500_000)))
@@ -515,6 +519,8 @@ async def tbot_camera_reorient_to_object(
     last_command_deg: float | None = None
     previous_abs_error_deg: float | None = None
     no_progress_count = 0
+    correction_sign = REORIENT_CORRECTION_SIGN
+    sign_flips = 0
 
     for _ in range(max_iterations):
         iterations += 1
@@ -533,6 +539,7 @@ async def tbot_camera_reorient_to_object(
                 {
                     "frames": [{"heading_offset_deg": 0.0, "image_base64": b64}],
                     "object_name": object_name_clean,
+                    "confidence_threshold": REORIENT_CONFIDENCE_THRESHOLD,
                 },
             )
         data = _extract_tool_dict(result)
@@ -558,6 +565,8 @@ async def tbot_camera_reorient_to_object(
                 "final_bbox": final_bbox,
                 "error_history_deg": error_history_deg,
                 "last_command_deg": last_command_deg,
+                "correction_sign_used": correction_sign,
+                "sign_flips": sign_flips,
                 "object_name": object_name_clean,
             }
 
@@ -574,12 +583,20 @@ async def tbot_camera_reorient_to_object(
                 "final_bbox": final_bbox,
                 "error_history_deg": error_history_deg,
                 "last_command_deg": last_command_deg,
+                "correction_sign_used": correction_sign,
+                "sign_flips": sign_flips,
                 "object_name": object_name_clean,
             }
 
         if previous_abs_error_deg is not None:
             improved = abs_error_deg <= (previous_abs_error_deg - REORIENT_IMPROVEMENT_EPS_DEG)
-            no_progress_count = 0 if improved else (no_progress_count + 1)
+            diverging = abs_error_deg >= (previous_abs_error_deg + REORIENT_DIVERGENCE_EPS_DEG)
+            if (not improved) and diverging and sign_flips < REORIENT_MAX_SIGN_FLIPS:
+                correction_sign *= -1.0
+                sign_flips += 1
+                no_progress_count = 0
+            else:
+                no_progress_count = 0 if improved else (no_progress_count + 1)
             if no_progress_count >= REORIENT_MAX_NO_PROGRESS:
                 return {
                     "status": "no_progress",
@@ -590,11 +607,13 @@ async def tbot_camera_reorient_to_object(
                     "final_bbox": final_bbox,
                     "error_history_deg": error_history_deg,
                     "last_command_deg": last_command_deg,
+                    "correction_sign_used": correction_sign,
+                    "sign_flips": sign_flips,
                     "object_name": object_name_clean,
                 }
         previous_abs_error_deg = abs_error_deg
 
-        correction_deg = final_in_frame_offset_deg * REORIENT_CORRECTION_SIGN
+        correction_deg = final_in_frame_offset_deg * correction_sign * REORIENT_GAIN
         command_deg = _clamp(correction_deg, REORIENT_MAX_STEP_DEG)
         last_command_deg = command_deg
 
@@ -610,6 +629,8 @@ async def tbot_camera_reorient_to_object(
         "final_bbox": final_bbox,
         "error_history_deg": error_history_deg,
         "last_command_deg": last_command_deg,
+        "correction_sign_used": correction_sign,
+        "sign_flips": sign_flips,
         "object_name": object_name_clean,
     }
 
