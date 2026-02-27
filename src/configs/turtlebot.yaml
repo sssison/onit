@@ -5,8 +5,8 @@ serving:
   model: Qwen/Qwen3.5-35B-A3B
   #model: Qwen/Qwen3-VL-8B-Instruct
   #model: nvidia/Cosmos-Reason2-8B
-  think: true
-  max_tokens: 262144
+  think: false
+  max_tokens: 8192
 
 messages:
   safety_warning:  "Press 'Enter' key to stop all tasks."
@@ -62,12 +62,12 @@ mcp:
   servers:
     - name: PromptsMCPServer
       description: Provides prompt templates for instruction generation
-      url: http://127.0.0.1:18200/prompts
+      url: http://127.0.0.1:18200/sse
       enabled: true
 
     - name: WebSearchHandler
       description: Handles web, news and weather search queries
-      url: http://127.0.0.1:18201/search
+      url: http://127.0.0.1:18201/sse
       enabled: false
 
     - name: BashMCPServer
