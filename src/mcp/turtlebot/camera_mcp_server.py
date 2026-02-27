@@ -449,7 +449,7 @@ async def camera_save_latest_frame(path: Optional[str] = None, overwrite: bool =
 
 
 def run(
-    transport: str = "streamable-http",
+    transport: str = "sse",
     host: str = "0.0.0.0",
     port: int = 18202,
     path: str = "/camera",

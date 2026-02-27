@@ -514,7 +514,7 @@ async def tbot_search_while_rotating(
 
 
 def run(
-    transport: str = "streamable-http",
+    transport: str = "sse",
     host: str = "0.0.0.0",
     port: int = 18209,
     path: str = "/turtlebot-search-v2",

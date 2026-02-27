@@ -24,7 +24,7 @@ servers:
     host : 0.0.0.0
     port : 18202
     path : /bash
-    transport : 'streamable-http'
+    transport : 'sse'
 
   - name: OfficeMCPServer
     module: tasks.office.microsoft
@@ -33,7 +33,7 @@ servers:
     host : 0.0.0.0
     port : 18203
     path : /office
-    transport : 'streamable-http'
+    transport : 'sse'
 
   - name: GoogleWorkspaceMCPServer
     module: tasks.office.google
@@ -42,7 +42,7 @@ servers:
     host : 0.0.0.0
     port : 18204
     path : /workspace
-    transport : 'streamable-http'
+    transport : 'sse'
     # Service account JSON for non-interactive auth (download from Google Cloud Console)
     #credentials_file: ~/.config/gcloud/credentials.json
 
@@ -53,7 +53,7 @@ servers:
     host : 0.0.0.0
     port : 18205
     path : /turtlebot-motion-v2
-    transport : 'streamable-http'
+    transport : 'sse'
 
   - name: TurtlebotCameraMCPServerV2
     module: src.mcp.turtlebot_v2.camera_mcp_server
@@ -62,7 +62,7 @@ servers:
     host : 0.0.0.0
     port : 18206
     path : /turtlebot-camera-v2
-    transport : 'streamable-http'
+    transport : 'sse'
 
   - name: TurtlebotVisionMCPServerV2
     module: src.mcp.turtlebot_v2.vision_mcp_server
@@ -71,7 +71,7 @@ servers:
     host : 0.0.0.0
     port : 18207
     path : /turtlebot-vision-v2
-    transport : 'streamable-http'
+    transport : 'sse'
 
   - name: TurtlebotLidarMCPServerV2
     module: src.mcp.turtlebot_v2.lidar_mcp_server
@@ -80,7 +80,7 @@ servers:
     host : 0.0.0.0
     port : 18208
     path : /turtlebot-lidar-v2
-    transport : 'streamable-http'
+    transport : 'sse'
 
   - name: TurtlebotSearchMCPServerV2
     module: src.mcp.turtlebot_v2.search_mcp_server
@@ -89,4 +89,4 @@ servers:
     host : 0.0.0.0
     port : 18209
     path : /turtlebot-search-v2
-    transport : 'streamable-http'
+    transport : 'sse'

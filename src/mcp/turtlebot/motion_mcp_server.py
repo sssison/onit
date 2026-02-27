@@ -317,7 +317,7 @@ async def motion_move(
 
 
 def run(
-    transport: str = "streamable-http",
+    transport: str = "sse",
     host: str = "0.0.0.0",
     port: int = 18201,
     path: str = "/motion",

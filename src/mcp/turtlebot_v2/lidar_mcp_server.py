@@ -618,7 +618,7 @@ async def tbot_lidar_check_collision(
 
 
 def run(
-    transport: str = "streamable-http",
+    transport: str = "sse",
     host: str = "0.0.0.0",
     port: int = 18208,
     path: str = "/turtlebot-lidar-v2",

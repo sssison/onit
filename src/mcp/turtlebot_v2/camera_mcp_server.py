@@ -397,7 +397,7 @@ async def tbot_camera_get_decoded_frame(
 
 
 def run(
-    transport: str = "streamable-http",
+    transport: str = "sse",
     host: str = "0.0.0.0",
     port: int = 18206,
     path: str = "/turtlebot-camera-v2",

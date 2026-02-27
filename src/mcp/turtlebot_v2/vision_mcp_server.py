@@ -242,7 +242,7 @@ async def tbot_vision_analyze_scene(
 
 
 def run(
-    transport: str = "streamable-http",
+    transport: str = "sse",
     host: str = "0.0.0.0",
     port: int = 18207,
     path: str = "/turtlebot-vision-v2",
