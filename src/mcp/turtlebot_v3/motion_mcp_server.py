@@ -38,12 +38,18 @@ LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/tu
 
 WALL_FOLLOW_KP = _env_float("WALL_FOLLOW_KP", 2.0)
 WALL_FOLLOW_MAX_ANGULAR = _env_float("WALL_FOLLOW_MAX_ANGULAR", 0.5)
+MOTION_COMMAND_REFRESH_S_RAW = _env_float("MOTION_COMMAND_REFRESH_S", 0.2)
+MOTION_COMMAND_REFRESH_S = (
+    MOTION_COMMAND_REFRESH_S_RAW if MOTION_COMMAND_REFRESH_S_RAW > 0 else 0.2
+)
 
 MOVE_PATH = "/move"
 STOP_PATH = "/stop"
 HEALTH_PATH = "/health"
 
 mcp_motion_v3 = FastMCP("TurtleBot Motion MCP Server V3")
+_continuous_motion_task: asyncio.Task[None] | None = None
+_continuous_motion_lock = asyncio.Lock()
 
 
 def _validate_finite(name: str, value: float) -> float:
@@ -63,6 +69,73 @@ def _clamp(value: float, limit: float) -> float:
     if value < -limit:
         return -limit
     return value
+
+
+async def _post_move_for_duration(
+    linear: float,
+    angular: float,
+    duration_s: float,
+) -> tuple[dict[str, Any] | None, int]:
+    """
+    Keep reposting /move for duration_s so motion backends that require
+    periodic updates keep executing the command.
+    """
+    start_mono = time.monotonic()
+    posts = 0
+    last_result: dict[str, Any] | None = None
+
+    while True:
+        elapsed = time.monotonic() - start_mono
+        if elapsed >= duration_s:
+            break
+
+        last_result = await _post_json(MOVE_PATH, {"linear": linear, "angular": angular})
+        posts += 1
+
+        remaining = duration_s - (time.monotonic() - start_mono)
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(MOTION_COMMAND_REFRESH_S, remaining))
+
+    return last_result, posts
+
+
+async def _continuous_motion_loop(linear: float, angular: float) -> None:
+    while True:
+        try:
+            await _post_json(MOVE_PATH, {"linear": linear, "angular": angular})
+            await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Continuous motion update failed: %s", e)
+            await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
+
+
+async def _set_continuous_motion(linear: float | None, angular: float = 0.0) -> bool:
+    """
+    Start or stop background /move keepalive updates.
+    Returns True if a previous background stream existed and was replaced/stopped.
+    """
+    global _continuous_motion_task
+    async with _continuous_motion_lock:
+        had_existing_stream = _continuous_motion_task is not None
+        if _continuous_motion_task is not None:
+            task = _continuous_motion_task
+            _continuous_motion_task = None
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning("Continuous motion task stop failed: %s", e)
+
+        if linear is None:
+            return had_existing_stream
+
+        _continuous_motion_task = asyncio.create_task(_continuous_motion_loop(linear, angular))
+        return had_existing_stream
 
 
 async def _post_json(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -154,8 +227,14 @@ async def tbot_motion_health() -> dict[str, Any]:
 @mcp_motion_v3.tool()
 async def tbot_motion_stop() -> dict[str, Any]:
     """Stop the robot immediately by setting linear and angular targets to zero."""
+    had_stream = await _set_continuous_motion(None)
     result = await _post_json(STOP_PATH)
-    return {**result, "base_url": BASE_URL, "endpoint": STOP_PATH}
+    return {
+        **result,
+        "base_url": BASE_URL,
+        "endpoint": STOP_PATH,
+        "had_continuous_stream": had_stream,
+    }
 
 
 @mcp_motion_v3.tool()
@@ -169,6 +248,7 @@ async def tbot_motion_move_forward(
     if duration_f <= 0:
         raise ValueError("duration_seconds must be > 0")
 
+    await _set_continuous_motion(None)
     clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
     start_mono = time.monotonic()
 
@@ -240,6 +320,7 @@ async def tbot_motion_move_along_wall(
     if stop_dist <= 0:
         raise ValueError("stop_distance_m must be > 0")
 
+    await _set_continuous_motion(None)
     clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
     wall_sign = 1.0 if direction_clean == "left" else -1.0
     start_mono = time.monotonic()
@@ -297,12 +378,11 @@ async def tbot_motion_move(
     linear_cmd = _clamp(linear_f, MAX_LINEAR)
     angular_cmd = _clamp(angular_f, MAX_ANGULAR)
 
-    result = await _post_json(MOVE_PATH, {"linear": linear_cmd, "angular": angular_cmd})
-
     if duration_s is not None:
         duration_f = _validate_finite("duration_s", duration_s)
         if duration_f > 0:
-            await asyncio.sleep(duration_f)
+            preempted_stream = await _set_continuous_motion(None)
+            move_result, posts = await _post_move_for_duration(linear_cmd, angular_cmd, duration_f)
             stop_result = await _post_json(STOP_PATH)
             return {
                 **stop_result,
@@ -310,12 +390,21 @@ async def tbot_motion_move(
                 "linear_cmd": linear_cmd,
                 "angular_cmd": angular_cmd,
                 "duration_s": duration_f,
+                "move_posts": posts,
+                "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+                "move_result": move_result,
+                "preempted_continuous_stream": preempted_stream,
             }
 
+    result = await _post_json(MOVE_PATH, {"linear": linear_cmd, "angular": angular_cmd})
+    replaced_stream = await _set_continuous_motion(linear_cmd, angular_cmd)
     return {
         **result,
+        "status": "streaming",
         "linear_cmd": linear_cmd,
         "angular_cmd": angular_cmd,
+        "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+        "preempted_continuous_stream": replaced_stream,
     }
 
 
@@ -360,7 +449,8 @@ async def tbot_motion_turn(
             f"(current value: {ANGULAR_SIGN!r}). Must be non-zero."
         )
 
-    move_result = await _post_json(MOVE_PATH, {"linear": 0.0, "angular": angular_cmd})
+    preempted_stream = await _set_continuous_motion(None)
+    move_result, posts = await _post_move_for_duration(0.0, angular_cmd, duration_f)
 
     # Verify the motion server actually received the angular command.
     health, _ = await _try_get_health()
@@ -376,7 +466,6 @@ async def tbot_motion_turn(
         health_angular is not None and abs(health_angular - angular_cmd) < 1e-6
     )
 
-    await asyncio.sleep(duration_f)
     stop_result = await _post_json(STOP_PATH)
     return {
         **stop_result,
@@ -388,6 +477,9 @@ async def tbot_motion_turn(
         "duration_seconds": duration_f,
         "was_clamped": abs(speed_f) != clamped_speed,
         "move_result": move_result,
+        "move_posts": posts,
+        "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+        "preempted_continuous_stream": preempted_stream,
         "health_angular_after_move": health_angular,
         "command_received_by_server": command_received,
     }
@@ -456,6 +548,8 @@ async def tbot_motion_approach_until_close(
     if clamped_speed == 0.0:
         clamped_speed = 0.05
 
+    await _set_continuous_motion(None)
+
     # Nudge parameters: ~10 degrees at a low angular speed
     nudge_speed = min(0.5, MAX_ANGULAR)
     nudge_angular_cmd = nudge_speed * ANGULAR_SIGN
@@ -465,14 +559,15 @@ async def tbot_motion_approach_until_close(
     final_distance_m: float | None = None
 
     try:
-        await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
-
         async with Client(LIDAR_MCP_URL_V3) as lidar:
             while True:
                 elapsed = time.monotonic() - start_mono
                 if elapsed >= timeout_f:
                     await _post_json(STOP_PATH)
                     return {"status": "timeout", "front_distance": final_distance_m}
+
+                # Re-post the forward command so backends that need keepalive updates keep moving.
+                await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
 
                 # Check collision risk
                 try:
