@@ -39,6 +39,8 @@ DEFAULT_VISION_API_KEY = os.getenv("TBOT_VISION_API_KEY", "EMPTY")
 VISION_TIMEOUT_S = _env_float("TBOT_VISION_TIMEOUT_S", 60.0)
 CAMERA_HFOV_DEG = _env_float("CAMERA_HFOV_DEG", 62.0)
 MOTION_MCP_URL_V3 = os.getenv("TBOT_MOTION_MCP_URL_V3", "http://127.0.0.1:18210/turtlebot-motion-v3")
+LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
+_LINE_FOLLOW_STOP_DISTANCE_M = _env_float("LINE_FOLLOW_STOP_DISTANCE_M", 0.35)
 
 _SEARCH_STEP_DEG = 10.0
 _SEARCH_ANGULAR_SPEED = 0.3   # rad/s — speed used for each 10° rotation step
@@ -46,6 +48,30 @@ _SEARCH_FRAME_SETTLE_S = 0.3  # seconds to wait after rotation for a fresh frame
 
 _LINE_FOLLOW_SPEED = _env_float("LINE_FOLLOW_SPEED", 0.1)
 _LINE_FOLLOW_ANGULAR = _env_float("LINE_FOLLOW_ANGULAR", 0.3)
+
+
+def _extract_tool_result_dict(tool_result: Any) -> dict[str, Any]:
+    """Extract a dict from a FastMCP Client.call_tool() ToolResult."""
+    if isinstance(tool_result, dict):
+        return tool_result
+    structured = getattr(tool_result, "structured_content", None)
+    if isinstance(structured, dict):
+        return structured
+    structured_camel = getattr(tool_result, "structuredContent", None)
+    if isinstance(structured_camel, dict):
+        return structured_camel
+    content = getattr(tool_result, "content", None)
+    if isinstance(content, list):
+        for part in content:
+            text = getattr(part, "text", None)
+            if isinstance(text, str):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+    return {}
 
 
 def _resolve_api_key(host: str) -> str:
@@ -414,7 +440,8 @@ async def tbot_vision_follow_line(
     color: the color of the line to follow (e.g. "black", "red", "yellow").
     timeout_s: stop and return after this many seconds.
 
-    Returns {"status": "line_lost"|"timeout", "ticks_followed": int}.
+    Returns {"status": "line_lost"|"timeout"|"obstacle_reached", "ticks_followed": int,
+             "front_distance": float|None}.
     """
     color_clean = color.strip() if isinstance(color, str) else ""
     if not color_clean:
@@ -427,6 +454,7 @@ async def tbot_vision_follow_line(
     start_mono = time.monotonic()
     ticks_followed = 0
     motion_url = os.getenv("TBOT_MOTION_MCP_URL_V3", MOTION_MCP_URL_V3)
+    lidar_url = os.getenv("TBOT_LIDAR_MCP_URL_V3", LIDAR_MCP_URL_V3)
 
     system_prompt = "Return only JSON with keys: visible (boolean), offset ('left'|'center'|'right'|null)."
     user_prompt = (
@@ -435,73 +463,93 @@ async def tbot_vision_follow_line(
     )
 
     async with Client(motion_url) as motion:
-        while True:
-            if time.monotonic() - start_mono >= timeout_f:
+        async with Client(lidar_url) as lidar:
+            while True:
+                if time.monotonic() - start_mono >= timeout_f:
+                    try:
+                        await motion.call_tool("tbot_motion_stop", {})
+                    except Exception:
+                        pass
+                    return {"status": "timeout", "ticks_followed": ticks_followed, "front_distance": None}
+
+                # Lidar collision check before any motion or LLM call
                 try:
-                    await motion.call_tool("tbot_motion_stop", {})
+                    raw = await lidar.call_tool("tbot_lidar_check_collision", {})
+                    collision = _extract_tool_result_dict(raw)
                 except Exception:
-                    pass
-                return {"status": "timeout", "ticks_followed": ticks_followed}
+                    collision = {}
 
-            frame_path = os.getenv("TBOT_FRAME_PATH", FRAME_PATH)
-            host = os.getenv("TBOT_VISION_HOST", DEFAULT_VISION_HOST)
-            model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
+                risk_level = collision.get("risk_level", "clear")
+                front_dist = (collision.get("distances") or {}).get("front")
 
-            try:
-                image_b64 = _load_frame_as_base64(frame_path)
-            except Exception:
+                if risk_level == "stop":
+                    try:
+                        await motion.call_tool("tbot_motion_stop", {})
+                    except Exception:
+                        pass
+                    return {"status": "obstacle_reached", "ticks_followed": ticks_followed, "front_distance": front_dist}
+
+                frame_path = os.getenv("TBOT_FRAME_PATH", FRAME_PATH)
+                host = os.getenv("TBOT_VISION_HOST", DEFAULT_VISION_HOST)
+                model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
+
                 try:
-                    await motion.call_tool("tbot_motion_stop", {})
+                    image_b64 = _load_frame_as_base64(frame_path)
                 except Exception:
-                    pass
-                return {"status": "line_lost", "ticks_followed": ticks_followed}
+                    try:
+                        await motion.call_tool("tbot_motion_stop", {})
+                    except Exception:
+                        pass
+                    return {"status": "line_lost", "ticks_followed": ticks_followed, "front_distance": front_dist}
 
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                    ],
-                },
-            ]
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                        ],
+                    },
+                ]
 
-            parsed: dict[str, Any] = {}
-            try:
-                client = AsyncOpenAI(base_url=host, api_key=_resolve_api_key(host))
-                completion = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    timeout=VISION_TIMEOUT_S,
+                parsed: dict[str, Any] = {}
+                try:
+                    client = AsyncOpenAI(base_url=host, api_key=_resolve_api_key(host))
+                    completion = await client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        timeout=VISION_TIMEOUT_S,
+                    )
+                    raw_response = completion.choices[0].message.content or ""
+                    parsed = _extract_first_json_object(raw_response) or {}
+                except (APITimeoutError, OpenAIError, Exception):
+                    parsed = {}
+
+                visible = bool(parsed.get("visible", False))
+                offset = parsed.get("offset")
+
+                if not visible:
+                    try:
+                        await motion.call_tool("tbot_motion_stop", {})
+                    except Exception:
+                        pass
+                    return {"status": "line_lost", "ticks_followed": ticks_followed, "front_distance": front_dist}
+
+                if offset == "left":
+                    angular = _LINE_FOLLOW_ANGULAR
+                elif offset == "right":
+                    angular = -_LINE_FOLLOW_ANGULAR
+                else:
+                    angular = 0.0
+
+                speed = _LINE_FOLLOW_SPEED * 0.5 if risk_level == "caution" else _LINE_FOLLOW_SPEED
+
+                await motion.call_tool(
+                    "tbot_motion_move",
+                    {"linear": speed, "angular": angular},
                 )
-                raw_response = completion.choices[0].message.content or ""
-                parsed = _extract_first_json_object(raw_response) or {}
-            except (APITimeoutError, OpenAIError, Exception):
-                parsed = {}
-
-            visible = bool(parsed.get("visible", False))
-            offset = parsed.get("offset")
-
-            if not visible:
-                try:
-                    await motion.call_tool("tbot_motion_stop", {})
-                except Exception:
-                    pass
-                return {"status": "line_lost", "ticks_followed": ticks_followed}
-
-            if offset == "left":
-                angular = _LINE_FOLLOW_ANGULAR
-            elif offset == "right":
-                angular = -_LINE_FOLLOW_ANGULAR
-            else:
-                angular = 0.0
-
-            await motion.call_tool(
-                "tbot_motion_move",
-                {"linear": _LINE_FOLLOW_SPEED, "angular": angular},
-            )
-            ticks_followed += 1
+                ticks_followed += 1
 
 
 def run(
