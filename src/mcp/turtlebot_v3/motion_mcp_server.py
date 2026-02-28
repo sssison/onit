@@ -1,7 +1,7 @@
 """
 TurtleBot Motion MCP Server V3.
 
-Duration-based motion commands via direct ROS2 /cmd_vel publishing.
+Duration-based motion commands via the HTTP API exposed by the motion server.
 """
 
 import asyncio
@@ -9,14 +9,11 @@ import json
 import logging
 import math
 import os
-import threading
 import time
 from typing import Any
 
-import rclpy
+import httpx
 from fastmcp import Client, FastMCP
-from geometry_msgs.msg import Twist
-from rclpy.node import Node
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +28,8 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"Invalid {name}={raw!r}; expected a float") from e
 
 
-CMD_VEL_TOPIC = os.getenv("TBOT_CMD_VEL_TOPIC", "/cmd_vel")
-ROS_NODE_NAME = os.getenv("TBOT_ROS_NODE_NAME", "tbot_motion_mcp_v3")
-CMD_VEL_QOS = int(os.getenv("TBOT_CMD_VEL_QOS", "10"))
-
+BASE_URL = os.getenv("MOTION_SERVER_BASE_URL", "http://10.158.38.26:5001").rstrip("/")
+HTTP_TIMEOUT_S = _env_float("MOTION_TIMEOUT_S", 5.0)
 MAX_LINEAR = abs(_env_float("MOTION_MAX_LINEAR", 0.2))
 MAX_ANGULAR = abs(_env_float("MOTION_MAX_ANGULAR", 1.0))
 ANGULAR_SIGN = _env_float("MOTION_ANGULAR_SIGN", -1.0)
@@ -44,30 +39,11 @@ LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/tu
 WALL_FOLLOW_KP = _env_float("WALL_FOLLOW_KP", 2.0)
 WALL_FOLLOW_MAX_ANGULAR = _env_float("WALL_FOLLOW_MAX_ANGULAR", 0.5)
 
+MOVE_PATH = "/move"
+STOP_PATH = "/stop"
+HEALTH_PATH = "/health"
+
 mcp_motion_v3 = FastMCP("TurtleBot Motion MCP Server V3")
-
-# Module-level ROS2 state
-_ros_lock = threading.Lock()
-_ros_node: Node | None = None
-_ros_publisher: Any | None = None
-_ros_spin_thread: threading.Thread | None = None
-_last_linear: float = 0.0
-_last_angular: float = 0.0
-
-
-def _ensure_ros() -> tuple[Node, Any]:
-    global _ros_node, _ros_publisher, _ros_spin_thread
-    with _ros_lock:
-        if _ros_node is None:
-            if not rclpy.ok():
-                rclpy.init()
-            _ros_node = Node(ROS_NODE_NAME)
-            _ros_publisher = _ros_node.create_publisher(Twist, CMD_VEL_TOPIC, CMD_VEL_QOS)
-            _ros_spin_thread = threading.Thread(
-                target=rclpy.spin, args=(_ros_node,), daemon=True
-            )
-            _ros_spin_thread.start()
-    return _ros_node, _ros_publisher
 
 
 def _validate_finite(name: str, value: float) -> float:
@@ -89,34 +65,43 @@ def _clamp(value: float, limit: float) -> float:
     return value
 
 
-def _publish_twist_sync(linear: float, angular: float) -> None:
-    global _last_linear, _last_angular
-    _, pub = _ensure_ros()
-    msg = Twist()
-    msg.linear.x = linear
-    msg.angular.z = angular
-    pub.publish(msg)
-    _last_linear = linear
-    _last_angular = angular
+async def _post_json(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    url = f"{BASE_URL}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Unexpected response from {url}: expected JSON object")
+            return data
+    except httpx.HTTPStatusError as e:
+        body = e.response.text
+        raise RuntimeError(f"Motion server error {e.response.status_code} for {url}: {body[:4000]}") from e
+    except httpx.RequestError as e:
+        raise RuntimeError(f"Failed to reach motion server at {url}: {e}") from e
 
 
-async def _publish_twist(linear: float, angular: float) -> dict[str, Any]:
-    _publish_twist_sync(linear, angular)
-    return {"linear": linear, "angular": angular, "topic": CMD_VEL_TOPIC}
-
-
-async def _stop_robot() -> dict[str, Any]:
-    return await _publish_twist(0.0, 0.0)
+async def _get_json(path: str) -> dict[str, Any]:
+    url = f"{BASE_URL}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Unexpected response from {url}: expected JSON object")
+            return data
+    except httpx.HTTPStatusError as e:
+        body = e.response.text
+        raise RuntimeError(f"Motion server error {e.response.status_code} for {url}: {body[:4000]}") from e
+    except httpx.RequestError as e:
+        raise RuntimeError(f"Failed to reach motion server at {url}: {e}") from e
 
 
 async def _try_get_health() -> tuple[dict[str, Any] | None, str | None]:
     try:
-        _, pub = _ensure_ros()
-        return {
-            "linear": _last_linear,
-            "angular": _last_angular,
-            "subscriber_count": pub.get_subscription_count(),
-        }, None
+        return await _get_json(HEALTH_PATH), None
     except Exception as e:
         return None, str(e)
 
@@ -150,17 +135,18 @@ async def tbot_motion_health() -> dict[str, Any]:
     """Check whether the TurtleBot motion server is online."""
     health, health_error = await _try_get_health()
     if health is not None:
-        sub_count = health.get("subscriber_count", 0)
         return {
+            **health,
             "status": "online",
-            "topic": CMD_VEL_TOPIC,
-            "node": ROS_NODE_NAME,
-            "subscriber_count": sub_count,
+            "base_url": BASE_URL,
+            "endpoints": {"move": MOVE_PATH, "stop": STOP_PATH, "health": HEALTH_PATH},
+            "reachable": True,
         }
     return {
         "status": "offline",
-        "topic": CMD_VEL_TOPIC,
-        "node": ROS_NODE_NAME,
+        "base_url": BASE_URL,
+        "reachable": False,
+        "endpoints": {"move": MOVE_PATH, "stop": STOP_PATH, "health": HEALTH_PATH},
         "health_error": health_error,
     }
 
@@ -168,8 +154,8 @@ async def tbot_motion_health() -> dict[str, Any]:
 @mcp_motion_v3.tool()
 async def tbot_motion_stop() -> dict[str, Any]:
     """Stop the robot immediately by setting linear and angular targets to zero."""
-    result = await _stop_robot()
-    return {**result, "topic": CMD_VEL_TOPIC}
+    result = await _post_json(STOP_PATH)
+    return {**result, "base_url": BASE_URL, "endpoint": STOP_PATH}
 
 
 @mcp_motion_v3.tool()
@@ -202,14 +188,14 @@ async def tbot_motion_move_forward(
             front_dist = (collision.get("distances") or {}).get("front")
 
             if risk_level == "stop":
-                await _stop_robot()
+                await _post_json(STOP_PATH)
                 return {"status": "collision_risk", "front_distance": front_dist}
 
             effective_speed = clamped_speed * 0.5 if risk_level == "caution" else clamped_speed
-            await _publish_twist(effective_speed, 0.0)
+            await _post_json(MOVE_PATH, {"linear": effective_speed, "angular": 0.0})
             await asyncio.sleep(0.2)
 
-    stop_result = await _stop_robot()
+    stop_result = await _post_json(STOP_PATH)
     return {
         **stop_result,
         "status": "completed",
@@ -262,7 +248,7 @@ async def tbot_motion_move_along_wall(
     async with Client(LIDAR_MCP_URL_V3) as lidar:
         while True:
             if time.monotonic() - start_mono >= timeout_f:
-                await _stop_robot()
+                await _post_json(STOP_PATH)
                 return {"status": "timeout", "distance_traveled_ticks": ticks}
 
             try:
@@ -275,7 +261,7 @@ async def tbot_motion_move_along_wall(
             lateral_dist = distances.get(direction_clean)
 
             if front_dist is not None and front_dist <= stop_dist:
-                await _stop_robot()
+                await _post_json(STOP_PATH)
                 return {"status": "obstacle_reached", "distance_traveled_ticks": ticks}
 
             if lateral_dist is not None:
@@ -284,7 +270,7 @@ async def tbot_motion_move_along_wall(
             else:
                 angular_correction = 0.0
 
-            await _publish_twist(clamped_speed, angular_correction)
+            await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": angular_correction})
             ticks += 1
             await asyncio.sleep(0.2)
 
@@ -311,13 +297,13 @@ async def tbot_motion_move(
     linear_cmd = _clamp(linear_f, MAX_LINEAR)
     angular_cmd = _clamp(angular_f, MAX_ANGULAR)
 
-    result = await _publish_twist(linear_cmd, angular_cmd)
+    result = await _post_json(MOVE_PATH, {"linear": linear_cmd, "angular": angular_cmd})
 
     if duration_s is not None:
         duration_f = _validate_finite("duration_s", duration_s)
         if duration_f > 0:
             await asyncio.sleep(duration_f)
-            stop_result = await _stop_robot()
+            stop_result = await _post_json(STOP_PATH)
             return {
                 **stop_result,
                 "status": "completed",
@@ -374,7 +360,7 @@ async def tbot_motion_turn(
             f"(current value: {ANGULAR_SIGN!r}). Must be non-zero."
         )
 
-    move_result = await _publish_twist(0.0, angular_cmd)
+    move_result = await _post_json(MOVE_PATH, {"linear": 0.0, "angular": angular_cmd})
 
     # Verify the motion server actually received the angular command.
     health, _ = await _try_get_health()
@@ -391,7 +377,7 @@ async def tbot_motion_turn(
     )
 
     await asyncio.sleep(duration_f)
-    stop_result = await _stop_robot()
+    stop_result = await _post_json(STOP_PATH)
     return {
         **stop_result,
         "status": "completed",
@@ -410,11 +396,32 @@ async def tbot_motion_turn(
 @mcp_motion_v3.tool()
 async def tbot_motion_get_robot_status() -> dict[str, Any]:
     """Get the current robot motion status — whether it is moving, and current linear/angular values."""
+    health, health_error = await _try_get_health()
+    if health is None:
+        return {
+            "moving": None,
+            "linear": None,
+            "angular": None,
+            "base_url": BASE_URL,
+            "error": health_error,
+        }
+
+    linear_raw = health.get("linear", 0.0)
+    angular_raw = health.get("angular", 0.0)
+    try:
+        linear_f = float(linear_raw) if linear_raw is not None else 0.0
+        angular_f = float(angular_raw) if angular_raw is not None else 0.0
+        moving = abs(linear_f) > 1e-6 or abs(angular_f) > 1e-6
+    except (TypeError, ValueError):
+        linear_f = 0.0
+        angular_f = 0.0
+        moving = False
+
     return {
-        "moving": abs(_last_linear) > 1e-6 or abs(_last_angular) > 1e-6,
-        "linear": _last_linear,
-        "angular": _last_angular,
-        "topic": CMD_VEL_TOPIC,
+        "moving": moving,
+        "linear": linear_f,
+        "angular": angular_f,
+        "base_url": BASE_URL,
     }
 
 
@@ -458,13 +465,13 @@ async def tbot_motion_approach_until_close(
     final_distance_m: float | None = None
 
     try:
-        await _publish_twist(clamped_speed, 0.0)
+        await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
 
         async with Client(LIDAR_MCP_URL_V3) as lidar:
             while True:
                 elapsed = time.monotonic() - start_mono
                 if elapsed >= timeout_f:
-                    await _stop_robot()
+                    await _post_json(STOP_PATH)
                     return {"status": "timeout", "front_distance": final_distance_m}
 
                 # Check collision risk
@@ -485,17 +492,17 @@ async def tbot_motion_approach_until_close(
                                 pass
 
                     if risk_level == "stop":
-                        await _stop_robot()
+                        await _post_json(STOP_PATH)
                         return {"status": "collision_risk", "front_distance": final_distance_m}
 
                     if risk_level == "caution":
-                        await _stop_robot()
+                        await _post_json(STOP_PATH)
                         # Nudge: small rotation to attempt repositioning
-                        await _publish_twist(0.0, nudge_angular_cmd)
+                        await _post_json(MOVE_PATH, {"linear": 0.0, "angular": nudge_angular_cmd})
                         await asyncio.sleep(nudge_duration_s)
-                        await _stop_robot()
+                        await _post_json(STOP_PATH)
                         # Resume forward motion
-                        await _publish_twist(clamped_speed, 0.0)
+                        await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
                 except Exception:
                     pass
 
@@ -512,7 +519,7 @@ async def tbot_motion_approach_until_close(
                             front_dist = float(dist_raw)
                             final_distance_m = front_dist
                             if front_dist <= target_dist:
-                                await _stop_robot()
+                                await _post_json(STOP_PATH)
                                 return {"status": "reached", "front_distance": final_distance_m}
                         except (TypeError, ValueError):
                             pass
@@ -523,7 +530,7 @@ async def tbot_motion_approach_until_close(
 
     except Exception:
         try:
-            await _stop_robot()
+            await _post_json(STOP_PATH)
         except Exception:
             pass
         raise
@@ -543,9 +550,9 @@ def run(
         logger.setLevel(logging.ERROR)
 
     logger.info(
-        "Starting TurtleBot Motion MCP V3 topic=%s node=%s at %s:%s%s",
-        CMD_VEL_TOPIC,
-        ROS_NODE_NAME,
+        "Starting TurtleBot Motion MCP V3 base_url=%s timeout_s=%.2f at %s:%s%s",
+        BASE_URL,
+        HTTP_TIMEOUT_S,
         host,
         port,
         path,
