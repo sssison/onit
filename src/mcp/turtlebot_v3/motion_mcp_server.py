@@ -180,6 +180,50 @@ async def tbot_motion_move_forward(
 
 
 @mcp_motion_v3.tool()
+async def tbot_motion_move(
+    linear: float,
+    angular: float,
+    duration_s: float | None = None,
+) -> dict[str, Any]:
+    """
+    Send a direct linear + angular velocity command to the robot.
+
+    linear:   forward speed m/s, clamped to ±MOTION_MAX_LINEAR (default 0.2).
+    angular:  angular speed rad/s sent directly; positive = left/CCW, negative = right/CW.
+              Clamped to ±MOTION_MAX_ANGULAR (default 1.0) but sign is NOT remapped — use
+              positive to turn left, negative to turn right (standard ROS2 convention).
+    duration_s: if provided and > 0, automatically stops after this many seconds.
+                If omitted, the command runs until tbot_motion_stop is called.
+    """
+    linear_f = _validate_finite("linear", linear)
+    angular_f = _validate_finite("angular", angular)
+
+    linear_cmd = _clamp(linear_f, MAX_LINEAR)
+    angular_cmd = _clamp(angular_f, MAX_ANGULAR)
+
+    result = await _post_json(MOVE_PATH, {"linear": linear_cmd, "angular": angular_cmd})
+
+    if duration_s is not None:
+        duration_f = _validate_finite("duration_s", duration_s)
+        if duration_f > 0:
+            await asyncio.sleep(duration_f)
+            stop_result = await _post_json(STOP_PATH)
+            return {
+                **stop_result,
+                "status": "completed",
+                "linear_cmd": linear_cmd,
+                "angular_cmd": angular_cmd,
+                "duration_s": duration_f,
+            }
+
+    return {
+        **result,
+        "linear_cmd": linear_cmd,
+        "angular_cmd": angular_cmd,
+    }
+
+
+@mcp_motion_v3.tool()
 async def tbot_motion_turn(
     direction: str,
     speed: float,
@@ -213,6 +257,12 @@ async def tbot_motion_turn(
     # "left"  → negative input frame → -1 * ANGULAR_SIGN
     input_frame_sign = 1.0 if direction_clean == "right" else -1.0
     angular_cmd = input_frame_sign * clamped_speed * ANGULAR_SIGN
+
+    if angular_cmd == 0.0:
+        raise ValueError(
+            f"angular_cmd is 0 — check MOTION_ANGULAR_SIGN env var "
+            f"(current value: {ANGULAR_SIGN!r}). Must be non-zero."
+        )
 
     move_result = await _post_json(MOVE_PATH, {"linear": 0.0, "angular": angular_cmd})
 
