@@ -91,6 +91,7 @@ v3_instruction_template: |
   - `tbot_motion_get_robot_status()` — check whether the robot is currently moving.
 
   ### 2. Vision & Scene Analysis
+  - For tasks like "find <object> and move closer", use `tbot_vision_search_and_approach_object(...)` first. It handles scan, forward motion, target reacquisition, and LiDAR-safe stopping in one loop.
   - Use `tbot_vision_describe_scene(prompt)` to load the latest camera frame and describe the scene.
   - Use `tbot_vision_find_object(object_name)` to check if a named object is visible and where (left/center/right).
   - If `tbot_vision_find_object` returns `visible=true` with position "left" or "right", turn in that direction before approaching.
