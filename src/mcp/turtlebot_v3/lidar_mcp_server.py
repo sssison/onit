@@ -380,15 +380,15 @@ async def tbot_lidar_is_path_clear(threshold_m: float = 0.5) -> dict[str, Any]:
 
 @mcp_lidar_v3.tool()
 async def tbot_lidar_check_collision(
-    front_threshold_m: float = 0.3,
+    front_threshold_m: float = 0.1,
     side_threshold_m: float = 0.2,
-    back_threshold_m: float = 0.3,
+    back_threshold_m: float = 0.1,
 ) -> dict[str, Any]:
     """
     Check for collision risk.
 
     risk_level:
-      "stop"    — front distance < front_threshold_m
+      "stop"    — front distance < front_threshold_m (default 0.1 m / 10 cm)
       "caution" — front distance between front_threshold_m and 2 × front_threshold_m
       "clear"   — front distance >= 2 × front_threshold_m
 
