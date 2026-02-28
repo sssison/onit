@@ -329,7 +329,10 @@ async def tbot_motion_move(
                             pass
                         await asyncio.sleep(0.2)
             else:
-                await asyncio.sleep(duration_f)
+                start_mono = time.monotonic()
+                while time.monotonic() - start_mono < duration_f:
+                    await _publish_twist(linear_cmd, angular_cmd)
+                    await asyncio.sleep(0.1)
             stop_result = await _stop_robot()
             return {
                 **stop_result,
@@ -387,8 +390,10 @@ async def tbot_motion_turn(
             f"(current value: {ANGULAR_SIGN!r}). Must be non-zero."
         )
 
-    await _publish_twist(0.0, angular_cmd)
-    await asyncio.sleep(duration_f)
+    start_mono = time.monotonic()
+    while time.monotonic() - start_mono < duration_f:
+        await _publish_twist(0.0, angular_cmd)
+        await asyncio.sleep(0.1)
     stop_result = await _stop_robot()
     return {
         **stop_result,
