@@ -47,7 +47,10 @@ MOTION_COLLISION_POLL_S_RAW = _env_float("MOTION_COLLISION_POLL_S", 0.2)
 MOTION_COLLISION_POLL_S = (
     MOTION_COLLISION_POLL_S_RAW if MOTION_COLLISION_POLL_S_RAW > 0 else 0.2
 )
-MOTION_STOP_BUFFER_M = max(0.0, _env_float("MOTION_STOP_BUFFER_M", 0.03))
+FORWARD_COLLISION_INTERRUPT_M = max(
+    0.01,
+    _env_float("MOTION_FORWARD_COLLISION_INTERRUPT_M", 0.10),
+)
 MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES = max(
     1,
     int(_env_float("MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES", 3.0)),
@@ -221,6 +224,87 @@ async def _try_get_health() -> tuple[dict[str, Any] | None, str | None]:
         return None, str(e)
 
 
+async def _run_collision_guarded_segment(
+    linear: float,
+    angular: float,
+    duration_s: float,
+    interrupt_distance_m: float,
+) -> dict[str, Any]:
+    """
+    Stream motion continuously while polling LiDAR for forward collision interrupt.
+    """
+    await _set_continuous_motion(None)
+    start_mono = time.monotonic()
+    collision_checks = 0
+    consecutive_lidar_failures = 0
+    last_front_dist: float | None = None
+    final_status = "completed"
+
+    async with Client(LIDAR_MCP_URL_V3) as lidar:
+        await _set_continuous_motion(linear, angular)
+        try:
+            while True:
+                elapsed = time.monotonic() - start_mono
+                if elapsed >= duration_s:
+                    break
+
+                try:
+                    raw = await lidar.call_tool(
+                        "tbot_lidar_check_collision",
+                        {"front_threshold_m": interrupt_distance_m},
+                    )
+                    collision = _extract_tool_dict(raw)
+                    collision_checks += 1
+                except Exception:
+                    collision = {}
+                    consecutive_lidar_failures += 1
+                    if consecutive_lidar_failures >= MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES:
+                        final_status = "lidar_unavailable"
+                        break
+
+                distances = collision.get("distances")
+                if isinstance(distances, dict):
+                    front_raw = distances.get("front")
+                    if isinstance(front_raw, (int, float)):
+                        last_front_dist = float(front_raw)
+                        consecutive_lidar_failures = 0
+                    else:
+                        consecutive_lidar_failures += 1
+                else:
+                    consecutive_lidar_failures += 1
+
+                if consecutive_lidar_failures >= MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES:
+                    final_status = "lidar_unavailable"
+                    break
+
+                if (
+                    (last_front_dist is not None and last_front_dist <= interrupt_distance_m)
+                    or collision.get("risk_level") == "stop"
+                ):
+                    final_status = "collision_risk"
+                    break
+
+                remaining = duration_s - (time.monotonic() - start_mono)
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(MOTION_COLLISION_POLL_S, remaining))
+        finally:
+            await _set_continuous_motion(None)
+
+    elapsed_total = min(duration_s, max(0.0, time.monotonic() - start_mono))
+    estimated_move_posts = max(1, int(math.ceil(elapsed_total / MOTION_COMMAND_REFRESH_S)))
+    return {
+        "status": final_status,
+        "front_distance": last_front_dist,
+        "move_posts": estimated_move_posts,
+        "collision_checks": collision_checks,
+        "consecutive_lidar_failures": consecutive_lidar_failures,
+        "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+        "collision_poll_s": MOTION_COLLISION_POLL_S,
+        "interrupt_distance_m": interrupt_distance_m,
+    }
+
+
 def _extract_tool_dict(tool_result: Any) -> dict[str, Any]:
     """Extract a dict from a FastMCP Client.call_tool() ToolResult."""
     if isinstance(tool_result, dict):
@@ -290,6 +374,9 @@ async def tbot_motion_move_forward(
 
     Motion is streamed continuously in the background so forward movement does
     not become pulse-like while waiting for LiDAR checks.
+
+    stop_distance_m is retained for API compatibility; forward collision
+    interrupt uses a fixed 10 cm threshold.
     """
     speed_f = _validate_finite("speed", speed)
     duration_f = _validate_finite("duration_seconds", duration_seconds)
@@ -299,109 +386,44 @@ async def tbot_motion_move_forward(
     if stop_distance_f <= 0:
         raise ValueError("stop_distance_m must be > 0")
 
-    await _set_continuous_motion(None)
     clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
-    start_mono = time.monotonic()
-    collision_checks = 0
-    consecutive_lidar_failures = 0
-    last_front_dist: float | None = None
-    last_dynamic_stop_trigger_m = stop_distance_f + MOTION_STOP_BUFFER_M
-    final_status = "completed"
-
-    async with Client(LIDAR_MCP_URL_V3) as lidar:
-        await _set_continuous_motion(clamped_speed, 0.0)
-        try:
-            while True:
-                elapsed = time.monotonic() - start_mono
-                if elapsed >= duration_f:
-                    break
-
-                poll_started = time.monotonic()
-                try:
-                    raw = await lidar.call_tool(
-                        "tbot_lidar_check_collision",
-                        {"front_threshold_m": stop_distance_f},
-                    )
-                    collision = _extract_tool_dict(raw)
-                    collision_checks += 1
-                except Exception:
-                    collision = {}
-                    consecutive_lidar_failures += 1
-                    if consecutive_lidar_failures >= MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES:
-                        final_status = "lidar_unavailable"
-                        break
-
-                distances = collision.get("distances")
-                if isinstance(distances, dict):
-                    front_raw = distances.get("front")
-                    if isinstance(front_raw, (int, float)):
-                        last_front_dist = float(front_raw)
-                        consecutive_lidar_failures = 0
-                    else:
-                        consecutive_lidar_failures += 1
-                        if consecutive_lidar_failures >= MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES:
-                            final_status = "lidar_unavailable"
-                            break
-                else:
-                    consecutive_lidar_failures += 1
-                    if consecutive_lidar_failures >= MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES:
-                        final_status = "lidar_unavailable"
-                        break
-
-                poll_elapsed_s = max(0.0, time.monotonic() - poll_started)
-                dynamic_margin_m = (
-                    MOTION_STOP_BUFFER_M
-                    + (clamped_speed * (poll_elapsed_s + MOTION_COMMAND_REFRESH_S))
-                )
-                last_dynamic_stop_trigger_m = stop_distance_f + dynamic_margin_m
-
-                if (
-                    last_front_dist is not None
-                    and last_front_dist <= last_dynamic_stop_trigger_m
-                ):
-                    final_status = "collision_risk"
-                    break
-                if collision.get("risk_level") == "stop":
-                    final_status = "collision_risk"
-                    break
-
-                remaining = duration_f - (time.monotonic() - start_mono)
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(min(MOTION_COLLISION_POLL_S, remaining))
-        finally:
-            await _set_continuous_motion(None)
-
+    interrupt_distance_m = FORWARD_COLLISION_INTERRUPT_M
+    guarded_result = await _run_collision_guarded_segment(
+        linear=clamped_speed,
+        angular=0.0,
+        duration_s=duration_f,
+        interrupt_distance_m=interrupt_distance_m,
+    )
     stop_result = await _post_json(STOP_PATH)
-    elapsed_total = min(duration_f, max(0.0, time.monotonic() - start_mono))
-    estimated_move_posts = max(1, int(math.ceil(elapsed_total / MOTION_COMMAND_REFRESH_S)))
 
-    if final_status == "collision_risk":
+    if guarded_result["status"] == "collision_risk":
         return {
             **stop_result,
             "status": "collision_risk",
-            "front_distance": last_front_dist,
+            "front_distance": guarded_result["front_distance"],
             "stop_distance_m": stop_distance_f,
-            "move_posts": estimated_move_posts,
-            "collision_checks": collision_checks,
-            "consecutive_lidar_failures": consecutive_lidar_failures,
-            "command_refresh_s": MOTION_COMMAND_REFRESH_S,
-            "collision_poll_s": MOTION_COLLISION_POLL_S,
-            "dynamic_stop_trigger_m": last_dynamic_stop_trigger_m,
+            "requested_stop_distance_m": stop_distance_f,
+            "interrupt_distance_m": interrupt_distance_m,
+            "move_posts": guarded_result["move_posts"],
+            "collision_checks": guarded_result["collision_checks"],
+            "consecutive_lidar_failures": guarded_result["consecutive_lidar_failures"],
+            "command_refresh_s": guarded_result["command_refresh_s"],
+            "collision_poll_s": guarded_result["collision_poll_s"],
         }
 
-    if final_status == "lidar_unavailable":
+    if guarded_result["status"] == "lidar_unavailable":
         return {
             **stop_result,
             "status": "lidar_unavailable",
-            "front_distance": last_front_dist,
+            "front_distance": guarded_result["front_distance"],
             "stop_distance_m": stop_distance_f,
-            "move_posts": estimated_move_posts,
-            "collision_checks": collision_checks,
-            "consecutive_lidar_failures": consecutive_lidar_failures,
-            "command_refresh_s": MOTION_COMMAND_REFRESH_S,
-            "collision_poll_s": MOTION_COLLISION_POLL_S,
-            "dynamic_stop_trigger_m": last_dynamic_stop_trigger_m,
+            "requested_stop_distance_m": stop_distance_f,
+            "interrupt_distance_m": interrupt_distance_m,
+            "move_posts": guarded_result["move_posts"],
+            "collision_checks": guarded_result["collision_checks"],
+            "consecutive_lidar_failures": guarded_result["consecutive_lidar_failures"],
+            "command_refresh_s": guarded_result["command_refresh_s"],
+            "collision_poll_s": guarded_result["collision_poll_s"],
         }
 
     return {
@@ -410,13 +432,14 @@ async def tbot_motion_move_forward(
         "speed": clamped_speed,
         "duration_seconds": duration_f,
         "stop_distance_m": stop_distance_f,
+        "requested_stop_distance_m": stop_distance_f,
+        "interrupt_distance_m": interrupt_distance_m,
         "was_clamped": abs(speed_f) != clamped_speed,
-        "move_posts": estimated_move_posts,
-        "collision_checks": collision_checks,
-        "consecutive_lidar_failures": consecutive_lidar_failures,
-        "command_refresh_s": MOTION_COMMAND_REFRESH_S,
-        "collision_poll_s": MOTION_COLLISION_POLL_S,
-        "dynamic_stop_trigger_m": last_dynamic_stop_trigger_m,
+        "move_posts": guarded_result["move_posts"],
+        "collision_checks": guarded_result["collision_checks"],
+        "consecutive_lidar_failures": guarded_result["consecutive_lidar_failures"],
+        "command_refresh_s": guarded_result["command_refresh_s"],
+        "collision_poll_s": guarded_result["collision_poll_s"],
     }
 
 
@@ -435,7 +458,8 @@ async def tbot_motion_move_along_wall(
     target_distance_m: desired lateral distance from the wall in metres.
     speed: forward speed in m/s (clamped to MAX_LINEAR).
     timeout_s: stop and return after this many seconds.
-    stop_distance_m: stop when a front obstacle is closer than this distance.
+    stop_distance_m: retained for API compatibility; forward collision interrupt
+                     uses a fixed 10 cm threshold.
 
     Returns {"status": "obstacle_reached"|"timeout", "distance_traveled_ticks": int}.
     """
@@ -461,6 +485,7 @@ async def tbot_motion_move_along_wall(
     start_mono = time.monotonic()
     ticks = 0
     move_posts = 0
+    interrupt_distance_m = FORWARD_COLLISION_INTERRUPT_M
 
     async with Client(LIDAR_MCP_URL_V3) as lidar:
         while True:
@@ -471,6 +496,8 @@ async def tbot_motion_move_along_wall(
                     "distance_traveled_ticks": ticks,
                     "move_posts": move_posts,
                     "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+                    "requested_stop_distance_m": stop_dist,
+                    "interrupt_distance_m": interrupt_distance_m,
                 }
 
             try:
@@ -482,13 +509,15 @@ async def tbot_motion_move_along_wall(
             front_dist = distances.get("front")
             lateral_dist = distances.get(direction_clean)
 
-            if front_dist is not None and front_dist <= stop_dist:
+            if front_dist is not None and front_dist <= interrupt_distance_m:
                 await _post_json(STOP_PATH)
                 return {
                     "status": "obstacle_reached",
                     "distance_traveled_ticks": ticks,
                     "move_posts": move_posts,
                     "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+                    "requested_stop_distance_m": stop_dist,
+                    "interrupt_distance_m": interrupt_distance_m,
                 }
 
             if lateral_dist is not None:
@@ -517,7 +546,9 @@ async def tbot_motion_move(
               Clamped to ±MOTION_MAX_ANGULAR (default 1.0) but sign is NOT remapped — use
               positive to turn left, negative to turn right (standard ROS2 convention).
     duration_s: if provided and > 0, automatically stops after this many seconds.
-                If omitted, the command runs until tbot_motion_stop is called.
+                For forward motion (linear > 0), duration_s is required so the
+                10 cm collision interrupt can be enforced.
+                If omitted, only non-forward commands stream until tbot_motion_stop.
     """
     linear_f = _validate_finite("linear", linear)
     angular_f = _validate_finite("angular", angular)
@@ -527,21 +558,52 @@ async def tbot_motion_move(
 
     if duration_s is not None:
         duration_f = _validate_finite("duration_s", duration_s)
-        if duration_f > 0:
-            preempted_stream = await _set_continuous_motion(None)
-            move_result, posts = await _post_move_for_duration(linear_cmd, angular_cmd, duration_f)
+        if duration_f <= 0:
+            raise ValueError("duration_s must be > 0 when provided")
+
+        preempted_stream = await _set_continuous_motion(None)
+        if linear_cmd > 0:
+            guarded_result = await _run_collision_guarded_segment(
+                linear=linear_cmd,
+                angular=angular_cmd,
+                duration_s=duration_f,
+                interrupt_distance_m=FORWARD_COLLISION_INTERRUPT_M,
+            )
             stop_result = await _post_json(STOP_PATH)
             return {
                 **stop_result,
-                "status": "completed",
+                "status": guarded_result["status"],
                 "linear_cmd": linear_cmd,
                 "angular_cmd": angular_cmd,
                 "duration_s": duration_f,
-                "move_posts": posts,
-                "command_refresh_s": MOTION_COMMAND_REFRESH_S,
-                "move_result": move_result,
+                "front_distance": guarded_result["front_distance"],
+                "interrupt_distance_m": guarded_result["interrupt_distance_m"],
+                "move_posts": guarded_result["move_posts"],
+                "collision_checks": guarded_result["collision_checks"],
+                "consecutive_lidar_failures": guarded_result["consecutive_lidar_failures"],
+                "command_refresh_s": guarded_result["command_refresh_s"],
+                "collision_poll_s": guarded_result["collision_poll_s"],
                 "preempted_continuous_stream": preempted_stream,
             }
+
+        move_result, posts = await _post_move_for_duration(linear_cmd, angular_cmd, duration_f)
+        stop_result = await _post_json(STOP_PATH)
+        return {
+            **stop_result,
+            "status": "completed",
+            "linear_cmd": linear_cmd,
+            "angular_cmd": angular_cmd,
+            "duration_s": duration_f,
+            "move_posts": posts,
+            "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+            "move_result": move_result,
+            "preempted_continuous_stream": preempted_stream,
+        }
+
+    if linear_cmd > 0:
+        raise ValueError(
+            "duration_s is required for forward linear motion so the 10cm collision interrupt can be enforced"
+        )
 
     result = await _post_json(MOVE_PATH, {"linear": linear_cmd, "angular": angular_cmd})
     replaced_stream = await _set_continuous_motion(linear_cmd, angular_cmd)
@@ -677,7 +739,9 @@ async def tbot_motion_approach_until_close(
     This uses continuous cmd_vel streaming (not discrete forward re-posts), and
     LiDAR is used only to decide when to stop.
 
-    stop_distance_m is passed as front_threshold_m to tbot_lidar_check_collision.
+    stop_distance_m is retained for API compatibility. Collision interrupt uses
+    a fixed 10 cm threshold to avoid over-conservative stops.
+
     If risk_level is "stop", halts and returns collision_risk.
     Returns status: "reached" | "collision_risk" | "timeout".
     """
@@ -704,6 +768,7 @@ async def tbot_motion_approach_until_close(
     collision_checks = 0
     consecutive_lidar_failures = 0
     final_status = "timeout"
+    interrupt_distance_m = FORWARD_COLLISION_INTERRUPT_M
 
     try:
         async with Client(LIDAR_MCP_URL_V3) as lidar:
@@ -718,7 +783,7 @@ async def tbot_motion_approach_until_close(
                 try:
                     collision_result = await lidar.call_tool(
                         "tbot_lidar_check_collision",
-                        {"front_threshold_m": stop_dist},
+                        {"front_threshold_m": interrupt_distance_m},
                     )
                     collision_data = _extract_tool_dict(collision_result)
                     collision_checks += 1
@@ -770,6 +835,8 @@ async def tbot_motion_approach_until_close(
         return {
             "status": "error",
             "front_distance": final_distance_m,
+            "requested_stop_distance_m": stop_dist,
+            "interrupt_distance_m": interrupt_distance_m,
             "collision_checks": collision_checks,
             "consecutive_lidar_failures": consecutive_lidar_failures,
             "command_refresh_s": MOTION_COMMAND_REFRESH_S,
@@ -790,6 +857,8 @@ async def tbot_motion_approach_until_close(
         "status": final_status,
         "front_distance": final_distance_m,
         "speed": clamped_speed,
+        "requested_stop_distance_m": stop_dist,
+        "interrupt_distance_m": interrupt_distance_m,
         "move_posts": estimated_move_posts,
         "collision_checks": collision_checks,
         "consecutive_lidar_failures": consecutive_lidar_failures,

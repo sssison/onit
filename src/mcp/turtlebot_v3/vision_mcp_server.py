@@ -49,6 +49,8 @@ _REPOSITION_DEFAULT_MAX_STEPS = 8
 
 _LINE_FOLLOW_SPEED = _env_float("LINE_FOLLOW_SPEED", 0.1)
 _LINE_FOLLOW_ANGULAR = _env_float("LINE_FOLLOW_ANGULAR", 0.3)
+_LINE_FOLLOW_TICK_S = _env_float("LINE_FOLLOW_TICK_S", 0.2)
+_VISION_FORWARD_COLLISION_INTERRUPT_M = _env_float("VISION_FORWARD_COLLISION_INTERRUPT_M", 0.1)
 _APPROACH_MIN_TARGET_DISTANCE_M = _env_float("APPROACH_MIN_TARGET_DISTANCE_M", 0.25)
 
 
@@ -532,6 +534,9 @@ async def tbot_vision_search_and_approach_object(
     3) Estimate front distance via LiDAR.
     4) Move forward at most once (only when needed).
     5) Verify visibility again and return final status.
+
+    stop_distance_m is retained for compatibility; forward collision interrupt
+    uses a fixed 10 cm threshold.
     """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
@@ -553,7 +558,7 @@ async def tbot_vision_search_and_approach_object(
     if timeout_s <= 0:
         raise ValueError("timeout_s must be > 0")
 
-    close_enough_m = max(0.1, float(stop_distance_m))
+    collision_interrupt_m = max(0.1, float(_VISION_FORWARD_COLLISION_INTERRUPT_M))
     effective_target_distance_m = max(float(target_distance_m), _APPROACH_MIN_TARGET_DISTANCE_M)
     verification_max_steps = min(_REPOSITION_DEFAULT_MAX_STEPS, max(1, int(initial_search_max_steps)))
 
@@ -679,7 +684,7 @@ async def tbot_vision_search_and_approach_object(
                         "errors": errors or None,
                     }
 
-                if front_distance <= close_enough_m:
+                if front_distance <= collision_interrupt_m:
                     await _safe_motion_stop(motion)
                     return {
                         "status": "collision_blocked",
@@ -701,7 +706,7 @@ async def tbot_vision_search_and_approach_object(
                     "tbot_motion_approach_until_close",
                     {
                         "target_distance_m": effective_target_distance_m,
-                        "stop_distance_m": close_enough_m,
+                        "stop_distance_m": collision_interrupt_m,
                         "speed": forward_speed,
                         "timeout_s": remaining_timeout,
                     },
@@ -796,7 +801,7 @@ async def tbot_vision_search_and_approach_object(
 
                 if post_front_distance is not None and post_front_distance <= effective_target_distance_m:
                     final_status = "reached"
-                elif post_front_distance is not None and post_front_distance <= close_enough_m:
+                elif post_front_distance is not None and post_front_distance <= collision_interrupt_m:
                     final_status = "collision_blocked"
                 else:
                     final_status = "approached"
@@ -948,7 +953,7 @@ async def tbot_vision_follow_line(
 
                 await motion.call_tool(
                     "tbot_motion_move",
-                    {"linear": speed, "angular": angular},
+                    {"linear": speed, "angular": angular, "duration_s": _LINE_FOLLOW_TICK_S},
                 )
                 ticks_followed += 1
 

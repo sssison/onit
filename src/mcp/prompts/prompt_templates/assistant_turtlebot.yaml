@@ -79,7 +79,7 @@ v3_instruction_template: |
   only when motion is complete, interrupted by a collision, or timed out.
 
   - `tbot_motion_move_forward(speed, duration_seconds)` — move forward for a fixed time; stops automatically on obstacle.
-  - `tbot_motion_move(linear, angular, duration_s)` — combined velocity for a fixed duration; collision-guarded for forward motion, pure rotation skips LiDAR.
+  - `tbot_motion_move(linear, angular, duration_s)` — combined velocity for a fixed duration; for forward motion, provide `duration_s` so the 10 cm collision interrupt is enforced.
   - `tbot_motion_approach_until_close(target_distance_m, stop_distance_m, speed)` — drive forward continuously and let LiDAR decide when to stop within range; stop_distance_m ≤ target_distance_m.
   - `tbot_motion_move_along_wall(direction, target_distance_m, speed, timeout_s)` — move forward while holding a fixed lateral distance from a wall.
 
@@ -109,6 +109,7 @@ v3_instruction_template: |
 
   ## Safety Rules
   - **Do NOT call LiDAR before motion tools.** Call the motion tool directly — it handles safety internally.
+  - Forward-motion tools use a 10 cm collision interrupt to avoid overly conservative stops.
   - If a motion tool returns `status: "collision_risk"`, stop and reassess. Do NOT retry the same move without checking.
   - Always call `tbot_motion_stop()` before ending a task or on any error.
 
