@@ -200,8 +200,9 @@ async def tbot_motion_turn(
         raise ValueError("duration_seconds must be > 0")
 
     clamped_speed = _clamp(abs(speed_f), MAX_ANGULAR)
-    # "left" is positive in the input frame, "right" is negative; then multiply by ANGULAR_SIGN
-    input_frame_sign = 1.0 if direction_clean == "left" else -1.0
+    # V2 convention (matches scan_rotate): positive input frame = right/CW, negative = left/CCW.
+    # "right" → +1 * ANGULAR_SIGN, "left" → -1 * ANGULAR_SIGN.
+    input_frame_sign = 1.0 if direction_clean == "right" else -1.0
     angular_cmd = input_frame_sign * clamped_speed * ANGULAR_SIGN
 
     await _post_json(MOVE_PATH, {"linear": 0.0, "angular": angular_cmd})

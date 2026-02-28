@@ -151,8 +151,8 @@ def test_motion_turn_left_angular_direction():
     assert result["direction"] == "left"
     move_call = next(c for c in calls if c[0] == motion_v3.MOVE_PATH)
     assert move_call[1]["linear"] == 0.0
-    # left: input_frame_sign=+1, cmd = +speed * ANGULAR_SIGN
-    expected_angular = 0.5 * motion_v3.ANGULAR_SIGN
+    # left: input_frame_sign=-1 (V2 convention: positive=right), cmd = -speed * ANGULAR_SIGN
+    expected_angular = -0.5 * motion_v3.ANGULAR_SIGN
     assert abs(move_call[1]["angular"] - expected_angular) < 1e-9
 
 
@@ -169,7 +169,7 @@ def test_motion_turn_right_angular_direction():
         asyncio.run(motion_v3.tbot_motion_turn(direction="right", speed=0.5, duration_seconds=0.5))
 
     move_call = next(c for c in calls if c[0] == motion_v3.MOVE_PATH)
-    expected_angular = -0.5 * motion_v3.ANGULAR_SIGN
+    expected_angular = 0.5 * motion_v3.ANGULAR_SIGN  # right: input_frame_sign=+1
     assert abs(move_call[1]["angular"] - expected_angular) < 1e-9
 
 
