@@ -332,7 +332,9 @@ async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, An
 
     distances: dict[str, float | None] = {}
     for name, center_deg in _SECTOR_CENTERS.items():
-        stats = _compute_sector_stats(scan, center_deg=center_deg, half_width_deg=45.0)
+        # Narrow front cone (±20°) so side obstacles don't register as forward hazards.
+        half_width = 20.0 if name == "front" else 45.0
+        stats = _compute_sector_stats(scan, center_deg=center_deg, half_width_deg=half_width)
         distances[name] = float(stats["min_m"]) if stats["status"] == "ok" and stats["min_m"] is not None else None
 
     if sector_clean == "all":
@@ -408,7 +410,10 @@ async def tbot_lidar_check_collision(
 
     distances: dict[str, float | None] = {}
     for name, center_deg in _SECTOR_CENTERS.items():
-        stats = _compute_sector_stats(scan, center_deg=center_deg, half_width_deg=45.0)
+        # Use a narrow 20° half-width for front to avoid picking up side obstacles;
+        # wider 45° for side/rear sectors (informational only, not used for risk_level).
+        half_width = 20.0 if name == "front" else 45.0
+        stats = _compute_sector_stats(scan, center_deg=center_deg, half_width_deg=half_width)
         distances[name] = float(stats["min_m"]) if stats["status"] == "ok" and stats["min_m"] is not None else None
 
     front_dist = distances.get("front")
