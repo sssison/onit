@@ -332,7 +332,7 @@ async def tbot_motion_move(
                 start_mono = time.monotonic()
                 while time.monotonic() - start_mono < duration_f:
                     await _publish_twist(linear_cmd, angular_cmd)
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.02)
             stop_result = await _stop_robot()
             return {
                 **stop_result,
@@ -393,7 +393,7 @@ async def tbot_motion_turn(
     start_mono = time.monotonic()
     while time.monotonic() - start_mono < duration_f:
         await _publish_twist(0.0, angular_cmd)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.02)
     stop_result = await _stop_robot()
     return {
         **stop_result,
