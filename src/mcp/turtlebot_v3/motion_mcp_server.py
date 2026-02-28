@@ -39,9 +39,9 @@ LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/tu
 
 WALL_FOLLOW_KP = _env_float("WALL_FOLLOW_KP", 2.0)
 WALL_FOLLOW_MAX_ANGULAR = _env_float("WALL_FOLLOW_MAX_ANGULAR", 0.5)
-MOTION_COMMAND_REFRESH_S_RAW = _env_float("MOTION_COMMAND_REFRESH_S", 0.2)
+MOTION_COMMAND_REFRESH_S_RAW = _env_float("MOTION_COMMAND_REFRESH_S", 0.05)
 MOTION_COMMAND_REFRESH_S = (
-    MOTION_COMMAND_REFRESH_S_RAW if MOTION_COMMAND_REFRESH_S_RAW > 0 else 0.2
+    MOTION_COMMAND_REFRESH_S_RAW if MOTION_COMMAND_REFRESH_S_RAW > 0 else 0.05
 )
 
 MOVE_PATH = "/move"
@@ -86,15 +86,15 @@ async def _post_move_for_duration(
     posts = 0
     last_result: dict[str, Any] | None = None
 
-    while True:
-        elapsed = time.monotonic() - start_mono
-        if elapsed >= duration_s:
-            break
+    # Guarantee at least one post even for very short durations.
+    effective_duration_s = max(duration_s, MOTION_COMMAND_REFRESH_S)
+    deadline = start_mono + effective_duration_s
 
+    while True:
         last_result = await _post_json(MOVE_PATH, {"linear": linear, "angular": angular})
         posts += 1
 
-        remaining = duration_s - (time.monotonic() - start_mono)
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         await asyncio.sleep(min(MOTION_COMMAND_REFRESH_S, remaining))
@@ -284,6 +284,7 @@ async def tbot_motion_move_forward(
     await _set_continuous_motion(None)
     clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
     start_mono = time.monotonic()
+    move_posts = 0
 
     async with Client(LIDAR_MCP_URL_V3) as lidar:
         while True:
@@ -302,11 +303,17 @@ async def tbot_motion_move_forward(
 
             if risk_level == "stop":
                 await _post_json(STOP_PATH)
-                return {"status": "collision_risk", "front_distance": front_dist}
+                return {
+                    "status": "collision_risk",
+                    "front_distance": front_dist,
+                    "move_posts": move_posts,
+                    "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+                }
 
             effective_speed = clamped_speed * 0.5 if risk_level == "caution" else clamped_speed
             await _post_json(MOVE_PATH, {"linear": effective_speed, "angular": 0.0})
-            await asyncio.sleep(0.2)
+            move_posts += 1
+            await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
 
     stop_result = await _post_json(STOP_PATH)
     return {
@@ -315,6 +322,8 @@ async def tbot_motion_move_forward(
         "speed": clamped_speed,
         "duration_seconds": duration_f,
         "was_clamped": abs(speed_f) != clamped_speed,
+        "move_posts": move_posts,
+        "command_refresh_s": MOTION_COMMAND_REFRESH_S,
     }
 
 
@@ -358,12 +367,18 @@ async def tbot_motion_move_along_wall(
     wall_sign = 1.0 if direction_clean == "left" else -1.0
     start_mono = time.monotonic()
     ticks = 0
+    move_posts = 0
 
     async with Client(LIDAR_MCP_URL_V3) as lidar:
         while True:
             if time.monotonic() - start_mono >= timeout_f:
                 await _post_json(STOP_PATH)
-                return {"status": "timeout", "distance_traveled_ticks": ticks}
+                return {
+                    "status": "timeout",
+                    "distance_traveled_ticks": ticks,
+                    "move_posts": move_posts,
+                    "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+                }
 
             try:
                 raw = await lidar.call_tool("tbot_lidar_get_obstacle_distances", {"sector": "all"})
@@ -376,7 +391,12 @@ async def tbot_motion_move_along_wall(
 
             if front_dist is not None and front_dist <= stop_dist:
                 await _post_json(STOP_PATH)
-                return {"status": "obstacle_reached", "distance_traveled_ticks": ticks}
+                return {
+                    "status": "obstacle_reached",
+                    "distance_traveled_ticks": ticks,
+                    "move_posts": move_posts,
+                    "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+                }
 
             if lateral_dist is not None:
                 error = lateral_dist - target_dist
@@ -386,7 +406,8 @@ async def tbot_motion_move_along_wall(
 
             await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": angular_correction})
             ticks += 1
-            await asyncio.sleep(0.2)
+            move_posts += 1
+            await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
 
 
 @mcp_motion_v3.tool()
@@ -590,6 +611,7 @@ async def tbot_motion_approach_until_close(
 
     start_mono = time.monotonic()
     final_distance_m: float | None = None
+    move_posts = 0
 
     try:
         async with Client(LIDAR_MCP_URL_V3) as lidar:
@@ -597,10 +619,16 @@ async def tbot_motion_approach_until_close(
                 elapsed = time.monotonic() - start_mono
                 if elapsed >= timeout_f:
                     await _post_json(STOP_PATH)
-                    return {"status": "timeout", "front_distance": final_distance_m}
+                    return {
+                        "status": "timeout",
+                        "front_distance": final_distance_m,
+                        "move_posts": move_posts,
+                        "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+                    }
 
                 # Re-post the forward command so backends that need keepalive updates keep moving.
                 await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
+                move_posts += 1
 
                 # Check collision risk
                 try:
@@ -621,7 +649,12 @@ async def tbot_motion_approach_until_close(
 
                     if risk_level == "stop":
                         await _post_json(STOP_PATH)
-                        return {"status": "collision_risk", "front_distance": final_distance_m}
+                        return {
+                            "status": "collision_risk",
+                            "front_distance": final_distance_m,
+                            "move_posts": move_posts,
+                            "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+                        }
 
                     if risk_level == "caution":
                         await _post_json(STOP_PATH)
@@ -648,13 +681,18 @@ async def tbot_motion_approach_until_close(
                             final_distance_m = front_dist
                             if front_dist <= target_dist:
                                 await _post_json(STOP_PATH)
-                                return {"status": "reached", "front_distance": final_distance_m}
+                                return {
+                                    "status": "reached",
+                                    "front_distance": final_distance_m,
+                                    "move_posts": move_posts,
+                                    "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+                                }
                         except (TypeError, ValueError):
                             pass
                 except Exception:
                     pass
 
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
 
     except Exception:
         try:
