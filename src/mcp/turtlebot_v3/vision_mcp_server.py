@@ -48,6 +48,9 @@ _SEARCH_FRAME_SETTLE_S = 0.3  # seconds to wait after rotation for a fresh frame
 
 _LINE_FOLLOW_SPEED = _env_float("LINE_FOLLOW_SPEED", 0.1)
 _LINE_FOLLOW_ANGULAR = _env_float("LINE_FOLLOW_ANGULAR", 0.3)
+_APPROACH_MIN_TARGET_DISTANCE_M = _env_float("APPROACH_MIN_TARGET_DISTANCE_M", 0.25)
+_APPROACH_DURATION_SAFETY_FACTOR_RAW = _env_float("APPROACH_DURATION_SAFETY_FACTOR", 0.7)
+_APPROACH_DURATION_SAFETY_FACTOR = min(max(_APPROACH_DURATION_SAFETY_FACTOR_RAW, 0.1), 1.0)
 
 
 def _extract_tool_result_dict(tool_result: Any) -> dict[str, Any]:
@@ -455,20 +458,19 @@ async def tbot_vision_search_and_approach_object(
     target_distance_m: float = 0.5,
     stop_distance_m: float = 0.1,
     forward_speed: float = 0.1,
-    forward_step_s: float = 5.0,
+    forward_step_s: float = 30.0,
     min_confidence: float = 0.5,
     initial_search_max_steps: int = 36,
     timeout_s: float = 90.0,
 ) -> dict[str, Any]:
     """
-    Search for a target object, then approach based on LiDAR-estimated forward distance.
+    Single-pass object approach:
+    1) Scan once to locate object.
+    2) Estimate front distance via LiDAR.
+    3) Move forward once using LiDAR-derived duration.
+    4) Stop and return final distance/status.
 
-    Workflow:
-    1) Scan to find object.
-    2) Estimate front distance from LiDAR.
-    3) Move forward using duration derived from distance and speed.
-    4) Check if object is still visible.
-    5) If lost, run one broad rescan; if still lost, stop if already <= 10 cm.
+    This policy intentionally avoids reorientation/reacquisition loops to reduce jitter.
     """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
@@ -491,18 +493,13 @@ async def tbot_vision_search_and_approach_object(
         raise ValueError("timeout_s must be > 0")
 
     close_enough_m = max(0.1, float(stop_distance_m))
+    effective_target_distance_m = max(float(target_distance_m), _APPROACH_MIN_TARGET_DISTANCE_M)
 
     started = time.monotonic()
     motion_url = os.getenv("TBOT_MOTION_MCP_URL_V3", MOTION_MCP_URL_V3)
     lidar_url = os.getenv("TBOT_LIDAR_MCP_URL_V3", LIDAR_MCP_URL_V3)
 
-    counters = {
-        "search_steps": 0,
-        "forward_segments": 0,
-        "rescan_attempts": 0,
-        "vision_checks": 0,
-    }
-    had_lost_target = False
+    counters = {"search_steps": 0, "forward_segments": 0}
     last_detection: dict[str, Any] | None = None
     errors: list[str] = []
 
@@ -512,254 +509,205 @@ async def tbot_vision_search_and_approach_object(
         max_steps=initial_search_max_steps,
     )
     counters["search_steps"] += int(initial_search.get("steps_taken") or 0)
+    last_detection = {
+        "visible": bool(initial_search.get("found", False)),
+        "confidence": float(initial_search.get("confidence", 0.0) or 0.0),
+        "position": initial_search.get("position"),
+        "bbox": initial_search.get("bbox"),
+    }
     if not initial_search.get("found", False):
         return {
             "status": "not_found",
             "object_name": object_name_clean,
-            "target_distance_m": float(target_distance_m),
+            "target_distance_m": effective_target_distance_m,
+            "requested_target_distance_m": float(target_distance_m),
             "final_front_distance_m": None,
             "phases": counters,
-            "last_detection": None,
-            "history_summary": {
-                "had_lost_target": False,
-                "errors_count": 0,
-            },
+            "last_detection": last_detection,
+            "history_summary": {"errors_count": 0},
             "timing_s": time.monotonic() - started,
         }
 
     async with Client(motion_url) as motion:
         async with Client(lidar_url) as lidar:
             try:
-                while True:
-                    elapsed = time.monotonic() - started
-                    if elapsed >= timeout_s:
-                        await _safe_motion_stop(motion)
-                        return {
-                            "status": "lost_timeout" if had_lost_target else "timeout",
-                            "object_name": object_name_clean,
-                            "target_distance_m": float(target_distance_m),
-                            "final_front_distance_m": None,
-                            "phases": counters,
-                            "last_detection": last_detection,
-                            "history_summary": {
-                                "had_lost_target": had_lost_target,
-                                "errors_count": len(errors),
-                            },
-                            "timing_s": elapsed,
-                            "errors": errors or None,
-                        }
-
-                    # 1) Estimate front distance first.
-                    lidar_raw = await lidar.call_tool(
-                        "tbot_lidar_get_obstacle_distances",
-                        {"sector": "front"},
-                    )
-                    lidar_data = _extract_tool_result_dict(lidar_raw)
-                    front_distance = _front_distance_from_lidar(lidar_data)
-                    if front_distance is not None and front_distance <= target_distance_m:
-                        await _safe_motion_stop(motion)
-                        return {
-                            "status": "reached",
-                            "object_name": object_name_clean,
-                            "target_distance_m": float(target_distance_m),
-                            "final_front_distance_m": front_distance,
-                            "phases": counters,
-                            "last_detection": last_detection,
-                            "history_summary": {
-                                "had_lost_target": had_lost_target,
-                                "errors_count": len(errors),
-                            },
-                            "timing_s": time.monotonic() - started,
-                            "errors": errors or None,
-                        }
-
-                    if front_distance is not None and front_distance <= close_enough_m:
-                        await _safe_motion_stop(motion)
-                        return {
-                            "status": "collision_blocked",
-                            "object_name": object_name_clean,
-                            "target_distance_m": float(target_distance_m),
-                            "final_front_distance_m": front_distance,
-                            "phases": counters,
-                            "last_detection": last_detection,
-                            "history_summary": {
-                                "had_lost_target": had_lost_target,
-                                "errors_count": len(errors),
-                            },
-                            "timing_s": time.monotonic() - started,
-                            "errors": errors or None,
-                        }
-
-                    # 2) Keep low-sensitivity collision guard (~10 cm) right before forward motion.
-                    collision_raw = await lidar.call_tool(
-                        "tbot_lidar_check_collision",
-                        {"front_threshold_m": close_enough_m},
-                    )
-                    collision_data = _extract_tool_result_dict(collision_raw)
-                    if collision_data.get("risk_level") == "stop":
-                        blocked_front = None
-                        distances = collision_data.get("distances")
-                        if isinstance(distances, dict):
-                            front_raw = distances.get("front")
-                            if isinstance(front_raw, (int, float)):
-                                blocked_front = float(front_raw)
-                        await _safe_motion_stop(motion)
-                        return {
-                            "status": "collision_blocked",
-                            "object_name": object_name_clean,
-                            "target_distance_m": float(target_distance_m),
-                            "final_front_distance_m": blocked_front,
-                            "phases": counters,
-                            "last_detection": last_detection,
-                            "history_summary": {
-                                "had_lost_target": had_lost_target,
-                                "errors_count": len(errors),
-                            },
-                            "timing_s": time.monotonic() - started,
-                            "errors": errors or None,
-                        }
-
-                    # 3) Estimate how long to move using LiDAR distance.
-                    segment_duration = float(forward_step_s)
-                    if front_distance is not None:
-                        target_travel_m = max(0.0, front_distance - target_distance_m)
-                        duration_to_target = target_travel_m / max(0.01, forward_speed)
-                        if duration_to_target <= 0:
-                            await _safe_motion_stop(motion)
-                            return {
-                                "status": "reached",
-                                "object_name": object_name_clean,
-                                "target_distance_m": float(target_distance_m),
-                                "final_front_distance_m": front_distance,
-                                "phases": counters,
-                                "last_detection": last_detection,
-                                "history_summary": {
-                                    "had_lost_target": had_lost_target,
-                                    "errors_count": len(errors),
-                                },
-                                "timing_s": time.monotonic() - started,
-                                "errors": errors or None,
-                            }
-
-                        safe_travel_m = max(0.0, front_distance - close_enough_m)
-                        max_duration_by_safety = safe_travel_m / max(0.01, forward_speed)
-                        if max_duration_by_safety <= 0:
-                            await _safe_motion_stop(motion)
-                            return {
-                                "status": "collision_blocked",
-                                "object_name": object_name_clean,
-                                "target_distance_m": float(target_distance_m),
-                                "final_front_distance_m": front_distance,
-                                "phases": counters,
-                                "last_detection": last_detection,
-                                "history_summary": {
-                                    "had_lost_target": had_lost_target,
-                                    "errors_count": len(errors),
-                                },
-                                "timing_s": time.monotonic() - started,
-                                "errors": errors or None,
-                            }
-                        segment_duration = min(segment_duration, duration_to_target, max_duration_by_safety)
-                    segment_duration = max(0.1, segment_duration)
-
-                    forward_raw = await motion.call_tool(
-                        "tbot_motion_move_forward",
-                        {
-                            "speed": forward_speed,
-                            "duration_seconds": segment_duration,
-                        },
-                    )
-                    forward_result = _extract_tool_result_dict(forward_raw)
-                    counters["forward_segments"] += 1
-
-                    if forward_result.get("status") == "collision_risk":
-                        await _safe_motion_stop(motion)
-                        return {
-                            "status": "collision_blocked",
-                            "object_name": object_name_clean,
-                            "target_distance_m": float(target_distance_m),
-                            "final_front_distance_m": forward_result.get("front_distance"),
-                            "phases": counters,
-                            "last_detection": last_detection,
-                            "history_summary": {
-                                "had_lost_target": had_lost_target,
-                                "errors_count": len(errors),
-                            },
-                            "timing_s": time.monotonic() - started,
-                            "errors": errors or None,
-                        }
-
-                    # 4) After forward motion, verify target is still visible.
-                    detection = await tbot_vision_find_object(object_name_clean)
-                    counters["vision_checks"] += 1
-                    last_detection = {
-                        "visible": bool(detection.get("visible", False)),
-                        "confidence": float(detection.get("confidence", 0.0) or 0.0),
-                        "position": detection.get("position"),
-                        "bbox": detection.get("bbox"),
+                elapsed = time.monotonic() - started
+                if elapsed >= timeout_s:
+                    await _safe_motion_stop(motion)
+                    return {
+                        "status": "timeout",
+                        "object_name": object_name_clean,
+                        "target_distance_m": effective_target_distance_m,
+                        "requested_target_distance_m": float(target_distance_m),
+                        "final_front_distance_m": None,
+                        "phases": counters,
+                        "last_detection": last_detection,
+                        "history_summary": {"errors_count": len(errors)},
+                        "timing_s": elapsed,
+                        "errors": errors or None,
                     }
 
-                    if _is_detection_good(detection, min_confidence):
-                        continue
+                # 1) Estimate front distance first.
+                lidar_raw = await lidar.call_tool(
+                    "tbot_lidar_get_obstacle_distances",
+                    {"sector": "front"},
+                )
+                lidar_data = _extract_tool_result_dict(lidar_raw)
+                front_distance = _front_distance_from_lidar(lidar_data)
+                if front_distance is None:
+                    await _safe_motion_stop(motion)
+                    return {
+                        "status": "error",
+                        "object_name": object_name_clean,
+                        "target_distance_m": effective_target_distance_m,
+                        "requested_target_distance_m": float(target_distance_m),
+                        "final_front_distance_m": None,
+                        "phases": counters,
+                        "last_detection": last_detection,
+                        "history_summary": {"errors_count": len(errors) + 1},
+                        "timing_s": time.monotonic() - started,
+                        "errors": [*errors, "LiDAR front distance unavailable"],
+                    }
 
-                    had_lost_target = True
-                    counters["rescan_attempts"] += 1
+                if front_distance <= effective_target_distance_m:
+                    await _safe_motion_stop(motion)
+                    return {
+                        "status": "reached",
+                        "object_name": object_name_clean,
+                        "target_distance_m": effective_target_distance_m,
+                        "requested_target_distance_m": float(target_distance_m),
+                        "final_front_distance_m": front_distance,
+                        "phases": counters,
+                        "last_detection": last_detection,
+                        "history_summary": {"errors_count": len(errors)},
+                        "timing_s": time.monotonic() - started,
+                        "errors": errors or None,
+                    }
 
-                    # User-requested safety fallback: if target is lost, verify if we are already ~10 cm away.
-                    lost_lidar_raw = await lidar.call_tool(
-                        "tbot_lidar_get_obstacle_distances",
-                        {"sector": "front"},
-                    )
-                    lost_lidar_data = _extract_tool_result_dict(lost_lidar_raw)
-                    lost_front_distance = _front_distance_from_lidar(lost_lidar_data)
-                    if lost_front_distance is not None and lost_front_distance <= close_enough_m:
-                        await _safe_motion_stop(motion)
-                        return {
-                            "status": "reached",
-                            "object_name": object_name_clean,
-                            "target_distance_m": float(target_distance_m),
-                            "final_front_distance_m": lost_front_distance,
-                            "phases": counters,
-                            "last_detection": last_detection,
-                            "history_summary": {
-                                "had_lost_target": had_lost_target,
-                                "errors_count": len(errors),
-                            },
-                            "timing_s": time.monotonic() - started,
-                            "errors": errors or None,
-                        }
+                if front_distance <= close_enough_m:
+                    await _safe_motion_stop(motion)
+                    return {
+                        "status": "collision_blocked",
+                        "object_name": object_name_clean,
+                        "target_distance_m": effective_target_distance_m,
+                        "requested_target_distance_m": float(target_distance_m),
+                        "final_front_distance_m": front_distance,
+                        "phases": counters,
+                        "last_detection": last_detection,
+                        "history_summary": {"errors_count": len(errors)},
+                        "timing_s": time.monotonic() - started,
+                        "errors": errors or None,
+                    }
 
-                    # No local reorientation policy: only broad rescan when target is lost.
-                    broad_rescan = await tbot_vision_search_object(
-                        object_name=object_name_clean,
-                        min_confidence=min_confidence,
-                        max_steps=initial_search_max_steps,
-                    )
-                    counters["search_steps"] += int(broad_rescan.get("steps_taken") or 0)
-                    if broad_rescan.get("found", False):
-                        last_detection = {
-                            "visible": True,
-                            "confidence": float(broad_rescan.get("confidence", 0.0) or 0.0),
-                            "position": broad_rescan.get("position"),
-                            "bbox": broad_rescan.get("bbox"),
-                        }
-                        continue
+                # 2) Keep low-sensitivity collision guard (~10 cm) before forward motion.
+                collision_raw = await lidar.call_tool(
+                    "tbot_lidar_check_collision",
+                    {"front_threshold_m": close_enough_m},
+                )
+                collision_data = _extract_tool_result_dict(collision_raw)
+                if collision_data.get("risk_level") == "stop":
+                    blocked_front = None
+                    distances = collision_data.get("distances")
+                    if isinstance(distances, dict):
+                        front_raw = distances.get("front")
+                        if isinstance(front_raw, (int, float)):
+                            blocked_front = float(front_raw)
+                    await _safe_motion_stop(motion)
+                    return {
+                        "status": "collision_blocked",
+                        "object_name": object_name_clean,
+                        "target_distance_m": effective_target_distance_m,
+                        "requested_target_distance_m": float(target_distance_m),
+                        "final_front_distance_m": blocked_front,
+                        "phases": counters,
+                        "last_detection": last_detection,
+                        "history_summary": {"errors_count": len(errors)},
+                        "timing_s": time.monotonic() - started,
+                        "errors": errors or None,
+                    }
 
-                    errors.append("reacquire_scan_not_found")
-                    await asyncio.sleep(_SEARCH_FRAME_SETTLE_S)
+                # 3) Compute one forward move duration from LiDAR estimate.
+                target_travel_m = max(0.0, front_distance - effective_target_distance_m)
+                duration_to_target = target_travel_m / max(0.01, forward_speed)
+                safe_travel_m = max(0.0, front_distance - close_enough_m)
+                max_duration_by_safety = safe_travel_m / max(0.01, forward_speed)
+
+                duration_s = max(
+                    0.1,
+                    min(
+                        float(forward_step_s),
+                        duration_to_target * _APPROACH_DURATION_SAFETY_FACTOR,
+                        max_duration_by_safety,
+                    ),
+                )
+
+                forward_raw = await motion.call_tool(
+                    "tbot_motion_move_forward",
+                    {
+                        "speed": forward_speed,
+                        "duration_seconds": duration_s,
+                        "stop_distance_m": close_enough_m,
+                    },
+                )
+                forward_result = _extract_tool_result_dict(forward_raw)
+                counters["forward_segments"] += 1
+
+                if forward_result.get("status") == "collision_risk":
+                    await _safe_motion_stop(motion)
+                    return {
+                        "status": "collision_blocked",
+                        "object_name": object_name_clean,
+                        "target_distance_m": effective_target_distance_m,
+                        "requested_target_distance_m": float(target_distance_m),
+                        "final_front_distance_m": forward_result.get("front_distance"),
+                        "phases": counters,
+                        "last_detection": last_detection,
+                        "history_summary": {"errors_count": len(errors)},
+                        "timing_s": time.monotonic() - started,
+                        "errors": errors or None,
+                    }
+
+                # 4) Final LiDAR check after the move.
+                post_lidar_raw = await lidar.call_tool(
+                    "tbot_lidar_get_obstacle_distances",
+                    {"sector": "front"},
+                )
+                post_lidar_data = _extract_tool_result_dict(post_lidar_raw)
+                post_front_distance = _front_distance_from_lidar(post_lidar_data)
+
+                await _safe_motion_stop(motion)
+
+                if post_front_distance is not None and post_front_distance <= effective_target_distance_m:
+                    final_status = "reached"
+                elif post_front_distance is not None and post_front_distance <= close_enough_m:
+                    final_status = "collision_blocked"
+                else:
+                    final_status = "approached"
+
+                return {
+                    "status": final_status,
+                    "object_name": object_name_clean,
+                    "target_distance_m": effective_target_distance_m,
+                    "requested_target_distance_m": float(target_distance_m),
+                    "final_front_distance_m": post_front_distance,
+                    "phases": counters,
+                    "last_detection": last_detection,
+                    "history_summary": {"errors_count": len(errors)},
+                    "timing_s": time.monotonic() - started,
+                    "errors": errors or None,
+                    "duration_seconds_executed": duration_s,
+                }
             except Exception as e:
                 await _safe_motion_stop(motion)
                 return {
                     "status": "error",
                     "object_name": object_name_clean,
-                    "target_distance_m": float(target_distance_m),
+                    "target_distance_m": effective_target_distance_m,
+                    "requested_target_distance_m": float(target_distance_m),
                     "final_front_distance_m": None,
                     "phases": counters,
                     "last_detection": last_detection,
-                    "history_summary": {
-                        "had_lost_target": had_lost_target,
-                        "errors_count": len(errors) + 1,
-                    },
+                    "history_summary": {"errors_count": len(errors) + 1},
                     "timing_s": time.monotonic() - started,
                     "errors": [*errors, str(e)],
                 }

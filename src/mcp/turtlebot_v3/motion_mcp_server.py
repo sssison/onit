@@ -43,6 +43,10 @@ MOTION_COMMAND_REFRESH_S_RAW = _env_float("MOTION_COMMAND_REFRESH_S", 0.05)
 MOTION_COMMAND_REFRESH_S = (
     MOTION_COMMAND_REFRESH_S_RAW if MOTION_COMMAND_REFRESH_S_RAW > 0 else 0.05
 )
+MOTION_COLLISION_POLL_S_RAW = _env_float("MOTION_COLLISION_POLL_S", 0.2)
+MOTION_COLLISION_POLL_S = (
+    MOTION_COLLISION_POLL_S_RAW if MOTION_COLLISION_POLL_S_RAW > 0 else 0.2
+)
 
 MOVE_PATH = "/move"
 STOP_PATH = "/stop"
@@ -274,56 +278,91 @@ async def tbot_motion_stop() -> dict[str, Any]:
 async def tbot_motion_move_forward(
     speed: float,
     duration_seconds: float,
+    stop_distance_m: float = 0.1,
 ) -> dict[str, Any]:
-    """Move the robot forward at the given speed for duration_seconds, then stop automatically."""
+    """
+    Move forward smoothly for duration_seconds with LiDAR stop guard.
+
+    Motion is streamed continuously in the background so forward movement does
+    not become pulse-like while waiting for LiDAR checks.
+    """
     speed_f = _validate_finite("speed", speed)
     duration_f = _validate_finite("duration_seconds", duration_seconds)
+    stop_distance_f = _validate_finite("stop_distance_m", stop_distance_m)
     if duration_f <= 0:
         raise ValueError("duration_seconds must be > 0")
+    if stop_distance_f <= 0:
+        raise ValueError("stop_distance_m must be > 0")
 
     await _set_continuous_motion(None)
     clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
     start_mono = time.monotonic()
-    move_posts = 0
+    collision_checks = 0
+    last_front_dist: float | None = None
+    final_status = "completed"
 
     async with Client(LIDAR_MCP_URL_V3) as lidar:
-        while True:
-            elapsed = time.monotonic() - start_mono
-            if elapsed >= duration_f:
-                break
+        await _set_continuous_motion(clamped_speed, 0.0)
+        try:
+            while True:
+                elapsed = time.monotonic() - start_mono
+                if elapsed >= duration_f:
+                    break
 
-            try:
-                raw = await lidar.call_tool("tbot_lidar_check_collision", {})
-                collision = _extract_tool_dict(raw)
-            except Exception:
-                collision = {}
+                try:
+                    raw = await lidar.call_tool(
+                        "tbot_lidar_check_collision",
+                        {"front_threshold_m": stop_distance_f},
+                    )
+                    collision = _extract_tool_dict(raw)
+                    collision_checks += 1
+                except Exception:
+                    collision = {}
 
-            risk_level = collision.get("risk_level", "clear")
-            front_dist = (collision.get("distances") or {}).get("front")
+                distances = collision.get("distances")
+                if isinstance(distances, dict):
+                    front_raw = distances.get("front")
+                    if isinstance(front_raw, (int, float)):
+                        last_front_dist = float(front_raw)
 
-            if risk_level == "stop":
-                await _post_json(STOP_PATH)
-                return {
-                    "status": "collision_risk",
-                    "front_distance": front_dist,
-                    "move_posts": move_posts,
-                    "command_refresh_s": MOTION_COMMAND_REFRESH_S,
-                }
+                if collision.get("risk_level") == "stop":
+                    final_status = "collision_risk"
+                    break
 
-            effective_speed = clamped_speed * 0.5 if risk_level == "caution" else clamped_speed
-            await _post_json(MOVE_PATH, {"linear": effective_speed, "angular": 0.0})
-            move_posts += 1
-            await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
+                remaining = duration_f - (time.monotonic() - start_mono)
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(MOTION_COLLISION_POLL_S, remaining))
+        finally:
+            await _set_continuous_motion(None)
 
     stop_result = await _post_json(STOP_PATH)
+    elapsed_total = min(duration_f, max(0.0, time.monotonic() - start_mono))
+    estimated_move_posts = max(1, int(math.ceil(elapsed_total / MOTION_COMMAND_REFRESH_S)))
+
+    if final_status == "collision_risk":
+        return {
+            **stop_result,
+            "status": "collision_risk",
+            "front_distance": last_front_dist,
+            "stop_distance_m": stop_distance_f,
+            "move_posts": estimated_move_posts,
+            "collision_checks": collision_checks,
+            "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+            "collision_poll_s": MOTION_COLLISION_POLL_S,
+        }
+
     return {
         **stop_result,
         "status": "completed",
         "speed": clamped_speed,
         "duration_seconds": duration_f,
+        "stop_distance_m": stop_distance_f,
         "was_clamped": abs(speed_f) != clamped_speed,
-        "move_posts": move_posts,
+        "move_posts": estimated_move_posts,
+        "collision_checks": collision_checks,
         "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+        "collision_poll_s": MOTION_COLLISION_POLL_S,
     }
 
 

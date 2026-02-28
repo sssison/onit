@@ -279,7 +279,7 @@ def test_search_and_approach_reaches_target_distance():
     assert any(name == "tbot_motion_stop" for name, _ in state["motion_calls"])
 
 
-def test_search_and_approach_lost_then_rescans():
+def test_search_and_approach_single_pass_no_rescan_or_reorient():
     state = _make_approach_state()
     state["forward_results"] = [{"status": "completed"}]
     state["lidar_results"] = [
@@ -315,7 +315,8 @@ def test_search_and_approach_lost_then_rescans():
         )
 
     assert result["status"] == "reached"
-    assert result["phases"]["rescan_attempts"] == 1
+    assert "rescan_attempts" not in result["phases"]
+    assert not any(name == "tbot_motion_turn" for name, _ in state["motion_calls"])
 
 
 def test_search_and_approach_returns_collision_blocked():
