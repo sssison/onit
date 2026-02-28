@@ -74,11 +74,14 @@ v3_instruction_template: |
 
   ### 1. Navigation & Motion
 
-  **These tools have collision guards built in — call them directly without any LiDAR pre-check:**
-  - `tbot_motion_move_forward(speed, duration_seconds)` — move forward; stops automatically on obstacle.
-  - `tbot_motion_move(linear, angular, duration_s)` — combined linear + angular velocity for a fixed duration; collision-guarded for forward motion, pure rotation skips LiDAR automatically.
-  - `tbot_motion_approach_until_close(target_distance_m, stop_distance_m, speed)` — drive forward and stop when an obstacle is within range; stop_distance_m ≤ target_distance_m.
-  - `tbot_motion_move_along_wall(direction, target_distance_m, speed, timeout_s)` — move forward while maintaining a fixed lateral distance from a wall.
+  **To move forward: call ONE of these tools and wait for it to return. Do NOT call LiDAR first.**
+  Each tool publishes /cmd_vel continuously and checks LiDAR in the background. They return
+  only when motion is complete, interrupted by a collision, or timed out.
+
+  - `tbot_motion_move_forward(speed, duration_seconds)` — move forward for a fixed time; stops automatically on obstacle.
+  - `tbot_motion_move(linear, angular, duration_s)` — combined velocity for a fixed duration; collision-guarded for forward motion, pure rotation skips LiDAR.
+  - `tbot_motion_approach_until_close(target_distance_m, stop_distance_m, speed)` — drive forward and stop when within range; stop_distance_m ≤ target_distance_m.
+  - `tbot_motion_move_along_wall(direction, target_distance_m, speed, timeout_s)` — move forward while holding a fixed lateral distance from a wall.
 
   **Turn-in-place (no LiDAR needed at all):**
   - `tbot_motion_turn(direction, speed, duration_seconds)` — rotate left or right; direction must be "left" or "right".
@@ -92,16 +95,19 @@ v3_instruction_template: |
   - Use `tbot_vision_find_object(object_name)` to check if a named object is visible and where (left/center/right).
   - If `tbot_vision_find_object` returns `visible=true` with position "left" or "right", turn in that direction before approaching.
 
-  ### 3. LiDAR — Environment Assessment Only
-  - **NEVER call LiDAR tools immediately before a motion tool.** All forward-motion tools already poll LiDAR internally. Pre-calling adds a ~3 s scan delay before the robot starts moving.
-  - Use `tbot_lidar_get_obstacle_distances(sector)` for situational awareness or planning — e.g., deciding which direction to go.
-  - Use `tbot_lidar_check_collision()` for standalone risk checks — e.g., after stopping, to assess the environment before planning the next move.
-  - Use `tbot_lidar_find_clear_path()` to identify navigable gaps when the robot is blocked.
-  - **Do NOT call LiDAR for rotation or turning in place.** It is irrelevant and wastes time.
+  ### 3. LiDAR — Post-stop Assessment Only
+  - **NEVER call LiDAR before or instead of a motion tool.** Doing so just adds delay — the
+    motion tools already run LiDAR checks internally and continuously while moving.
+  - Call LiDAR tools ONLY when the robot is stationary and you need to understand the environment
+    before deciding what to do next (e.g., after a collision stop, to pick a new heading).
+  - `tbot_lidar_get_obstacle_distances(sector)` — distances in a named sector.
+  - `tbot_lidar_check_collision()` — risk level check while stopped.
+  - `tbot_lidar_find_clear_path()` — find navigable gaps when blocked.
+  - **Never call LiDAR for rotation or turning in place.** It is irrelevant.
 
   ## Safety Rules
-  - **Do NOT pre-call LiDAR before motion tools** — collision guards are built into every forward-motion tool.
-  - NEVER ignore a "stop" risk_level returned by any motion tool.
+  - **Do NOT call LiDAR before motion tools.** Call the motion tool directly — it handles safety internally.
+  - If a motion tool returns `status: "collision_risk"`, stop and reassess. Do NOT retry the same move without checking.
   - Always call `tbot_motion_stop()` before ending a task or on any error.
 
   ## File Operations Policy

@@ -229,6 +229,78 @@ async def _call_lidar_tool(tool_name: str, args: dict) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Concurrent forward-motion helper
+# ---------------------------------------------------------------------------
+
+async def _run_forward_with_collision_guard(
+    linear: float,
+    angular: float,
+    duration_f: float,
+) -> dict[str, Any]:
+    """
+    Publish cmd_vel at CONTROL_HZ for up to duration_f seconds.
+
+    LiDAR collision checks run concurrently in a background asyncio.Task so
+    the /cmd_vel stream is never blocked waiting for a slow LiDAR round-trip
+    (~3-5 s). The last-known risk level is applied on every publish tick.
+
+    Returns dict with 'status' key: "completed" | "collision_risk" | "lidar_unavailable".
+    """
+    tick = 1.0 / CONTROL_HZ
+    start_mono = time.monotonic()
+    last_risk: str = "clear"
+    last_front_dist: float | None = None
+    consec_fails: int = 0
+    lidar_task: asyncio.Task | None = None
+
+    try:
+        while True:
+            elapsed = time.monotonic() - start_mono
+            if elapsed >= duration_f:
+                break
+
+            # Harvest a completed LiDAR background task
+            if lidar_task is not None and lidar_task.done():
+                try:
+                    col = lidar_task.result()
+                    last_risk = col.get("risk_level", "clear")
+                    fd = (col.get("distances") or {}).get("front")
+                    if fd is not None:
+                        last_front_dist = float(fd)
+                    consec_fails = 0
+                except Exception as exc:
+                    logger.warning("LiDAR background task failed: %s", exc)
+                    consec_fails += 1
+                lidar_task = None
+
+            # Fire a new LiDAR task if none is in flight
+            if lidar_task is None:
+                if consec_fails > LIDAR_MAX_CONSEC_FAILS:
+                    await _stop_robot()
+                    return {"status": "lidar_unavailable", "front_distance": last_front_dist}
+                lidar_task = asyncio.create_task(
+                    _call_lidar_tool("tbot_lidar_check_collision", {})
+                )
+
+            # Act on last known risk — publish every tick regardless of LiDAR state
+            if last_risk == "stop":
+                lidar_task.cancel()
+                await _stop_robot()
+                return {"status": "collision_risk", "front_distance": last_front_dist}
+
+            effective_linear = linear * 0.5 if last_risk == "caution" else linear
+            await _publish_twist(effective_linear, angular)
+            await asyncio.sleep(tick)
+
+    finally:
+        if lidar_task is not None:
+            lidar_task.cancel()
+
+    stop_result = await _stop_robot()
+    return {**stop_result, "status": "completed", "front_distance": last_front_dist}
+
+
+# ---------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------
 
@@ -273,45 +345,10 @@ async def tbot_motion_move_forward(
     if duration_f <= 0:
         raise ValueError("duration_seconds must be > 0")
 
-    clamped_speed             = _clamp(abs(speed_f), MAX_LINEAR)
-    start_mono                = time.monotonic()
-    tick                      = 1.0 / CONTROL_HZ
-    consecutive_lidar_failures = 0
-
-    while True:
-        elapsed = time.monotonic() - start_mono
-        if elapsed >= duration_f:
-            break
-
-        try:
-            collision = await _call_lidar_tool("tbot_lidar_check_collision", {})
-            consecutive_lidar_failures = 0
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning("LiDAR call failed: %s", e)
-            consecutive_lidar_failures += 1
-            if consecutive_lidar_failures > LIDAR_MAX_CONSEC_FAILS:
-                await _stop_robot()
-                return {"status": "lidar_unavailable"}
-            # Keep moving at reduced speed while LiDAR is temporarily unavailable
-            await _publish_twist(clamped_speed * 0.5, 0.0)
-            await asyncio.sleep(tick)
-            continue
-
-        risk_level = collision.get("risk_level", "clear")
-        front_dist = (collision.get("distances") or {}).get("front")
-
-        if risk_level == "stop":
-            await _stop_robot()
-            return {"status": "collision_risk", "front_distance": front_dist}
-
-        effective_speed = clamped_speed * 0.5 if risk_level == "caution" else clamped_speed
-        await _publish_twist(effective_speed, 0.0)
-        await asyncio.sleep(tick)
-
-    stop_result = await _stop_robot()
+    clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
+    result = await _run_forward_with_collision_guard(clamped_speed, 0.0, duration_f)
     return {
-        **stop_result,
-        "status": "completed",
+        **result,
         "speed": clamped_speed,
         "duration_seconds": duration_f,
         "was_clamped": abs(speed_f) != clamped_speed,
@@ -362,35 +399,50 @@ async def tbot_motion_move_along_wall(
     ticks         = 0
     tick          = 1.0 / CONTROL_HZ
 
-    while True:
-        if time.monotonic() - start_mono >= timeout_f:
-            await _stop_robot()
-            return {"status": "timeout", "distance_traveled_ticks": ticks}
+    last_distances: dict[str, Any] = {}
+    lidar_task: asyncio.Task | None = None
 
-        try:
-            distances = (
-                await _call_lidar_tool("tbot_lidar_get_obstacle_distances", {"sector": "all"})
-            ).get("distances", {})
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning("LiDAR call failed: %s", e)
-            distances = {}
+    try:
+        while True:
+            if time.monotonic() - start_mono >= timeout_f:
+                await _stop_robot()
+                return {"status": "timeout", "distance_traveled_ticks": ticks}
 
-        front_dist   = distances.get("front")
-        lateral_dist = distances.get(direction_clean)
+            # Harvest completed LiDAR background task
+            if lidar_task is not None and lidar_task.done():
+                try:
+                    last_distances = lidar_task.result().get("distances", {})
+                except Exception as exc:
+                    logger.warning("LiDAR background task failed: %s", exc)
+                lidar_task = None
 
-        if front_dist is not None and front_dist <= stop_dist:
-            await _stop_robot()
-            return {"status": "obstacle_reached", "distance_traveled_ticks": ticks}
+            # Fire new LiDAR task if none in flight
+            if lidar_task is None:
+                lidar_task = asyncio.create_task(
+                    _call_lidar_tool("tbot_lidar_get_obstacle_distances", {"sector": "all"})
+                )
 
-        if lateral_dist is not None:
-            error              = lateral_dist - target_dist
-            angular_correction = _clamp(wall_sign * WALL_FOLLOW_KP * error, WALL_FOLLOW_MAX_ANGULAR)
-        else:
-            angular_correction = 0.0
+            front_dist   = last_distances.get("front")
+            lateral_dist = last_distances.get(direction_clean)
 
-        await _publish_twist(clamped_speed, angular_correction)
-        ticks += 1
-        await asyncio.sleep(tick)
+            if front_dist is not None and front_dist <= stop_dist:
+                lidar_task.cancel()
+                await _stop_robot()
+                return {"status": "obstacle_reached", "distance_traveled_ticks": ticks}
+
+            if lateral_dist is not None:
+                error              = lateral_dist - target_dist
+                angular_correction = _clamp(wall_sign * WALL_FOLLOW_KP * error, WALL_FOLLOW_MAX_ANGULAR)
+            else:
+                angular_correction = 0.0
+
+            await _publish_twist(clamped_speed, angular_correction)
+            ticks += 1
+            await asyncio.sleep(tick)
+
+    finally:
+        if lidar_task is not None:
+            lidar_task.cancel()
 
 
 @mcp_motion_v3.tool()
@@ -435,43 +487,18 @@ async def tbot_motion_move(
                 while time.monotonic() - start_mono < duration_f:
                     await _publish_twist(linear_cmd, angular_cmd)
                     await asyncio.sleep(tick)
+                stop_result = await _stop_robot()
+                return {
+                    **stop_result,
+                    "status": "completed",
+                    "linear_cmd": linear_cmd,
+                    "angular_cmd": angular_cmd,
+                    "duration_s": duration_f,
+                }
             else:
-                # Forward, backward, or combined: run collision guard every tick
-                consecutive_lidar_failures = 0
-                while time.monotonic() - start_mono < duration_f:
-                    try:
-                        collision = await _call_lidar_tool("tbot_lidar_check_collision", {})
-                        consecutive_lidar_failures = 0
-                        if collision.get("risk_level") == "stop":
-                            front_dist = (collision.get("distances") or {}).get("front")
-                            await _stop_robot()
-                            return {
-                                "status": "collision_risk",
-                                "front_distance": front_dist,
-                                "linear_cmd": linear_cmd,
-                                "angular_cmd": angular_cmd,
-                            }
-                    except (asyncio.TimeoutError, Exception) as e:
-                        logger.warning("LiDAR call failed: %s", e)
-                        consecutive_lidar_failures += 1
-                        if consecutive_lidar_failures > LIDAR_MAX_CONSEC_FAILS:
-                            await _stop_robot()
-                            return {
-                                "status": "lidar_unavailable",
-                                "linear_cmd": linear_cmd,
-                                "angular_cmd": angular_cmd,
-                            }
-                    await _publish_twist(linear_cmd, angular_cmd)
-                    await asyncio.sleep(tick)
-
-            stop_result = await _stop_robot()
-            return {
-                **stop_result,
-                "status": "completed",
-                "linear_cmd": linear_cmd,
-                "angular_cmd": angular_cmd,
-                "duration_s": duration_f,
-            }
+                # Forward/combined: concurrent LiDAR guard, unblocked publishing
+                guard = await _run_forward_with_collision_guard(linear_cmd, angular_cmd, duration_f)
+                return {**guard, "linear_cmd": linear_cmd, "angular_cmd": angular_cmd, "duration_s": duration_f}
 
     return {
         **result,
@@ -592,10 +619,15 @@ async def tbot_motion_approach_until_close(
     nudge_angular_cmd = nudge_speed * ANGULAR_SIGN
     nudge_duration_s  = (10.0 * math.pi / 180.0) / max(0.01, nudge_speed)
 
-    start_mono                = time.monotonic()
-    final_distance_m: float | None = None
-    consecutive_lidar_failures: int = 0
+    start_mono       = time.monotonic()
+    final_dist_m: float | None = None
+    consec_fails: int = 0
     tick = 1.0 / CONTROL_HZ
+    lidar_task: asyncio.Task | None = None
+
+    # Seed last-known values so the first tick doesn't stop prematurely
+    last_risk: str = "clear"
+    last_front: float | None = None
 
     try:
         await _publish_twist(clamped_speed, 0.0)
@@ -604,75 +636,54 @@ async def tbot_motion_approach_until_close(
             elapsed = time.monotonic() - start_mono
             if elapsed >= timeout_f:
                 await _stop_robot()
-                return {"status": "timeout", "front_distance": final_distance_m}
+                return {"status": "timeout", "front_distance": final_dist_m}
 
-            tick_had_failure = False
+            # Harvest completed LiDAR task
+            # One call covers both safety and distance — collision check returns distances.front
+            if lidar_task is not None and lidar_task.done():
+                try:
+                    col = lidar_task.result()
+                    last_risk = col.get("risk_level", "clear")
+                    fd = (col.get("distances") or {}).get("front")
+                    if fd is not None:
+                        last_front = float(fd)
+                        final_dist_m = last_front
+                    consec_fails = 0
+                except Exception as exc:
+                    logger.warning("LiDAR background task failed: %s", exc)
+                    consec_fails += 1
+                lidar_task = None
 
-            # --- Collision check ---
-            try:
-                collision_data = await _call_lidar_tool(
-                    "tbot_lidar_check_collision",
-                    {"front_threshold_m": stop_dist},
+            # Fire new LiDAR task if none in flight
+            if lidar_task is None:
+                if consec_fails > LIDAR_MAX_CONSEC_FAILS:
+                    await _stop_robot()
+                    return {"status": "lidar_unavailable", "front_distance": final_dist_m}
+                lidar_task = asyncio.create_task(
+                    _call_lidar_tool("tbot_lidar_check_collision", {"front_threshold_m": stop_dist})
                 )
-                risk_level = collision_data.get("risk_level", "clear")
-                distances  = collision_data.get("distances", {})
-                if isinstance(distances, dict):
-                    front_raw = distances.get("front")
-                    if front_raw is not None:
-                        try:
-                            final_distance_m = float(front_raw)
-                        except (TypeError, ValueError):
-                            pass
 
-                if risk_level == "stop":
-                    await _stop_robot()
-                    return {"status": "collision_risk", "front_distance": final_distance_m}
+            # Act on last known state
+            if last_risk == "stop":
+                lidar_task.cancel()
+                await _stop_robot()
+                return {"status": "collision_risk", "front_distance": final_dist_m}
 
-                if risk_level == "caution":
-                    await _stop_robot()
-                    await _publish_twist(0.0, nudge_angular_cmd)
-                    await asyncio.sleep(nudge_duration_s)
-                    await _stop_robot()
-                    await _publish_twist(clamped_speed, 0.0)
-
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning("LiDAR call failed: %s", e)
-                tick_had_failure = True
-
-            # --- Target distance check ---
-            try:
-                dist_data  = await _call_lidar_tool(
-                    "tbot_lidar_get_obstacle_distances",
-                    {"sector": "front"},
-                )
-                distances      = dist_data.get("distances", {})
-                front_dist_raw = (
-                    distances.get("front") if isinstance(distances, dict)
-                    else dist_data.get("distance_m")
-                )
-                if front_dist_raw is None:
-                    front_dist_raw = dist_data.get("distance_m")
-                if front_dist_raw is not None:
-                    try:
-                        front_dist       = float(front_dist_raw)
-                        final_distance_m = front_dist
-                        if front_dist <= target_dist:
-                            await _stop_robot()
-                            return {"status": "reached", "front_distance": final_distance_m}
-                    except (TypeError, ValueError):
-                        pass
-
-            except (asyncio.TimeoutError, Exception) as e:
-                logger.warning("LiDAR call failed: %s", e)
-                tick_had_failure = True
-
-            if tick_had_failure:
-                consecutive_lidar_failures += 1
-                if consecutive_lidar_failures > LIDAR_MAX_CONSEC_FAILS:
-                    await _stop_robot()
-                    return {"status": "lidar_unavailable", "front_distance": final_distance_m}
+            if last_risk == "caution":
+                await _stop_robot()
+                await _publish_twist(0.0, nudge_angular_cmd)
+                await asyncio.sleep(nudge_duration_s)
+                await _stop_robot()
+                last_risk = "clear"
+                await _publish_twist(clamped_speed, 0.0)
             else:
-                consecutive_lidar_failures = 0
+                await _publish_twist(clamped_speed, 0.0)
+
+            # Target-distance reached check (uses front dist from collision result)
+            if last_front is not None and last_front <= target_dist:
+                lidar_task.cancel()
+                await _stop_robot()
+                return {"status": "reached", "front_distance": final_dist_m}
 
             await asyncio.sleep(tick)
 
@@ -682,6 +693,9 @@ async def tbot_motion_approach_until_close(
         except Exception:
             pass
         raise
+    finally:
+        if lidar_task is not None:
+            lidar_task.cancel()
 
 
 def run(
