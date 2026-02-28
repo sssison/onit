@@ -189,6 +189,7 @@ async def tbot_motion_turn(
     Turn the robot left or right at the given angular speed for duration_seconds, then stop.
 
     direction must be "left" or "right".
+    speed is in rad/s (clamped to MOTION_MAX_ANGULAR, default 1.0).
     """
     direction_clean = direction.strip().lower() if isinstance(direction, str) else ""
     if direction_clean not in ("left", "right"):
@@ -200,12 +201,35 @@ async def tbot_motion_turn(
         raise ValueError("duration_seconds must be > 0")
 
     clamped_speed = _clamp(abs(speed_f), MAX_ANGULAR)
-    # V2 convention (matches scan_rotate): positive input frame = right/CW, negative = left/CCW.
-    # "right" → +1 * ANGULAR_SIGN, "left" → -1 * ANGULAR_SIGN.
+    if clamped_speed == 0.0:
+        raise ValueError(
+            f"Effective angular speed is 0 (speed={speed_f!r}, MAX_ANGULAR={MAX_ANGULAR!r}). "
+            "Pass a non-zero speed within the allowed range."
+        )
+
+    # ROS convention: angular.z > 0 = CCW = left, angular.z < 0 = CW = right.
+    # ANGULAR_SIGN flips the mapping when the robot's frame differs (default -1.0).
+    # "right" → positive input frame → +1 * ANGULAR_SIGN
+    # "left"  → negative input frame → -1 * ANGULAR_SIGN
     input_frame_sign = 1.0 if direction_clean == "right" else -1.0
     angular_cmd = input_frame_sign * clamped_speed * ANGULAR_SIGN
 
-    await _post_json(MOVE_PATH, {"linear": 0.0, "angular": angular_cmd})
+    move_result = await _post_json(MOVE_PATH, {"linear": 0.0, "angular": angular_cmd})
+
+    # Verify the motion server actually received the angular command.
+    health, _ = await _try_get_health()
+    health_angular: float | None = None
+    if health is not None:
+        raw = health.get("angular")
+        try:
+            health_angular = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            pass
+
+    command_received = (
+        health_angular is not None and abs(health_angular - angular_cmd) < 1e-6
+    )
+
     await asyncio.sleep(duration_f)
     stop_result = await _post_json(STOP_PATH)
     return {
@@ -214,8 +238,12 @@ async def tbot_motion_turn(
         "direction": direction_clean,
         "speed": clamped_speed,
         "angular_cmd": angular_cmd,
+        "angular_sign": ANGULAR_SIGN,
         "duration_seconds": duration_f,
         "was_clamped": abs(speed_f) != clamped_speed,
+        "move_result": move_result,
+        "health_angular_after_move": health_angular,
+        "command_received_by_server": command_received,
     }
 
 
