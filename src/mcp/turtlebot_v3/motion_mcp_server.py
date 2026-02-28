@@ -63,7 +63,11 @@ MAX_LINEAR   = abs(_env_float("MOTION_MAX_LINEAR", 0.2))
 MAX_ANGULAR  = abs(_env_float("MOTION_MAX_ANGULAR", 1.0))
 ANGULAR_SIGN = _env_float("MOTION_ANGULAR_SIGN", -1.0)
 
-LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
+LIDAR_MCP_URL_V3       = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
+# Must exceed the LiDAR server's LIDAR_SCAN_TIMEOUT_S (default 3.0 s) plus HTTP overhead.
+LIDAR_CALL_TIMEOUT_S   = _env_float("LIDAR_CALL_TIMEOUT_S", 5.0)
+# Consecutive ticks with no LiDAR response before a forward motion loop stops.
+LIDAR_MAX_CONSEC_FAILS = int(os.getenv("LIDAR_MAX_CONSEC_FAILS", "3"))
 
 WALL_FOLLOW_KP          = _env_float("WALL_FOLLOW_KP", 2.0)
 WALL_FOLLOW_MAX_ANGULAR = _env_float("WALL_FOLLOW_MAX_ANGULAR", 0.5)
@@ -192,19 +196,6 @@ async def _stop_robot() -> dict[str, Any]:
     return await _publish_twist(0.0, 0.0)
 
 
-async def _try_get_health() -> tuple[dict[str, Any] | None, str | None]:
-    try:
-        _, pub = await _ensure_ros()
-        linear, angular = _get_last_velocities()
-        return {
-            "linear": linear,
-            "angular": angular,
-            "subscriber_count": pub.get_subscription_count(),
-        }, None
-    except Exception as e:
-        return None, str(e)
-
-
 # ---------------------------------------------------------------------------
 # LiDAR client helpers
 # ---------------------------------------------------------------------------
@@ -221,11 +212,11 @@ async def _get_lidar_client() -> Client:
 
 
 async def _call_lidar_tool(tool_name: str, args: dict) -> dict[str, Any]:
-    """Call a LiDAR tool with a 2 s timeout, falling back to a per-call client on failure."""
+    """Call a LiDAR tool with LIDAR_CALL_TIMEOUT_S timeout, falling back to a per-call client on failure."""
     global _lidar_client
     try:
         client = await _get_lidar_client()
-        raw = await asyncio.wait_for(client.call_tool(tool_name, args), timeout=2.0)
+        raw = await asyncio.wait_for(client.call_tool(tool_name, args), timeout=LIDAR_CALL_TIMEOUT_S)
         return _extract_tool_dict(raw)
     except (asyncio.TimeoutError, Exception) as e:
         logger.warning("LiDAR call failed (cached client): %s", e)
@@ -233,32 +224,13 @@ async def _call_lidar_tool(tool_name: str, args: dict) -> dict[str, Any]:
             _lidar_client = None
     # Fallback: fresh per-call client
     async with Client(LIDAR_MCP_URL_V3) as fresh:
-        raw = await asyncio.wait_for(fresh.call_tool(tool_name, args), timeout=2.0)
+        raw = await asyncio.wait_for(fresh.call_tool(tool_name, args), timeout=LIDAR_CALL_TIMEOUT_S)
         return _extract_tool_dict(raw)
 
 
 # ---------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------
-
-@mcp_motion_v3.tool()
-async def tbot_motion_health() -> dict[str, Any]:
-    """Check whether the TurtleBot motion server is online."""
-    health, health_error = await _try_get_health()
-    if health is not None:
-        return {
-            "status": "online",
-            "topic": CMD_VEL_TOPIC,
-            "node": ROS_NODE_NAME,
-            "subscriber_count": health.get("subscriber_count", 0),
-        }
-    return {
-        "status": "offline",
-        "topic": CMD_VEL_TOPIC,
-        "node": ROS_NODE_NAME,
-        "health_error": health_error,
-    }
-
 
 @mcp_motion_v3.tool()
 async def tbot_motion_stop() -> dict[str, Any]:
@@ -292,9 +264,10 @@ async def tbot_motion_move_forward(
     if duration_f <= 0:
         raise ValueError("duration_seconds must be > 0")
 
-    clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
-    start_mono    = time.monotonic()
-    tick          = 1.0 / CONTROL_HZ
+    clamped_speed             = _clamp(abs(speed_f), MAX_LINEAR)
+    start_mono                = time.monotonic()
+    tick                      = 1.0 / CONTROL_HZ
+    consecutive_lidar_failures = 0
 
     while True:
         elapsed = time.monotonic() - start_mono
@@ -303,10 +276,17 @@ async def tbot_motion_move_forward(
 
         try:
             collision = await _call_lidar_tool("tbot_lidar_check_collision", {})
+            consecutive_lidar_failures = 0
         except (asyncio.TimeoutError, Exception) as e:
             logger.warning("LiDAR call failed: %s", e)
-            await _stop_robot()
-            return {"status": "lidar_unavailable"}
+            consecutive_lidar_failures += 1
+            if consecutive_lidar_failures > LIDAR_MAX_CONSEC_FAILS:
+                await _stop_robot()
+                return {"status": "lidar_unavailable"}
+            # Keep moving at reduced speed while LiDAR is temporarily unavailable
+            await _publish_twist(clamped_speed * 0.5, 0.0)
+            await asyncio.sleep(tick)
+            continue
 
         risk_level = collision.get("risk_level", "clear")
         front_dist = (collision.get("distances") or {}).get("front")
@@ -439,9 +419,11 @@ async def tbot_motion_move(
                     await asyncio.sleep(tick)
             else:
                 # Forward, backward, or combined: run collision guard every tick
+                consecutive_lidar_failures = 0
                 while time.monotonic() - start_mono < duration_f:
                     try:
                         collision = await _call_lidar_tool("tbot_lidar_check_collision", {})
+                        consecutive_lidar_failures = 0
                         if collision.get("risk_level") == "stop":
                             front_dist = (collision.get("distances") or {}).get("front")
                             await _stop_robot()
@@ -453,12 +435,14 @@ async def tbot_motion_move(
                             }
                     except (asyncio.TimeoutError, Exception) as e:
                         logger.warning("LiDAR call failed: %s", e)
-                        await _stop_robot()
-                        return {
-                            "status": "lidar_unavailable",
-                            "linear_cmd": linear_cmd,
-                            "angular_cmd": angular_cmd,
-                        }
+                        consecutive_lidar_failures += 1
+                        if consecutive_lidar_failures > LIDAR_MAX_CONSEC_FAILS:
+                            await _stop_robot()
+                            return {
+                                "status": "lidar_unavailable",
+                                "linear_cmd": linear_cmd,
+                                "angular_cmd": angular_cmd,
+                            }
                     await _publish_twist(linear_cmd, angular_cmd)
                     await asyncio.sleep(tick)
 
@@ -663,7 +647,7 @@ async def tbot_motion_approach_until_close(
 
             if tick_had_failure:
                 consecutive_lidar_failures += 1
-                if consecutive_lidar_failures > 5:
+                if consecutive_lidar_failures > LIDAR_MAX_CONSEC_FAILS:
                     await _stop_robot()
                     return {"status": "lidar_unavailable", "front_distance": final_distance_m}
             else:
