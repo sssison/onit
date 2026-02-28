@@ -44,7 +44,10 @@ class JetsonVideoServer(Node):
             np_arr = np.frombuffer(msg.data, np.uint8)
             cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-            # 2. Re-encode to MJPEG (.jpg)
+            # 2. Rotate 90° clockwise
+            cv_image = cv2.rotate(cv_image, cv2.ROTATE_90_CLOCKWISE)
+
+            # 3. Re-encode to MJPEG (.jpg)
             # Lowering quality to 40-50 helps with latency over Wi-Fi
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 50]
             ret, buffer = cv2.imencode('.jpg', cv_image, encode_param)
