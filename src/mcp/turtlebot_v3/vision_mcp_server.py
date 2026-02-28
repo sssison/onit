@@ -510,7 +510,7 @@ async def tbot_vision_search_object(
 async def tbot_vision_search_and_approach_object(
     object_name: str,
     target_distance_m: float = 0.5,
-    stop_distance_m: float = 0.35,
+    stop_distance_m: float = 0.1,
     forward_speed: float = 0.1,
     forward_step_s: float = 0.8,
     min_confidence: float = 0.5,
@@ -524,9 +524,10 @@ async def tbot_vision_search_and_approach_object(
 
     Workflow:
     1) Scan to find object.
-    2) Move forward in short segments (LiDAR collision-guarded by motion tool).
-    3) If object leaves frame, do local sweep; if needed, do broad rescan.
-    4) Repeat until LiDAR front distance <= target_distance_m, or fail/timeout.
+    2) Estimate front distance from LiDAR.
+    3) Move forward in short segments (LiDAR collision-guarded by motion tool).
+    4) Check vision after each forward segment; if object is lost, reorient/reacquire.
+    5) Repeat until close enough, or fail/timeout.
     """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
@@ -551,6 +552,8 @@ async def tbot_vision_search_and_approach_object(
         raise ValueError("reacquire_step_deg must be > 0")
     if timeout_s <= 0:
         raise ValueError("timeout_s must be > 0")
+
+    close_enough_m = max(0.1, float(stop_distance_m))
 
     started = time.monotonic()
     motion_url = os.getenv("TBOT_MOTION_MCP_URL_V3", MOTION_MCP_URL_V3)
@@ -609,129 +612,7 @@ async def tbot_vision_search_and_approach_object(
                             "errors": errors or None,
                         }
 
-                    detection = await tbot_vision_find_object(object_name_clean)
-                    counters["vision_checks"] += 1
-                    last_detection = {
-                        "visible": bool(detection.get("visible", False)),
-                        "confidence": float(detection.get("confidence", 0.0) or 0.0),
-                        "position": detection.get("position"),
-                        "bbox": detection.get("bbox"),
-                    }
-
-                    if not _is_detection_good(detection, min_confidence):
-                        had_lost_target = True
-                        counters["reacquire_attempts"] += 1
-
-                        local_detection, local_checks = await _local_reacquire_object(
-                            motion=motion,
-                            object_name=object_name_clean,
-                            min_confidence=min_confidence,
-                            local_steps=reacquire_local_steps,
-                            step_deg=reacquire_step_deg,
-                            turn_speed=_APPROACH_TURN_SPEED,
-                        )
-                        counters["vision_checks"] += local_checks
-                        if local_detection is not None:
-                            last_detection = {
-                                "visible": True,
-                                "confidence": float(local_detection.get("confidence", 0.0) or 0.0),
-                                "position": local_detection.get("position"),
-                                "bbox": local_detection.get("bbox"),
-                            }
-                            continue
-
-                        broad_rescan = await tbot_vision_search_object(
-                            object_name=object_name_clean,
-                            min_confidence=min_confidence,
-                            max_steps=initial_search_max_steps,
-                        )
-                        counters["search_steps"] += int(broad_rescan.get("steps_taken") or 0)
-                        if broad_rescan.get("found", False):
-                            last_detection = {
-                                "visible": True,
-                                "confidence": float(broad_rescan.get("confidence", 0.0) or 0.0),
-                                "position": broad_rescan.get("position"),
-                                "bbox": broad_rescan.get("bbox"),
-                            }
-                            continue
-
-                        errors.append("reacquire_scan_not_found")
-                        await asyncio.sleep(_SEARCH_FRAME_SETTLE_S)
-                        continue
-
-                    position = detection.get("position")
-                    bbox = detection.get("bbox")
-                    turn_deg = 0.0
-                    if isinstance(bbox, dict):
-                        cx_raw = bbox.get("cx")
-                        if isinstance(cx_raw, (int, float)):
-                            offset_deg = (float(cx_raw) - 0.5) * CAMERA_HFOV_DEG
-                            if abs(offset_deg) > _APPROACH_CENTER_OFFSET_DEG:
-                                turn_deg = offset_deg
-                    elif position == "left":
-                        turn_deg = reacquire_step_deg
-                    elif position == "right":
-                        turn_deg = -reacquire_step_deg
-
-                    if abs(turn_deg) > 1e-6:
-                        await _turn_by_degrees(motion, turn_deg, _APPROACH_TURN_SPEED)
-                        await asyncio.sleep(_SEARCH_FRAME_SETTLE_S)
-
-                    collision_raw = await lidar.call_tool(
-                        "tbot_lidar_check_collision",
-                        {"front_threshold_m": stop_distance_m},
-                    )
-                    collision_data = _extract_tool_result_dict(collision_raw)
-                    if collision_data.get("risk_level") == "stop":
-                        front_dist = None
-                        distances = collision_data.get("distances")
-                        if isinstance(distances, dict):
-                            front_raw = distances.get("front")
-                            if isinstance(front_raw, (int, float)):
-                                front_dist = float(front_raw)
-                        await _safe_motion_stop(motion)
-                        return {
-                            "status": "collision_blocked",
-                            "object_name": object_name_clean,
-                            "target_distance_m": float(target_distance_m),
-                            "final_front_distance_m": front_dist,
-                            "phases": counters,
-                            "last_detection": last_detection,
-                            "history_summary": {
-                                "had_lost_target": had_lost_target,
-                                "errors_count": len(errors),
-                            },
-                            "timing_s": time.monotonic() - started,
-                            "errors": errors or None,
-                        }
-
-                    forward_raw = await motion.call_tool(
-                        "tbot_motion_move_forward",
-                        {
-                            "speed": forward_speed,
-                            "duration_seconds": forward_step_s,
-                        },
-                    )
-                    forward_result = _extract_tool_result_dict(forward_raw)
-                    counters["forward_segments"] += 1
-
-                    if forward_result.get("status") == "collision_risk":
-                        await _safe_motion_stop(motion)
-                        return {
-                            "status": "collision_blocked",
-                            "object_name": object_name_clean,
-                            "target_distance_m": float(target_distance_m),
-                            "final_front_distance_m": forward_result.get("front_distance"),
-                            "phases": counters,
-                            "last_detection": last_detection,
-                            "history_summary": {
-                                "had_lost_target": had_lost_target,
-                                "errors_count": len(errors),
-                            },
-                            "timing_s": time.monotonic() - started,
-                            "errors": errors or None,
-                        }
-
+                    # 1) Estimate front distance first.
                     lidar_raw = await lidar.call_tool(
                         "tbot_lidar_get_obstacle_distances",
                         {"sector": "front"},
@@ -754,6 +635,196 @@ async def tbot_vision_search_and_approach_object(
                             "timing_s": time.monotonic() - started,
                             "errors": errors or None,
                         }
+
+                    if front_distance is not None and front_distance <= close_enough_m:
+                        await _safe_motion_stop(motion)
+                        return {
+                            "status": "collision_blocked",
+                            "object_name": object_name_clean,
+                            "target_distance_m": float(target_distance_m),
+                            "final_front_distance_m": front_distance,
+                            "phases": counters,
+                            "last_detection": last_detection,
+                            "history_summary": {
+                                "had_lost_target": had_lost_target,
+                                "errors_count": len(errors),
+                            },
+                            "timing_s": time.monotonic() - started,
+                            "errors": errors or None,
+                        }
+
+                    # 2) Keep low-sensitivity collision guard (~10 cm) right before forward motion.
+                    collision_raw = await lidar.call_tool(
+                        "tbot_lidar_check_collision",
+                        {"front_threshold_m": close_enough_m},
+                    )
+                    collision_data = _extract_tool_result_dict(collision_raw)
+                    if collision_data.get("risk_level") == "stop":
+                        blocked_front = None
+                        distances = collision_data.get("distances")
+                        if isinstance(distances, dict):
+                            front_raw = distances.get("front")
+                            if isinstance(front_raw, (int, float)):
+                                blocked_front = float(front_raw)
+                        await _safe_motion_stop(motion)
+                        return {
+                            "status": "collision_blocked",
+                            "object_name": object_name_clean,
+                            "target_distance_m": float(target_distance_m),
+                            "final_front_distance_m": blocked_front,
+                            "phases": counters,
+                            "last_detection": last_detection,
+                            "history_summary": {
+                                "had_lost_target": had_lost_target,
+                                "errors_count": len(errors),
+                            },
+                            "timing_s": time.monotonic() - started,
+                            "errors": errors or None,
+                        }
+
+                    # 3) Estimate how long to move using LiDAR distance.
+                    segment_duration = float(forward_step_s)
+                    if front_distance is not None:
+                        safe_travel_m = max(0.0, front_distance - close_enough_m)
+                        max_duration_by_lidar = safe_travel_m / max(0.01, forward_speed)
+                        if max_duration_by_lidar <= 0:
+                            await _safe_motion_stop(motion)
+                            return {
+                                "status": "collision_blocked",
+                                "object_name": object_name_clean,
+                                "target_distance_m": float(target_distance_m),
+                                "final_front_distance_m": front_distance,
+                                "phases": counters,
+                                "last_detection": last_detection,
+                                "history_summary": {
+                                    "had_lost_target": had_lost_target,
+                                    "errors_count": len(errors),
+                                },
+                                "timing_s": time.monotonic() - started,
+                                "errors": errors or None,
+                            }
+                        segment_duration = min(segment_duration, max_duration_by_lidar)
+                    segment_duration = max(0.1, segment_duration)
+
+                    forward_raw = await motion.call_tool(
+                        "tbot_motion_move_forward",
+                        {
+                            "speed": forward_speed,
+                            "duration_seconds": segment_duration,
+                        },
+                    )
+                    forward_result = _extract_tool_result_dict(forward_raw)
+                    counters["forward_segments"] += 1
+
+                    if forward_result.get("status") == "collision_risk":
+                        await _safe_motion_stop(motion)
+                        return {
+                            "status": "collision_blocked",
+                            "object_name": object_name_clean,
+                            "target_distance_m": float(target_distance_m),
+                            "final_front_distance_m": forward_result.get("front_distance"),
+                            "phases": counters,
+                            "last_detection": last_detection,
+                            "history_summary": {
+                                "had_lost_target": had_lost_target,
+                                "errors_count": len(errors),
+                            },
+                            "timing_s": time.monotonic() - started,
+                            "errors": errors or None,
+                        }
+
+                    # 4) After forward motion, verify target is still visible.
+                    detection = await tbot_vision_find_object(object_name_clean)
+                    counters["vision_checks"] += 1
+                    last_detection = {
+                        "visible": bool(detection.get("visible", False)),
+                        "confidence": float(detection.get("confidence", 0.0) or 0.0),
+                        "position": detection.get("position"),
+                        "bbox": detection.get("bbox"),
+                    }
+
+                    if _is_detection_good(detection, min_confidence):
+                        position = detection.get("position")
+                        bbox = detection.get("bbox")
+                        turn_deg = 0.0
+                        if isinstance(bbox, dict):
+                            cx_raw = bbox.get("cx")
+                            if isinstance(cx_raw, (int, float)):
+                                offset_deg = (float(cx_raw) - 0.5) * CAMERA_HFOV_DEG
+                                if abs(offset_deg) > _APPROACH_CENTER_OFFSET_DEG:
+                                    turn_deg = offset_deg
+                        elif position == "left":
+                            turn_deg = reacquire_step_deg
+                        elif position == "right":
+                            turn_deg = -reacquire_step_deg
+
+                        if abs(turn_deg) > 1e-6:
+                            await _turn_by_degrees(motion, turn_deg, _APPROACH_TURN_SPEED)
+                            await asyncio.sleep(_SEARCH_FRAME_SETTLE_S)
+                        continue
+
+                    had_lost_target = True
+                    counters["reacquire_attempts"] += 1
+
+                    local_detection, local_checks = await _local_reacquire_object(
+                        motion=motion,
+                        object_name=object_name_clean,
+                        min_confidence=min_confidence,
+                        local_steps=reacquire_local_steps,
+                        step_deg=reacquire_step_deg,
+                        turn_speed=_APPROACH_TURN_SPEED,
+                    )
+                    counters["vision_checks"] += local_checks
+                    if local_detection is not None:
+                        last_detection = {
+                            "visible": True,
+                            "confidence": float(local_detection.get("confidence", 0.0) or 0.0),
+                            "position": local_detection.get("position"),
+                            "bbox": local_detection.get("bbox"),
+                        }
+                        continue
+
+                    # User-requested safety fallback: if target is lost, verify if we are already ~10 cm away.
+                    lost_lidar_raw = await lidar.call_tool(
+                        "tbot_lidar_get_obstacle_distances",
+                        {"sector": "front"},
+                    )
+                    lost_lidar_data = _extract_tool_result_dict(lost_lidar_raw)
+                    lost_front_distance = _front_distance_from_lidar(lost_lidar_data)
+                    if lost_front_distance is not None and lost_front_distance <= close_enough_m:
+                        await _safe_motion_stop(motion)
+                        return {
+                            "status": "reached",
+                            "object_name": object_name_clean,
+                            "target_distance_m": float(target_distance_m),
+                            "final_front_distance_m": lost_front_distance,
+                            "phases": counters,
+                            "last_detection": last_detection,
+                            "history_summary": {
+                                "had_lost_target": had_lost_target,
+                                "errors_count": len(errors),
+                            },
+                            "timing_s": time.monotonic() - started,
+                            "errors": errors or None,
+                        }
+
+                    broad_rescan = await tbot_vision_search_object(
+                        object_name=object_name_clean,
+                        min_confidence=min_confidence,
+                        max_steps=initial_search_max_steps,
+                    )
+                    counters["search_steps"] += int(broad_rescan.get("steps_taken") or 0)
+                    if broad_rescan.get("found", False):
+                        last_detection = {
+                            "visible": True,
+                            "confidence": float(broad_rescan.get("confidence", 0.0) or 0.0),
+                            "position": broad_rescan.get("position"),
+                            "bbox": broad_rescan.get("bbox"),
+                        }
+                        continue
+
+                    errors.append("reacquire_scan_not_found")
+                    await asyncio.sleep(_SEARCH_FRAME_SETTLE_S)
             except Exception as e:
                 await _safe_motion_stop(motion)
                 return {

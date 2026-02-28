@@ -274,7 +274,7 @@ def test_search_and_approach_reaches_target_distance():
 
     assert result["status"] == "reached"
     assert result["phases"]["search_steps"] == 2
-    assert result["phases"]["forward_segments"] == 2
+    assert result["phases"]["forward_segments"] == 1
     assert result["final_front_distance_m"] == pytest.approx(0.45)
     assert any(name == "tbot_motion_stop" for name, _ in state["motion_calls"])
 
@@ -282,7 +282,10 @@ def test_search_and_approach_reaches_target_distance():
 def test_search_and_approach_lost_then_reacquires_locally():
     state = _make_approach_state()
     state["forward_results"] = [{"status": "completed"}]
-    state["lidar_results"] = [{"status": "ok", "distance_m": 0.4, "distances": {"front": 0.4}}]
+    state["lidar_results"] = [
+        {"status": "ok", "distance_m": 0.9, "distances": {"front": 0.9}},
+        {"status": "ok", "distance_m": 0.4, "distances": {"front": 0.4}},
+    ]
 
     def fake_client(url: str):
         return _FakeApproachClient(url, state)
@@ -319,6 +322,7 @@ def test_search_and_approach_lost_then_reacquires_locally():
 def test_search_and_approach_returns_collision_blocked():
     state = _make_approach_state()
     state["forward_results"] = [{"status": "collision_risk", "front_distance": 0.22}]
+    state["lidar_results"] = [{"status": "ok", "distance_m": 0.9, "distances": {"front": 0.9}}]
 
     def fake_client(url: str):
         return _FakeApproachClient(url, state)
