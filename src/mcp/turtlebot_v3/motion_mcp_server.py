@@ -672,11 +672,13 @@ async def tbot_motion_approach_until_close(
     timeout_s: float = 30.0,
 ) -> dict[str, Any]:
     """
-    Move forward until the front obstacle is within target_distance_m.
+    Move forward continuously until LiDAR reports target distance reached.
+
+    This uses continuous cmd_vel streaming (not discrete forward re-posts), and
+    LiDAR is used only to decide when to stop.
 
     stop_distance_m is passed as front_threshold_m to tbot_lidar_check_collision.
     If risk_level is "stop", halts and returns collision_risk.
-    If risk_level is "caution", stops, nudges ~10 degrees, then resumes.
     Returns status: "reached" | "collision_risk" | "timeout".
     """
     target_dist = _validate_finite("target_distance_m", target_distance_m)
@@ -697,31 +699,20 @@ async def tbot_motion_approach_until_close(
 
     await _set_continuous_motion(None)
 
-    # Nudge parameters: ~10 degrees at a low angular speed
-    nudge_speed = min(0.5, MAX_ANGULAR)
-    nudge_angular_cmd = nudge_speed * ANGULAR_SIGN
-    nudge_duration_s = (10.0 * math.pi / 180.0) / max(0.01, nudge_speed)
-
     start_mono = time.monotonic()
     final_distance_m: float | None = None
-    move_posts = 0
+    collision_checks = 0
+    consecutive_lidar_failures = 0
+    final_status = "timeout"
 
     try:
         async with Client(LIDAR_MCP_URL_V3) as lidar:
+            await _set_continuous_motion(clamped_speed, 0.0)
             while True:
                 elapsed = time.monotonic() - start_mono
                 if elapsed >= timeout_f:
-                    await _post_json(STOP_PATH)
-                    return {
-                        "status": "timeout",
-                        "front_distance": final_distance_m,
-                        "move_posts": move_posts,
-                        "command_refresh_s": MOTION_COMMAND_REFRESH_S,
-                    }
-
-                # Re-post the forward command so backends that need keepalive updates keep moving.
-                await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
-                move_posts += 1
+                    final_status = "timeout"
+                    break
 
                 # Check collision risk
                 try:
@@ -730,6 +721,7 @@ async def tbot_motion_approach_until_close(
                         {"front_threshold_m": stop_dist},
                     )
                     collision_data = _extract_tool_dict(collision_result)
+                    collision_checks += 1
                     risk_level = collision_data.get("risk_level", "clear")
                     distances = collision_data.get("distances", {})
                     if isinstance(distances, dict):
@@ -737,28 +729,15 @@ async def tbot_motion_approach_until_close(
                         if front_raw is not None:
                             try:
                                 final_distance_m = float(front_raw)
+                                consecutive_lidar_failures = 0
                             except (TypeError, ValueError):
                                 pass
 
                     if risk_level == "stop":
-                        await _post_json(STOP_PATH)
-                        return {
-                            "status": "collision_risk",
-                            "front_distance": final_distance_m,
-                            "move_posts": move_posts,
-                            "command_refresh_s": MOTION_COMMAND_REFRESH_S,
-                        }
-
-                    if risk_level == "caution":
-                        await _post_json(STOP_PATH)
-                        # Nudge: small rotation to attempt repositioning
-                        await _post_json(MOVE_PATH, {"linear": 0.0, "angular": nudge_angular_cmd})
-                        await asyncio.sleep(nudge_duration_s)
-                        await _post_json(STOP_PATH)
-                        # Resume forward motion
-                        await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
+                        final_status = "collision_risk"
+                        break
                 except Exception:
-                    pass
+                    consecutive_lidar_failures += 1
 
                 # Check target distance
                 try:
@@ -772,27 +751,50 @@ async def tbot_motion_approach_until_close(
                         try:
                             front_dist = float(dist_raw)
                             final_distance_m = front_dist
+                            consecutive_lidar_failures = 0
                             if front_dist <= target_dist:
-                                await _post_json(STOP_PATH)
-                                return {
-                                    "status": "reached",
-                                    "front_distance": final_distance_m,
-                                    "move_posts": move_posts,
-                                    "command_refresh_s": MOTION_COMMAND_REFRESH_S,
-                                }
+                                final_status = "reached"
+                                break
                         except (TypeError, ValueError):
                             pass
                 except Exception:
-                    pass
+                    consecutive_lidar_failures += 1
 
                 await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
-
-    except Exception:
+    except Exception as e:
         try:
+            await _set_continuous_motion(None)
             await _post_json(STOP_PATH)
         except Exception:
             pass
-        raise
+        return {
+            "status": "error",
+            "front_distance": final_distance_m,
+            "collision_checks": collision_checks,
+            "consecutive_lidar_failures": consecutive_lidar_failures,
+            "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+            "error": str(e),
+        }
+    finally:
+        try:
+            await _set_continuous_motion(None)
+        except Exception:
+            pass
+
+    stop_result = await _post_json(STOP_PATH)
+    elapsed_total = min(timeout_f, max(0.0, time.monotonic() - start_mono))
+    estimated_move_posts = max(1, int(math.ceil(elapsed_total / MOTION_COMMAND_REFRESH_S)))
+
+    return {
+        **stop_result,
+        "status": final_status,
+        "front_distance": final_distance_m,
+        "speed": clamped_speed,
+        "move_posts": estimated_move_posts,
+        "collision_checks": collision_checks,
+        "consecutive_lidar_failures": consecutive_lidar_failures,
+        "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+    }
 
 
 def run(

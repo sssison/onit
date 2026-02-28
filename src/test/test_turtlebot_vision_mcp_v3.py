@@ -279,10 +279,10 @@ class _FakeApproachClient:
     async def call_tool(self, name: str, payload: dict[str, Any]):
         if self._url == vision_v3.MOTION_MCP_URL_V3:
             self._state["motion_calls"].append((name, payload))
-            if name == "tbot_motion_move_forward":
-                if not self._state["forward_results"]:
-                    raise AssertionError("No mocked forward results left")
-                return self._state["forward_results"].pop(0)
+            if name == "tbot_motion_approach_until_close":
+                if not self._state["approach_results"]:
+                    raise AssertionError("No mocked approach results left")
+                return self._state["approach_results"].pop(0)
             if name in ("tbot_motion_turn", "tbot_motion_stop"):
                 return {"status": "ok"}
             raise AssertionError(f"Unexpected motion tool call: {name}")
@@ -306,7 +306,7 @@ def _make_approach_state() -> dict[str, Any]:
     return {
         "motion_calls": [],
         "lidar_calls": [],
-        "forward_results": [],
+        "approach_results": [],
         "collision_results": [],
         "lidar_results": [],
     }
@@ -314,7 +314,7 @@ def _make_approach_state() -> dict[str, Any]:
 
 def test_search_and_approach_reaches_target_distance():
     state = _make_approach_state()
-    state["forward_results"] = [{"status": "completed"}]
+    state["approach_results"] = [{"status": "reached", "front_distance": 0.45, "move_posts": 4}]
     state["lidar_results"] = [
         {"status": "ok", "distance_m": 0.9, "distances": {"front": 0.9}},
         {"status": "ok", "distance_m": 0.45, "distances": {"front": 0.45}},
@@ -352,7 +352,7 @@ def test_search_and_approach_reaches_target_distance():
     assert result["phases"]["reposition_turns"] == 0
     assert result["phases"]["forward_segments"] == 1
     assert result["final_front_distance_m"] == pytest.approx(0.45)
-    assert len([name for name, _ in state["motion_calls"] if name == "tbot_motion_move_forward"]) == 1
+    assert len([name for name, _ in state["motion_calls"] if name == "tbot_motion_approach_until_close"]) == 1
     assert any(name == "tbot_motion_stop" for name, _ in state["motion_calls"])
     assert reposition_mock.await_count == 2
 
@@ -394,13 +394,13 @@ def test_search_and_approach_reached_without_forward_when_already_close():
     assert result["status"] == "reached"
     assert result["phases"]["forward_segments"] == 0
     assert result["phases"]["verification_scans"] == 1
-    assert len([name for name, _ in state["motion_calls"] if name == "tbot_motion_move_forward"]) == 0
+    assert len([name for name, _ in state["motion_calls"] if name == "tbot_motion_approach_until_close"]) == 0
     assert reposition_mock.await_count == 1
 
 
 def test_search_and_approach_verification_failed_after_one_forward():
     state = _make_approach_state()
-    state["forward_results"] = [{"status": "completed"}]
+    state["approach_results"] = [{"status": "reached", "front_distance": 0.5, "move_posts": 3}]
     state["lidar_results"] = [{"status": "ok", "distance_m": 0.9, "distances": {"front": 0.9}}]
 
     def fake_client(url: str):
@@ -433,13 +433,13 @@ def test_search_and_approach_verification_failed_after_one_forward():
     assert result["phases"]["forward_segments"] == 1
     assert result["phases"]["verification_scans"] == 2
     assert result["phases"]["reposition_turns"] == 4
-    assert len([name for name, _ in state["motion_calls"] if name == "tbot_motion_move_forward"]) == 1
+    assert len([name for name, _ in state["motion_calls"] if name == "tbot_motion_approach_until_close"]) == 1
     assert reposition_mock.await_count == 2
 
 
 def test_search_and_approach_returns_collision_blocked():
     state = _make_approach_state()
-    state["forward_results"] = [{"status": "collision_risk", "front_distance": 0.22}]
+    state["approach_results"] = [{"status": "collision_risk", "front_distance": 0.22, "move_posts": 1}]
     state["lidar_results"] = [{"status": "ok", "distance_m": 0.9, "distances": {"front": 0.9}}]
 
     def fake_client(url: str):

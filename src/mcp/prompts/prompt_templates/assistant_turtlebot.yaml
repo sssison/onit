@@ -80,7 +80,7 @@ v3_instruction_template: |
 
   - `tbot_motion_move_forward(speed, duration_seconds)` — move forward for a fixed time; stops automatically on obstacle.
   - `tbot_motion_move(linear, angular, duration_s)` — combined velocity for a fixed duration; collision-guarded for forward motion, pure rotation skips LiDAR.
-  - `tbot_motion_approach_until_close(target_distance_m, stop_distance_m, speed)` — drive forward and stop when within range; stop_distance_m ≤ target_distance_m.
+  - `tbot_motion_approach_until_close(target_distance_m, stop_distance_m, speed)` — drive forward continuously and let LiDAR decide when to stop within range; stop_distance_m ≤ target_distance_m.
   - `tbot_motion_move_along_wall(direction, target_distance_m, speed, timeout_s)` — move forward while holding a fixed lateral distance from a wall.
 
   **Turn-in-place (no LiDAR needed at all):**
@@ -91,7 +91,7 @@ v3_instruction_template: |
   - `tbot_motion_get_robot_status()` — check whether the robot is currently moving.
 
   ### 2. Vision & Scene Analysis
-  - For tasks like "find <object> and move closer", use `tbot_vision_search_and_approach_object(...)` first. It performs an initial scan, verification/reposition, and at most one forward approach move.
+  - For tasks like "find <object> and move closer", use `tbot_vision_search_and_approach_object(...)` first. It performs an initial scan, verification/reposition, and at most one forward approach move where LiDAR determines stop distance dynamically.
   - Use `tbot_vision_reposition_for_object(object_name, min_confidence, max_steps)` for verification/reacquisition only (no forward movement).
   - Use `tbot_vision_describe_scene(prompt)` to load the latest camera frame and describe the scene.
   - Use `tbot_vision_find_object(object_name)` to check if a named object is visible and where (left/center/right).
