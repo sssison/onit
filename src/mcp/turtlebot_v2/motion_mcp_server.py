@@ -34,6 +34,10 @@ HTTP_TIMEOUT_S = _env_float("MOTION_TIMEOUT_S", 2.0)
 MAX_LINEAR = abs(_env_float("MOTION_MAX_LINEAR", 0.2))
 MAX_ANGULAR = abs(_env_float("MOTION_MAX_ANGULAR", 1.0))
 ANGULAR_SIGN = _env_float("MOTION_ANGULAR_SIGN", -1.0)
+MOTION_COMMAND_REFRESH_S_RAW = _env_float("MOTION_COMMAND_REFRESH_S", 0.2)
+MOTION_COMMAND_REFRESH_S = (
+    MOTION_COMMAND_REFRESH_S_RAW if MOTION_COMMAND_REFRESH_S_RAW > 0 else 0.2
+)
 
 LIDAR_MCP_URL = os.getenv("TBOT_LIDAR_MCP_URL", "http://127.0.0.1:18208/turtlebot-lidar-v2")
 
@@ -82,6 +86,37 @@ def _invalidate_motion_commands() -> None:
     global _motion_command_version
     with _motion_command_lock:
         _motion_command_version += 1
+
+
+async def _post_move_for_duration(
+    linear: float,
+    angular: float,
+    duration_s: float,
+    command_version: int,
+) -> tuple[dict[str, Any] | None, int, bool]:
+    """
+    Keep reposting /move over duration_s for motion backends that require
+    periodic command refresh. Stops early if command is preempted.
+    """
+    start_mono = time.monotonic()
+    posts = 0
+    last_result: dict[str, Any] | None = None
+
+    while True:
+        elapsed = time.monotonic() - start_mono
+        if elapsed >= duration_s:
+            return last_result, posts, False
+
+        last_result = await _post_json(MOVE_PATH, {"linear": linear, "angular": angular})
+        posts += 1
+
+        remaining = duration_s - (time.monotonic() - start_mono)
+        if remaining <= 0:
+            return last_result, posts, False
+        await asyncio.sleep(min(MOTION_COMMAND_REFRESH_S, remaining))
+
+        if not _is_latest_motion_command(command_version):
+            return last_result, posts, True
 
 
 async def _post_json(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -177,22 +212,36 @@ async def tbot_motion_move(
     angular_cmd = angular_cmd_unmapped * ANGULAR_SIGN
 
     command_version = _reserve_motion_command()
-    result = await _post_json(MOVE_PATH, {"linear": linear_cmd, "angular": angular_cmd})
+    result: dict[str, Any] = {}
 
     if duration_s is not None:
         duration_f = _validate_finite("duration_s", duration_s)
         if duration_f > 0:
-            await asyncio.sleep(duration_f)
-            if _is_latest_motion_command(command_version):
+            move_result, posts, preempted = await _post_move_for_duration(
+                linear_cmd, angular_cmd, duration_f, command_version
+            )
+            if not preempted and _is_latest_motion_command(command_version):
                 await _post_json(STOP_PATH)
-                result = {**result, "auto_stopped": True, "duration_s": duration_f}
+                result = {
+                    **(move_result or {"status": "updated"}),
+                    "auto_stopped": True,
+                    "duration_s": duration_f,
+                    "move_posts": posts,
+                    "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+                }
             else:
                 result = {
-                    **result,
+                    **(move_result or {"status": "updated"}),
                     "auto_stopped": False,
                     "duration_s": duration_f,
                     "auto_stop_skipped_stale": True,
+                    "move_posts": posts,
+                    "command_refresh_s": MOTION_COMMAND_REFRESH_S,
                 }
+        else:
+            result = await _post_json(MOVE_PATH, {"linear": linear_cmd, "angular": angular_cmd})
+    else:
+        result = await _post_json(MOVE_PATH, {"linear": linear_cmd, "angular": angular_cmd})
 
     health, health_error = await _try_get_health()
     verification: dict[str, Any] = {
@@ -267,14 +316,27 @@ async def tbot_motion_scan_rotate(
     angular_cmd = math.copysign(clamped_speed, degrees_f) * ANGULAR_SIGN
 
     command_version = _reserve_motion_command()
-    await _post_json(MOVE_PATH, {"linear": 0.0, "angular": angular_cmd})
-    await asyncio.sleep(duration_s)
+    move_result, _, preempted = await _post_move_for_duration(
+        0.0, angular_cmd, duration_s, command_version
+    )
 
-    if _is_latest_motion_command(command_version):
+    if (not preempted) and _is_latest_motion_command(command_version):
         await _post_json(STOP_PATH)
-        return {"status": "completed", "degrees": degrees_f, "duration_s": duration_s, "angular_cmd": angular_cmd}
+        return {
+            **(move_result or {}),
+            "status": "completed",
+            "degrees": degrees_f,
+            "duration_s": duration_s,
+            "angular_cmd": angular_cmd,
+        }
 
-    return {"status": "preempted", "degrees": degrees_f, "duration_s": duration_s, "angular_cmd": angular_cmd}
+    return {
+        **(move_result or {}),
+        "status": "preempted",
+        "degrees": degrees_f,
+        "duration_s": duration_s,
+        "angular_cmd": angular_cmd,
+    }
 
 
 @mcp_motion_v2.tool()
@@ -298,8 +360,6 @@ async def tbot_motion_forward_until_close(
         clamped_speed = 0.05
 
     command_version = _reserve_motion_command()
-    await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
-
     start_mono = time.monotonic()
     stop_reason = "timeout"
     final_distance_m: float | None = None
@@ -314,6 +374,8 @@ async def tbot_motion_forward_until_close(
                 if not _is_latest_motion_command(command_version):
                     stop_reason = "preempted"
                     break
+
+                await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
                 try:
                     result = await lidar.call_tool("tbot_lidar_nearest_obstacle", {"sector": "front"})
                     data = _extract_tool_dict(result)

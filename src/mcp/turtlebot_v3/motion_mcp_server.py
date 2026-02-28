@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from typing import Any
 
@@ -48,8 +49,9 @@ STOP_PATH = "/stop"
 HEALTH_PATH = "/health"
 
 mcp_motion_v3 = FastMCP("TurtleBot Motion MCP Server V3")
-_continuous_motion_task: asyncio.Task[None] | None = None
-_continuous_motion_lock = asyncio.Lock()
+_continuous_motion_thread: threading.Thread | None = None
+_continuous_motion_stop_event: threading.Event | None = None
+_continuous_motion_lock = threading.Lock()
 
 
 def _validate_finite(name: str, value: float) -> float:
@@ -100,16 +102,35 @@ async def _post_move_for_duration(
     return last_result, posts
 
 
-async def _continuous_motion_loop(linear: float, angular: float) -> None:
+def _post_json_sync(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    url = f"{BASE_URL}{path}"
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
+            response = client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Unexpected response from {url}: expected JSON object")
+            return data
+    except httpx.HTTPStatusError as e:
+        body = e.response.text
+        raise RuntimeError(f"Motion server error {e.response.status_code} for {url}: {body[:4000]}") from e
+    except httpx.RequestError as e:
+        raise RuntimeError(f"Failed to reach motion server at {url}: {e}") from e
+
+
+def _continuous_motion_loop(linear: float, angular: float, stop_event: threading.Event) -> None:
     while True:
+        if stop_event.is_set():
+            return
         try:
-            await _post_json(MOVE_PATH, {"linear": linear, "angular": angular})
-            await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
-        except asyncio.CancelledError:
-            raise
+            _post_json_sync(MOVE_PATH, {"linear": linear, "angular": angular})
         except Exception as e:
             logger.warning("Continuous motion update failed: %s", e)
-            await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
+
+        # Use event.wait so stop requests interrupt the sleep immediately.
+        if stop_event.wait(MOTION_COMMAND_REFRESH_S):
+            return
 
 
 async def _set_continuous_motion(linear: float | None, angular: float = 0.0) -> bool:
@@ -117,25 +138,37 @@ async def _set_continuous_motion(linear: float | None, angular: float = 0.0) -> 
     Start or stop background /move keepalive updates.
     Returns True if a previous background stream existed and was replaced/stopped.
     """
-    global _continuous_motion_task
-    async with _continuous_motion_lock:
-        had_existing_stream = _continuous_motion_task is not None
-        if _continuous_motion_task is not None:
-            task = _continuous_motion_task
-            _continuous_motion_task = None
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.warning("Continuous motion task stop failed: %s", e)
+    global _continuous_motion_thread, _continuous_motion_stop_event
 
-        if linear is None:
-            return had_existing_stream
+    with _continuous_motion_lock:
+        old_thread = _continuous_motion_thread
+        old_stop_event = _continuous_motion_stop_event
+        had_existing_stream = old_thread is not None
+        _continuous_motion_thread = None
+        _continuous_motion_stop_event = None
 
-        _continuous_motion_task = asyncio.create_task(_continuous_motion_loop(linear, angular))
+    if old_stop_event is not None:
+        old_stop_event.set()
+    if old_thread is not None:
+        try:
+            await asyncio.to_thread(old_thread.join, 1.0)
+        except Exception as e:
+            logger.warning("Continuous motion thread stop failed: %s", e)
+
+    if linear is None:
         return had_existing_stream
+
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_continuous_motion_loop,
+        args=(linear, angular, stop_event),
+        daemon=True,
+    )
+    with _continuous_motion_lock:
+        _continuous_motion_thread = thread
+        _continuous_motion_stop_event = stop_event
+    thread.start()
+    return had_existing_stream
 
 
 async def _post_json(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
