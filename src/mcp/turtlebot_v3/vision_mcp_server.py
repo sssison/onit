@@ -4,6 +4,7 @@ TurtleBot Vision MCP Server V3.
 Reads frames directly from /dev/shm/latest_frame.jpg — no ROS dependency.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -12,7 +13,7 @@ import os
 import re
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
 from openai import APITimeoutError, AsyncOpenAI, OpenAIError
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,11 @@ DEFAULT_VISION_MODEL = os.getenv("TBOT_VISION_MODEL", "Qwen/Qwen3.5-35B-A3B")
 DEFAULT_VISION_API_KEY = os.getenv("TBOT_VISION_API_KEY", "EMPTY")
 VISION_TIMEOUT_S = _env_float("TBOT_VISION_TIMEOUT_S", 60.0)
 CAMERA_HFOV_DEG = _env_float("CAMERA_HFOV_DEG", 62.0)
+MOTION_MCP_URL_V3 = os.getenv("TBOT_MOTION_MCP_URL_V3", "http://127.0.0.1:18210/turtlebot-motion-v3")
+
+_SEARCH_STEP_DEG = 10.0
+_SEARCH_ANGULAR_SPEED = 0.3   # rad/s — speed used for each 10° rotation step
+_SEARCH_FRAME_SETTLE_S = 0.3  # seconds to wait after rotation for a fresh frame
 
 
 def _resolve_api_key(host: str) -> str:
@@ -313,6 +319,83 @@ async def tbot_vision_find_object(object_name: str) -> dict[str, Any]:
         "confidence": confidence,
         "bbox": bbox,
         "model_info": model_info,
+    }
+
+
+@mcp_vision_v3.tool()
+async def tbot_vision_search_object(
+    object_name: str,
+    min_confidence: float = 0.5,
+    max_steps: int = 36,
+) -> dict[str, Any]:
+    """
+    Rotate the robot in 10-degree steps and search for a named object.
+
+    Checks the current frame first, then rotates left (CCW) 10° at a time until the
+    object is found or max_steps rotations have been completed (default 36 = full 360°).
+
+    min_confidence: minimum confidence threshold (0–1) to accept a detection as found.
+    max_steps: maximum number of 10° rotation steps before giving up (default 36 = 360°).
+
+    Returns {"found": bool, "position": "left"|"center"|"right"|null, "confidence": float,
+             "bbox": ..., "steps_taken": int, "degrees_rotated": float}.
+    """
+    object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
+    if not object_name_clean:
+        raise ValueError("object_name must be a non-empty string")
+    if not (0.0 < min_confidence <= 1.0):
+        raise ValueError("min_confidence must be between 0 (exclusive) and 1 (inclusive)")
+    if max_steps < 1:
+        raise ValueError("max_steps must be >= 1")
+
+    step_rad = _SEARCH_STEP_DEG * math.pi / 180.0
+    step_duration_s = step_rad / _SEARCH_ANGULAR_SPEED
+    motion_url = os.getenv("TBOT_MOTION_MCP_URL_V3", MOTION_MCP_URL_V3)
+
+    steps_taken = 0
+    last_model_info: dict[str, Any] | None = None
+
+    async with Client(motion_url) as motion:
+        for step in range(max_steps + 1):
+            # Check current frame before rotating
+            vision_result = await tbot_vision_find_object(object_name_clean)
+            last_model_info = vision_result.get("model_info")
+
+            if vision_result["visible"] and (vision_result["confidence"] or 0.0) >= min_confidence:
+                try:
+                    await motion.call_tool("tbot_motion_stop", {})
+                except Exception:
+                    pass
+                return {
+                    "found": True,
+                    "position": vision_result["position"],
+                    "confidence": vision_result["confidence"],
+                    "bbox": vision_result["bbox"],
+                    "steps_taken": steps_taken,
+                    "degrees_rotated": steps_taken * _SEARCH_STEP_DEG,
+                    "model_info": last_model_info,
+                }
+
+            if step == max_steps:
+                break
+
+            # Rotate 10° left; duration_s causes auto-stop after the step
+            await motion.call_tool(
+                "tbot_motion_move",
+                {"linear": 0.0, "angular": _SEARCH_ANGULAR_SPEED, "duration_s": step_duration_s},
+            )
+            steps_taken += 1
+            # Wait for the camera frame to update after rotation
+            await asyncio.sleep(_SEARCH_FRAME_SETTLE_S)
+
+    return {
+        "found": False,
+        "position": None,
+        "confidence": 0.0,
+        "bbox": None,
+        "steps_taken": steps_taken,
+        "degrees_rotated": steps_taken * _SEARCH_STEP_DEG,
+        "model_info": last_model_info,
     }
 
 
