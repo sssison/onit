@@ -436,6 +436,77 @@ async def tbot_lidar_check_collision(
     return {"risk_level": risk_level, "distances": distances}
 
 
+@mcp_lidar_v3.tool()
+async def tbot_lidar_find_clear_path(
+    min_gap_width_m: float = 0.5,
+    clearance_threshold_m: float = 1.0,
+) -> dict[str, Any]:
+    """
+    Find navigable gaps in the current LiDAR scan.
+
+    min_gap_width_m: only report gaps at least this wide (arc-length approximation).
+    clearance_threshold_m: a range reading must be >= this value to be counted as clear.
+
+    Returns {"gaps": [...], "best_gap": {...}|null} where each gap has
+    {"heading_degrees": float, "width_m": float, "center_distance_m": float}.
+    Heading convention matches _SECTOR_CENTERS: 0° = forward, 90° = left, -90° = right.
+    """
+    try:
+        scan = await _get_one_scan()
+    except Exception as e:
+        return {"gaps": [], "best_gap": None, "error": str(e)}
+
+    ranges = scan["ranges"]
+    range_min = float(scan["range_min"])
+    range_max = float(scan["range_max"])
+    angle_increment_rad = float(scan["angle_increment"])
+    n = len(ranges)
+
+    # Mark each index as clear or occupied
+    clear = [
+        _is_valid_range(ranges[i], range_min, range_max) and ranges[i] >= clearance_threshold_m
+        for i in range(n)
+    ]
+
+    # Group consecutive clear indices into gap runs
+    runs: list[tuple[int, int]] = []
+    in_run = False
+    run_start = 0
+    for i in range(n):
+        if clear[i]:
+            if not in_run:
+                run_start = i
+                in_run = True
+        else:
+            if in_run:
+                runs.append((run_start, i - 1))
+                in_run = False
+    if in_run:
+        runs.append((run_start, n - 1))
+
+    # Compute gap fields for each run
+    gaps: list[dict[str, Any]] = []
+    for start_idx, end_idx in runs:
+        indices = range(start_idx, end_idx + 1)
+        angles_deg = [_angle_for_index_deg(scan, i) for i in indices]
+        clear_ranges = [float(ranges[i]) for i in indices]
+        center_distance_m = sum(clear_ranges) / len(clear_ranges)
+        heading_degrees = (angles_deg[0] + angles_deg[-1]) / 2.0
+        angle_span_rad = len(clear_ranges) * angle_increment_rad
+        width_m = angle_span_rad * center_distance_m
+
+        if width_m >= min_gap_width_m:
+            gaps.append({
+                "heading_degrees": heading_degrees,
+                "width_m": width_m,
+                "center_distance_m": center_distance_m,
+            })
+
+    gaps.sort(key=lambda g: g["width_m"], reverse=True)
+    best_gap = gaps[0] if gaps else None
+    return {"gaps": gaps, "best_gap": best_gap}
+
+
 def run(
     transport: str = "streamable-http",
     host: str = "0.0.0.0",

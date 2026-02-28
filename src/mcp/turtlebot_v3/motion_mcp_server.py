@@ -36,6 +36,9 @@ ANGULAR_SIGN = _env_float("MOTION_ANGULAR_SIGN", -1.0)
 
 LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
 
+WALL_FOLLOW_KP = _env_float("WALL_FOLLOW_KP", 2.0)
+WALL_FOLLOW_MAX_ANGULAR = _env_float("WALL_FOLLOW_MAX_ANGULAR", 0.5)
+
 MOVE_PATH = "/move"
 STOP_PATH = "/stop"
 HEALTH_PATH = "/health"
@@ -167,8 +170,31 @@ async def tbot_motion_move_forward(
         raise ValueError("duration_seconds must be > 0")
 
     clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
-    await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
-    await asyncio.sleep(duration_f)
+    start_mono = time.monotonic()
+
+    async with Client(LIDAR_MCP_URL_V3) as lidar:
+        while True:
+            elapsed = time.monotonic() - start_mono
+            if elapsed >= duration_f:
+                break
+
+            try:
+                raw = await lidar.call_tool("tbot_lidar_check_collision", {})
+                collision = _extract_tool_dict(raw)
+            except Exception:
+                collision = {}
+
+            risk_level = collision.get("risk_level", "clear")
+            front_dist = (collision.get("distances") or {}).get("front")
+
+            if risk_level == "stop":
+                await _post_json(STOP_PATH)
+                return {"status": "collision_risk", "front_distance": front_dist}
+
+            effective_speed = clamped_speed * 0.5 if risk_level == "caution" else clamped_speed
+            await _post_json(MOVE_PATH, {"linear": effective_speed, "angular": 0.0})
+            await asyncio.sleep(0.2)
+
     stop_result = await _post_json(STOP_PATH)
     return {
         **stop_result,
@@ -177,6 +203,76 @@ async def tbot_motion_move_forward(
         "duration_seconds": duration_f,
         "was_clamped": abs(speed_f) != clamped_speed,
     }
+
+
+@mcp_motion_v3.tool()
+async def tbot_motion_move_along_wall(
+    direction: str,
+    target_distance_m: float,
+    speed: float = 0.15,
+    timeout_s: float = 30.0,
+    stop_distance_m: float = 0.4,
+) -> dict[str, Any]:
+    """
+    Move forward while maintaining a fixed lateral distance from a wall.
+
+    direction: "left" or "right" — which wall to follow.
+    target_distance_m: desired lateral distance from the wall in metres.
+    speed: forward speed in m/s (clamped to MAX_LINEAR).
+    timeout_s: stop and return after this many seconds.
+    stop_distance_m: stop when a front obstacle is closer than this distance.
+
+    Returns {"status": "obstacle_reached"|"timeout", "distance_traveled_ticks": int}.
+    """
+    direction_clean = direction.strip().lower() if isinstance(direction, str) else ""
+    if direction_clean not in ("left", "right"):
+        raise ValueError(f"direction must be 'left' or 'right', got {direction!r}")
+
+    target_dist = _validate_finite("target_distance_m", target_distance_m)
+    speed_f = _validate_finite("speed", speed)
+    timeout_f = _validate_finite("timeout_s", timeout_s)
+    stop_dist = _validate_finite("stop_distance_m", stop_distance_m)
+
+    if target_dist <= 0:
+        raise ValueError("target_distance_m must be > 0")
+    if timeout_f <= 0:
+        raise ValueError("timeout_s must be > 0")
+    if stop_dist <= 0:
+        raise ValueError("stop_distance_m must be > 0")
+
+    clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
+    wall_sign = 1.0 if direction_clean == "left" else -1.0
+    start_mono = time.monotonic()
+    ticks = 0
+
+    async with Client(LIDAR_MCP_URL_V3) as lidar:
+        while True:
+            if time.monotonic() - start_mono >= timeout_f:
+                await _post_json(STOP_PATH)
+                return {"status": "timeout", "distance_traveled_ticks": ticks}
+
+            try:
+                raw = await lidar.call_tool("tbot_lidar_get_obstacle_distances", {"sector": "all"})
+                distances = _extract_tool_dict(raw).get("distances", {})
+            except Exception:
+                distances = {}
+
+            front_dist = distances.get("front")
+            lateral_dist = distances.get(direction_clean)
+
+            if front_dist is not None and front_dist <= stop_dist:
+                await _post_json(STOP_PATH)
+                return {"status": "obstacle_reached", "distance_traveled_ticks": ticks}
+
+            if lateral_dist is not None:
+                error = lateral_dist - target_dist
+                angular_correction = _clamp(wall_sign * WALL_FOLLOW_KP * error, WALL_FOLLOW_MAX_ANGULAR)
+            else:
+                angular_correction = 0.0
+
+            await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": angular_correction})
+            ticks += 1
+            await asyncio.sleep(0.2)
 
 
 @mcp_motion_v3.tool()

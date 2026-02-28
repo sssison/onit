@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import re
+import time
 from typing import Any
 
 from fastmcp import Client, FastMCP
@@ -42,6 +43,9 @@ MOTION_MCP_URL_V3 = os.getenv("TBOT_MOTION_MCP_URL_V3", "http://127.0.0.1:18210/
 _SEARCH_STEP_DEG = 10.0
 _SEARCH_ANGULAR_SPEED = 0.3   # rad/s — speed used for each 10° rotation step
 _SEARCH_FRAME_SETTLE_S = 0.3  # seconds to wait after rotation for a fresh frame
+
+_LINE_FOLLOW_SPEED = _env_float("LINE_FOLLOW_SPEED", 0.1)
+_LINE_FOLLOW_ANGULAR = _env_float("LINE_FOLLOW_ANGULAR", 0.3)
 
 
 def _resolve_api_key(host: str) -> str:
@@ -397,6 +401,107 @@ async def tbot_vision_search_object(
         "degrees_rotated": steps_taken * _SEARCH_STEP_DEG,
         "model_info": last_model_info,
     }
+
+
+@mcp_vision_v3.tool()
+async def tbot_vision_follow_line(
+    color: str = "black",
+    timeout_s: float = 30.0,
+) -> dict[str, Any]:
+    """
+    Follow a colored line on the floor using the camera and LLM perception.
+
+    color: the color of the line to follow (e.g. "black", "red", "yellow").
+    timeout_s: stop and return after this many seconds.
+
+    Returns {"status": "line_lost"|"timeout", "ticks_followed": int}.
+    """
+    color_clean = color.strip() if isinstance(color, str) else ""
+    if not color_clean:
+        raise ValueError("color must be a non-empty string")
+
+    timeout_f = float(timeout_s)
+    if timeout_f <= 0:
+        raise ValueError("timeout_s must be > 0")
+
+    start_mono = time.monotonic()
+    ticks_followed = 0
+    motion_url = os.getenv("TBOT_MOTION_MCP_URL_V3", MOTION_MCP_URL_V3)
+
+    system_prompt = "Return only JSON with keys: visible (boolean), offset ('left'|'center'|'right'|null)."
+    user_prompt = (
+        f"Is there a {color_clean} colored line on the floor? "
+        "If yes, is the line to the left, center, or right of the image center?"
+    )
+
+    async with Client(motion_url) as motion:
+        while True:
+            if time.monotonic() - start_mono >= timeout_f:
+                try:
+                    await motion.call_tool("tbot_motion_stop", {})
+                except Exception:
+                    pass
+                return {"status": "timeout", "ticks_followed": ticks_followed}
+
+            frame_path = os.getenv("TBOT_FRAME_PATH", FRAME_PATH)
+            host = os.getenv("TBOT_VISION_HOST", DEFAULT_VISION_HOST)
+            model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
+
+            try:
+                image_b64 = _load_frame_as_base64(frame_path)
+            except Exception:
+                try:
+                    await motion.call_tool("tbot_motion_stop", {})
+                except Exception:
+                    pass
+                return {"status": "line_lost", "ticks_followed": ticks_followed}
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                    ],
+                },
+            ]
+
+            parsed: dict[str, Any] = {}
+            try:
+                client = AsyncOpenAI(base_url=host, api_key=_resolve_api_key(host))
+                completion = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    timeout=VISION_TIMEOUT_S,
+                )
+                raw_response = completion.choices[0].message.content or ""
+                parsed = _extract_first_json_object(raw_response) or {}
+            except (APITimeoutError, OpenAIError, Exception):
+                parsed = {}
+
+            visible = bool(parsed.get("visible", False))
+            offset = parsed.get("offset")
+
+            if not visible:
+                try:
+                    await motion.call_tool("tbot_motion_stop", {})
+                except Exception:
+                    pass
+                return {"status": "line_lost", "ticks_followed": ticks_followed}
+
+            if offset == "left":
+                angular = _LINE_FOLLOW_ANGULAR
+            elif offset == "right":
+                angular = -_LINE_FOLLOW_ANGULAR
+            else:
+                angular = 0.0
+
+            await motion.call_tool(
+                "tbot_motion_move",
+                {"linear": _LINE_FOLLOW_SPEED, "angular": angular},
+            )
+            ticks_followed += 1
 
 
 def run(
