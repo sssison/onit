@@ -49,9 +49,6 @@ _SEARCH_FRAME_SETTLE_S = 0.3  # seconds to wait after rotation for a fresh frame
 _LINE_FOLLOW_SPEED = _env_float("LINE_FOLLOW_SPEED", 0.1)
 _LINE_FOLLOW_ANGULAR = _env_float("LINE_FOLLOW_ANGULAR", 0.3)
 
-_APPROACH_TURN_SPEED = _env_float("APPROACH_TURN_SPEED", 0.35)
-_APPROACH_CENTER_OFFSET_DEG = _env_float("APPROACH_CENTER_OFFSET_DEG", 6.0)
-
 
 def _extract_tool_result_dict(tool_result: Any) -> dict[str, Any]:
     """Extract a dict from a FastMCP Client.call_tool() ToolResult."""
@@ -221,60 +218,6 @@ async def _safe_motion_stop(motion: Client) -> None:
         await motion.call_tool("tbot_motion_stop", {})
     except Exception:
         pass
-
-
-def _turn_duration_s(turn_deg: float, turn_speed: float) -> float:
-    speed = max(0.01, abs(turn_speed))
-    return abs(turn_deg) * math.pi / 180.0 / speed
-
-
-async def _turn_by_degrees(motion: Client, turn_deg: float, turn_speed: float) -> None:
-    if abs(turn_deg) < 1e-6:
-        return
-    direction = "left" if turn_deg > 0 else "right"
-    await motion.call_tool(
-        "tbot_motion_turn",
-        {
-            "direction": direction,
-            "speed": abs(turn_speed),
-            "duration_seconds": _turn_duration_s(turn_deg, turn_speed),
-        },
-    )
-
-
-async def _local_reacquire_object(
-    motion: Client,
-    object_name: str,
-    min_confidence: float,
-    local_steps: int,
-    step_deg: float,
-    turn_speed: float,
-) -> tuple[dict[str, Any] | None, int]:
-    """
-    Try short alternating left/right sweeps around the current heading.
-    Returns (detection or None, vision_checks_count).
-    """
-    current_offset = 0.0
-    vision_checks = 0
-    targets: list[float] = []
-    for i in range(1, local_steps + 1):
-        targets.append(-i * step_deg)
-        targets.append(i * step_deg)
-
-    for target_offset in targets:
-        delta = target_offset - current_offset
-        await _turn_by_degrees(motion, delta, turn_speed)
-        current_offset = target_offset
-        await asyncio.sleep(_SEARCH_FRAME_SETTLE_S)
-
-        detection = await tbot_vision_find_object(object_name)
-        vision_checks += 1
-        if _is_detection_good(detection, min_confidence):
-            return detection, vision_checks
-
-    # Recenter to original heading before falling back to broad scan.
-    await _turn_by_degrees(motion, -current_offset, turn_speed)
-    return None, vision_checks
 
 
 @mcp_vision_v3.tool()
@@ -512,22 +455,20 @@ async def tbot_vision_search_and_approach_object(
     target_distance_m: float = 0.5,
     stop_distance_m: float = 0.1,
     forward_speed: float = 0.1,
-    forward_step_s: float = 0.8,
+    forward_step_s: float = 5.0,
     min_confidence: float = 0.5,
     initial_search_max_steps: int = 36,
-    reacquire_local_steps: int = 3,
-    reacquire_step_deg: float = 10.0,
     timeout_s: float = 90.0,
 ) -> dict[str, Any]:
     """
-    Search for a target object, then approach it while continuously reacquiring.
+    Search for a target object, then approach based on LiDAR-estimated forward distance.
 
     Workflow:
     1) Scan to find object.
     2) Estimate front distance from LiDAR.
-    3) Move forward in short segments (LiDAR collision-guarded by motion tool).
-    4) Check vision after each forward segment; if object is lost, reorient/reacquire.
-    5) Repeat until close enough, or fail/timeout.
+    3) Move forward using duration derived from distance and speed.
+    4) Check if object is still visible.
+    5) If lost, run one broad rescan; if still lost, stop if already <= 10 cm.
     """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
@@ -546,10 +487,6 @@ async def tbot_vision_search_and_approach_object(
         raise ValueError("min_confidence must be between 0 (exclusive) and 1 (inclusive)")
     if initial_search_max_steps < 1:
         raise ValueError("initial_search_max_steps must be >= 1")
-    if reacquire_local_steps < 1:
-        raise ValueError("reacquire_local_steps must be >= 1")
-    if reacquire_step_deg <= 0:
-        raise ValueError("reacquire_step_deg must be > 0")
     if timeout_s <= 0:
         raise ValueError("timeout_s must be > 0")
 
@@ -562,7 +499,7 @@ async def tbot_vision_search_and_approach_object(
     counters = {
         "search_steps": 0,
         "forward_segments": 0,
-        "reacquire_attempts": 0,
+        "rescan_attempts": 0,
         "vision_checks": 0,
     }
     had_lost_target = False
@@ -685,9 +622,28 @@ async def tbot_vision_search_and_approach_object(
                     # 3) Estimate how long to move using LiDAR distance.
                     segment_duration = float(forward_step_s)
                     if front_distance is not None:
+                        target_travel_m = max(0.0, front_distance - target_distance_m)
+                        duration_to_target = target_travel_m / max(0.01, forward_speed)
+                        if duration_to_target <= 0:
+                            await _safe_motion_stop(motion)
+                            return {
+                                "status": "reached",
+                                "object_name": object_name_clean,
+                                "target_distance_m": float(target_distance_m),
+                                "final_front_distance_m": front_distance,
+                                "phases": counters,
+                                "last_detection": last_detection,
+                                "history_summary": {
+                                    "had_lost_target": had_lost_target,
+                                    "errors_count": len(errors),
+                                },
+                                "timing_s": time.monotonic() - started,
+                                "errors": errors or None,
+                            }
+
                         safe_travel_m = max(0.0, front_distance - close_enough_m)
-                        max_duration_by_lidar = safe_travel_m / max(0.01, forward_speed)
-                        if max_duration_by_lidar <= 0:
+                        max_duration_by_safety = safe_travel_m / max(0.01, forward_speed)
+                        if max_duration_by_safety <= 0:
                             await _safe_motion_stop(motion)
                             return {
                                 "status": "collision_blocked",
@@ -703,7 +659,7 @@ async def tbot_vision_search_and_approach_object(
                                 "timing_s": time.monotonic() - started,
                                 "errors": errors or None,
                             }
-                        segment_duration = min(segment_duration, max_duration_by_lidar)
+                        segment_duration = min(segment_duration, duration_to_target, max_duration_by_safety)
                     segment_duration = max(0.1, segment_duration)
 
                     forward_raw = await motion.call_tool(
@@ -744,45 +700,10 @@ async def tbot_vision_search_and_approach_object(
                     }
 
                     if _is_detection_good(detection, min_confidence):
-                        position = detection.get("position")
-                        bbox = detection.get("bbox")
-                        turn_deg = 0.0
-                        if isinstance(bbox, dict):
-                            cx_raw = bbox.get("cx")
-                            if isinstance(cx_raw, (int, float)):
-                                offset_deg = (float(cx_raw) - 0.5) * CAMERA_HFOV_DEG
-                                if abs(offset_deg) > _APPROACH_CENTER_OFFSET_DEG:
-                                    turn_deg = offset_deg
-                        elif position == "left":
-                            turn_deg = reacquire_step_deg
-                        elif position == "right":
-                            turn_deg = -reacquire_step_deg
-
-                        if abs(turn_deg) > 1e-6:
-                            await _turn_by_degrees(motion, turn_deg, _APPROACH_TURN_SPEED)
-                            await asyncio.sleep(_SEARCH_FRAME_SETTLE_S)
                         continue
 
                     had_lost_target = True
-                    counters["reacquire_attempts"] += 1
-
-                    local_detection, local_checks = await _local_reacquire_object(
-                        motion=motion,
-                        object_name=object_name_clean,
-                        min_confidence=min_confidence,
-                        local_steps=reacquire_local_steps,
-                        step_deg=reacquire_step_deg,
-                        turn_speed=_APPROACH_TURN_SPEED,
-                    )
-                    counters["vision_checks"] += local_checks
-                    if local_detection is not None:
-                        last_detection = {
-                            "visible": True,
-                            "confidence": float(local_detection.get("confidence", 0.0) or 0.0),
-                            "position": local_detection.get("position"),
-                            "bbox": local_detection.get("bbox"),
-                        }
-                        continue
+                    counters["rescan_attempts"] += 1
 
                     # User-requested safety fallback: if target is lost, verify if we are already ~10 cm away.
                     lost_lidar_raw = await lidar.call_tool(
@@ -808,6 +729,7 @@ async def tbot_vision_search_and_approach_object(
                             "errors": errors or None,
                         }
 
+                    # No local reorientation policy: only broad rescan when target is lost.
                     broad_rescan = await tbot_vision_search_object(
                         object_name=object_name_clean,
                         min_confidence=min_confidence,

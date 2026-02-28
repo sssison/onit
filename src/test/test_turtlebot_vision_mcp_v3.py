@@ -279,11 +279,12 @@ def test_search_and_approach_reaches_target_distance():
     assert any(name == "tbot_motion_stop" for name, _ in state["motion_calls"])
 
 
-def test_search_and_approach_lost_then_reacquires_locally():
+def test_search_and_approach_lost_then_rescans():
     state = _make_approach_state()
     state["forward_results"] = [{"status": "completed"}]
     state["lidar_results"] = [
         {"status": "ok", "distance_m": 0.9, "distances": {"front": 0.9}},
+        {"status": "ok", "distance_m": 0.4, "distances": {"front": 0.4}},
         {"status": "ok", "distance_m": 0.4, "distances": {"front": 0.4}},
     ]
 
@@ -309,14 +310,12 @@ def test_search_and_approach_lost_then_reacquires_locally():
             vision_v3.tbot_vision_search_and_approach_object(
                 object_name="bottle",
                 target_distance_m=0.5,
-                reacquire_local_steps=1,
                 timeout_s=10.0,
             )
         )
 
     assert result["status"] == "reached"
-    assert result["phases"]["reacquire_attempts"] == 1
-    assert any(name == "tbot_motion_turn" for name, _ in state["motion_calls"])
+    assert result["phases"]["rescan_attempts"] == 1
 
 
 def test_search_and_approach_returns_collision_blocked():
