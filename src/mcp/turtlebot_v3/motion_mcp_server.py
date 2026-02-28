@@ -89,6 +89,8 @@ _ros_node: Node | None = None
 _ros_publisher: Any | None = None
 _last_linear: float = 0.0
 _last_angular: float = 0.0
+_continuous_motion_task: asyncio.Task | None = None
+_continuous_motion_lock: asyncio.Lock = asyncio.Lock()
 
 # ---------------------------------------------------------------------------
 # LiDAR client state
@@ -194,6 +196,52 @@ async def _publish_twist(linear: float, angular: float) -> dict[str, Any]:
 
 async def _stop_robot() -> dict[str, Any]:
     return await _publish_twist(0.0, 0.0)
+
+
+async def _await_task_exit(task: asyncio.Task) -> None:
+    """Await a task and swallow expected cancellation exceptions."""
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.warning("Continuous motion task exited with error: %s", exc)
+
+
+async def _continuous_publish_loop(linear: float, angular: float) -> None:
+    """Republish a fixed velocity command until cancelled."""
+    tick = 1.0 / CONTROL_HZ
+    while True:
+        await _publish_twist(linear, angular)
+        await asyncio.sleep(tick)
+
+
+async def _set_continuous_motion(
+    linear: float | None,
+    angular: float = 0.0,
+) -> None:
+    """
+    Replace any active continuous motion publisher task.
+
+    If linear is None, continuous motion is disabled.
+    """
+    global _continuous_motion_task
+    previous_task: asyncio.Task | None = None
+
+    async with _continuous_motion_lock:
+        previous_task = _continuous_motion_task
+        if previous_task is not None:
+            previous_task.cancel()
+
+        if linear is None:
+            _continuous_motion_task = None
+        else:
+            _continuous_motion_task = asyncio.create_task(
+                _continuous_publish_loop(linear, angular)
+            )
+
+    if previous_task is not None:
+        await _await_task_exit(previous_task)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +355,7 @@ async def _run_forward_with_collision_guard(
 @mcp_motion_v3.tool()
 async def tbot_motion_stop() -> dict[str, Any]:
     """Stop the robot immediately by setting linear and angular targets to zero."""
+    await _set_continuous_motion(None)
     return await _stop_robot()
 
 
@@ -345,6 +394,7 @@ async def tbot_motion_move_forward(
     if duration_f <= 0:
         raise ValueError("duration_seconds must be > 0")
 
+    await _set_continuous_motion(None)
     clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
     result = await _run_forward_with_collision_guard(clamped_speed, 0.0, duration_f)
     return {
@@ -393,6 +443,7 @@ async def tbot_motion_move_along_wall(
     if stop_dist <= 0:
         raise ValueError("stop_distance_m must be > 0")
 
+    await _set_continuous_motion(None)
     clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
     wall_sign     = 1.0 if direction_clean == "left" else -1.0
     start_mono    = time.monotonic()
@@ -473,35 +524,38 @@ async def tbot_motion_move(
     linear_cmd  = _clamp(linear_f, MAX_LINEAR)
     angular_cmd = _clamp(angular_f, MAX_ANGULAR)
 
-    result = await _publish_twist(linear_cmd, angular_cmd)
-
     if duration_s is not None:
         duration_f = _validate_finite("duration_s", duration_s)
-        if duration_f > 0:
-            tick          = 1.0 / CONTROL_HZ
-            pure_rotation = (linear_cmd == 0.0 and angular_cmd != 0.0)
-            start_mono    = time.monotonic()
+        if duration_f <= 0:
+            raise ValueError("duration_s must be > 0 when provided")
+        await _set_continuous_motion(None)
+        tick          = 1.0 / CONTROL_HZ
+        pure_rotation = (linear_cmd == 0.0 and angular_cmd != 0.0)
+        start_mono    = time.monotonic()
 
-            if pure_rotation:
-                # Pure rotation: skip LiDAR overhead, republish continuously
-                while time.monotonic() - start_mono < duration_f:
-                    await _publish_twist(linear_cmd, angular_cmd)
-                    await asyncio.sleep(tick)
-                stop_result = await _stop_robot()
-                return {
-                    **stop_result,
-                    "status": "completed",
-                    "linear_cmd": linear_cmd,
-                    "angular_cmd": angular_cmd,
-                    "duration_s": duration_f,
-                }
-            else:
-                # Forward/combined: concurrent LiDAR guard, unblocked publishing
-                guard = await _run_forward_with_collision_guard(linear_cmd, angular_cmd, duration_f)
-                return {**guard, "linear_cmd": linear_cmd, "angular_cmd": angular_cmd, "duration_s": duration_f}
+        if pure_rotation:
+            # Pure rotation: skip LiDAR overhead, republish continuously
+            while time.monotonic() - start_mono < duration_f:
+                await _publish_twist(linear_cmd, angular_cmd)
+                await asyncio.sleep(tick)
+            stop_result = await _stop_robot()
+            return {
+                **stop_result,
+                "status": "completed",
+                "linear_cmd": linear_cmd,
+                "angular_cmd": angular_cmd,
+                "duration_s": duration_f,
+            }
+        else:
+            # Forward/combined: concurrent LiDAR guard, unblocked publishing
+            guard = await _run_forward_with_collision_guard(linear_cmd, angular_cmd, duration_f)
+            return {**guard, "linear_cmd": linear_cmd, "angular_cmd": angular_cmd, "duration_s": duration_f}
 
+    await _set_continuous_motion(linear_cmd, angular_cmd)
+    result = await _publish_twist(linear_cmd, angular_cmd)
     return {
         **result,
+        "status": "streaming",
         "linear_cmd": linear_cmd,
         "angular_cmd": angular_cmd,
     }
@@ -549,6 +603,7 @@ async def tbot_motion_turn(
             f"(current value: {ANGULAR_SIGN!r}). Must be non-zero."
         )
 
+    await _set_continuous_motion(None)
     tick       = 1.0 / TURN_HZ
     start_mono = time.monotonic()
     while time.monotonic() - start_mono < duration_f:
@@ -610,6 +665,7 @@ async def tbot_motion_approach_until_close(
     if timeout_f <= 0:
         raise ValueError("timeout_s must be > 0")
 
+    await _set_continuous_motion(None)
     clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
     if clamped_speed == 0.0:
         clamped_speed = 0.05
