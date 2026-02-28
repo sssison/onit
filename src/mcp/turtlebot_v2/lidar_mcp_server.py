@@ -410,7 +410,7 @@ if RCLPY_AVAILABLE:
                 if self._latest_scan is None:
                     raise RuntimeError(
                         f"No scan received yet on topic '{self._topic_name}'. "
-                        "Use tbot_lidar_health() or confirm the publisher is active."
+                        "Confirm the LiDAR publisher is active."
                     )
                 age_s = max(0.0, time.monotonic() - float(self._latest_scan["received_mono_s"]))
                 return {
@@ -493,27 +493,6 @@ def _shutdown_ros() -> None:
 
 atexit.register(_shutdown_ros)
 
-
-@mcp_lidar_v2.tool()
-async def tbot_lidar_health() -> dict[str, Any]:
-    """Check if the LiDAR sensor is online and receiving data."""
-    try:
-        node = _get_lidar_node()
-    except Exception as e:
-        return {
-            "status": "offline",
-            "ros_available": RCLPY_AVAILABLE,
-            "topic": LIDAR_TOPIC,
-            "scan_present": False,
-            "scan_count": 0,
-            "latest_age_s": None,
-            "frame_id": None,
-            "error": str(e),
-        }
-
-    snapshot = node.snapshot()
-    status = "online" if snapshot["scan_present"] else "waiting_for_scans"
-    return {"status": status, "ros_available": RCLPY_AVAILABLE, **snapshot}
 
 
 _SECTOR_CENTERS: dict[str, float] = {

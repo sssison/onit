@@ -195,33 +195,6 @@ def _load_frame_as_base64(path: str) -> str:
 
 
 @mcp_vision_v3.tool()
-async def tbot_vision_health() -> dict[str, Any]:
-    """Check if the vision system is operational: frame file presence and LLM configuration."""
-    frame_path = os.getenv("TBOT_FRAME_PATH", FRAME_PATH)
-    host = os.getenv("TBOT_VISION_HOST", DEFAULT_VISION_HOST)
-    model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
-
-    frame_exists = False
-    frame_size_bytes: int | None = None
-    try:
-        stat = os.stat(frame_path)
-        frame_exists = True
-        frame_size_bytes = stat.st_size
-    except OSError:
-        pass
-
-    status = "online" if frame_exists else "no_frame"
-    return {
-        "status": status,
-        "frame_path": frame_path,
-        "frame_exists": frame_exists,
-        "frame_size_bytes": frame_size_bytes,
-        "host": host,
-        "model": model,
-    }
-
-
-@mcp_vision_v3.tool()
 async def tbot_vision_describe_scene(
     prompt: str = "Describe what you see.",
 ) -> dict[str, Any]:

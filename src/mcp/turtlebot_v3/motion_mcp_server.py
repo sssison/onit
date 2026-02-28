@@ -258,7 +258,16 @@ async def tbot_motion_move_forward(
     speed: float,
     duration_seconds: float,
 ) -> dict[str, Any]:
-    """Move the robot forward at the given speed for duration_seconds, then stop automatically."""
+    """
+    Move the robot forward at speed m/s for duration_seconds, then stop.
+
+    COLLISION GUARD IS BUILT IN — do NOT call tbot_lidar_check_collision or
+    tbot_lidar_get_obstacle_distances before this tool. The loop already polls
+    the LiDAR server internally on every tick and halts on risk_level "stop".
+    Pre-calling LiDAR queues an extra slow scan (~3 s) and delays the move.
+
+    Returns {"status": "completed"|"collision_risk"|"lidar_unavailable", ...}.
+    """
     speed_f    = _validate_finite("speed", speed)
     duration_f = _validate_finite("duration_seconds", duration_seconds)
     if duration_f <= 0:
@@ -325,6 +334,9 @@ async def tbot_motion_move_along_wall(
     speed: forward speed in m/s (clamped to MAX_LINEAR).
     timeout_s: stop and return after this many seconds.
     stop_distance_m: stop when a front obstacle is closer than this distance.
+
+    LiDAR IS POLLED INTERNALLY on every tick — do NOT call tbot_lidar_check_collision
+    or tbot_lidar_get_obstacle_distances before this tool. Pre-calling adds ~3 s delay.
 
     Returns {"status": "obstacle_reached"|"timeout", "distance_traveled_ticks": int}.
     """
@@ -396,6 +408,12 @@ async def tbot_motion_move(
               positive to turn left, negative to turn right (standard ROS2 convention).
     duration_s: if provided and > 0, automatically stops after this many seconds.
                 If omitted, the command runs until tbot_motion_stop is called.
+
+    COLLISION GUARD IS BUILT IN for timed forward motion — do NOT call
+    tbot_lidar_check_collision or tbot_lidar_get_obstacle_distances before this
+    tool when using duration_s. The loop polls LiDAR every tick internally.
+    Pre-calling LiDAR adds ~3 s of delay before the robot starts moving.
+    Pure-rotation commands (linear=0) skip LiDAR and turn immediately.
     """
     linear_f  = _validate_finite("linear", linear)
     angular_f = _validate_finite("angular", angular)
@@ -549,6 +567,9 @@ async def tbot_motion_approach_until_close(
     If risk_level is "stop", halts and returns collision_risk.
     If risk_level is "caution", stops, nudges ~10 degrees, then resumes.
     Returns status: "reached" | "collision_risk" | "timeout" | "lidar_unavailable".
+
+    LiDAR IS POLLED INTERNALLY on every tick — do NOT call tbot_lidar_check_collision
+    or tbot_lidar_get_obstacle_distances before this tool. Pre-calling adds ~3 s delay.
     """
     target_dist = _validate_finite("target_distance_m", target_distance_m)
     stop_dist   = _validate_finite("stop_distance_m", stop_distance_m)

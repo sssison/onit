@@ -255,19 +255,10 @@ def _shutdown_ros() -> None:
 atexit.register(_shutdown_ros)
 
 
-@mcp_camera.tool()
-async def camera_health() -> dict[str, Any]:
-    """Return current subscriber status for the compressed camera topic."""
-    logger.debug("Tool camera_health called")
+async def _camera_status() -> dict[str, Any]:
     node = _get_camera_node()
     snapshot = node.snapshot()
     status = "online" if snapshot["frame_present"] else "waiting_for_frames"
-    logger.debug(
-        "camera_health status=%s frame_present=%s frame_count=%s",
-        status,
-        snapshot["frame_present"],
-        snapshot["frame_count"],
-    )
     return {"status": status, **snapshot}
 
 
@@ -297,7 +288,7 @@ async def camera_wait_for_frame(timeout_s: float = 5.0) -> dict[str, Any]:
         frame_arrived,
         initial_frame_count,
     )
-    return await camera_health()
+    return await _camera_status()
 
 
 @mcp_camera.tool(

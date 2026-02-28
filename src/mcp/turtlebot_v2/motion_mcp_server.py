@@ -125,46 +125,6 @@ async def _try_get_health() -> tuple[dict[str, Any] | None, str | None]:
         return None, str(e)
 
 
-async def _probe_motion_api() -> dict[str, Any]:
-    url = f"{BASE_URL}{MOVE_PATH}"
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-            response = await client.options(url)
-    except httpx.RequestError as e:
-        return {
-            "status": "offline",
-            "base_url": BASE_URL,
-            "reachable": False,
-            "error": str(e),
-            "endpoints": {"move": MOVE_PATH, "stop": STOP_PATH, "health": HEALTH_PATH},
-        }
-
-    return {
-        "status": "online" if response.status_code != 404 else "offline",
-        "base_url": BASE_URL,
-        "reachable": response.status_code != 404,
-        "status_code": response.status_code,
-        "endpoints": {"move": MOVE_PATH, "stop": STOP_PATH, "health": HEALTH_PATH},
-    }
-
-
-@mcp_motion_v2.tool()
-async def tbot_motion_health() -> dict[str, Any]:
-    """Check whether the TurtleBot motion server is online."""
-    health, health_error = await _try_get_health()
-    if health is not None:
-        return {
-            **health,
-            "status": "online",
-            "base_url": BASE_URL,
-            "endpoints": {"move": MOVE_PATH, "stop": STOP_PATH, "health": HEALTH_PATH},
-            "reachable": True,
-        }
-
-    probe = await _probe_motion_api()
-    return {**probe, "health_error": health_error}
-
-
 @mcp_motion_v2.tool()
 async def tbot_motion_stop() -> dict[str, Any]:
     """Stop the robot by setting linear and angular targets to zero."""

@@ -302,39 +302,17 @@ async def _get_one_scan(timeout_s: float = SCAN_TIMEOUT_S) -> dict[str, Any]:
 
 
 @mcp_lidar_v3.tool()
-async def tbot_lidar_health() -> dict[str, Any]:
-    """Check if the LiDAR sensor is online and receiving data."""
-    try:
-        scan = await _get_one_scan(3.0)
-        num_points = len(scan.get("ranges", []))
-        scan_age_s = scan.get("age_s", 0.0)
-        return {
-            "status": "online",
-            "topic": LIDAR_TOPIC,
-            "ros_available": RCLPY_AVAILABLE,
-            "scan_present": True,
-            "num_points": num_points,
-            "scan_age_s": scan_age_s,
-        }
-    except Exception as e:
-        return {
-            "status": "offline",
-            "topic": LIDAR_TOPIC,
-            "ros_available": RCLPY_AVAILABLE,
-            "scan_present": False,
-            "num_points": 0,
-            "scan_age_s": None,
-            "error": str(e),
-        }
-
-
-@mcp_lidar_v3.tool()
 async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, Any]:
     """
     Return the distance to the nearest obstacle in a named sector.
 
     sector: "front" | "left" | "right" | "rear" | "all"
     Returns {status, sector, distance_m, distances: {front, left, right, rear}}.
+
+    NOTE: Do NOT call this as a pre-check before motion tools. tbot_motion_move_forward,
+    tbot_motion_move (with duration_s), tbot_motion_approach_until_close, and
+    tbot_motion_move_along_wall all poll LiDAR internally. Pre-calling queues an
+    extra ~3 s scan and delays the robot's movement.
     """
     sector_clean = sector.strip().lower() if isinstance(sector, str) else "all"
     valid_sectors = set(_SECTOR_CENTERS.keys()) | {"all"}
@@ -379,7 +357,12 @@ async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, An
 
 @mcp_lidar_v3.tool()
 async def tbot_lidar_is_path_clear(threshold_m: float = 0.5) -> dict[str, Any]:
-    """Check if the forward path is clear (front sector min distance > threshold_m)."""
+    """
+    Check if the forward path is clear (front sector min distance > threshold_m).
+
+    NOTE: Do NOT call this before tbot_motion_move_forward or tbot_motion_move.
+    Those tools check for obstacles internally. Pre-calling adds ~3 s delay.
+    """
     try:
         scan = await _get_one_scan()
     except Exception as e:
@@ -408,6 +391,11 @@ async def tbot_lidar_check_collision(
       "clear"   — front distance >= 2 × front_threshold_m
 
     Returns {risk_level, distances: {front, left, right, rear}}.
+
+    NOTE: Do NOT call this before tbot_motion_move_forward, tbot_motion_move (with
+    duration_s), tbot_motion_approach_until_close, or tbot_motion_move_along_wall.
+    Those tools already run this check internally on every tick. Pre-calling adds
+    ~3 s of scan delay before the robot starts moving.
     """
     try:
         scan = await _get_one_scan()

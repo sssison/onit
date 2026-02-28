@@ -205,7 +205,7 @@ if RCLPY_AVAILABLE:
                 if self._latest_bytes is None:
                     raise RuntimeError(
                         f"No frame received yet on topic '{self._topic_name}'. "
-                        "Confirm the camera publisher is active or check tbot_camera_health()."
+                        "Confirm the camera publisher is active."
                     )
                 frame_age = None
                 if self._latest_rx_mono_s is not None:
@@ -297,24 +297,6 @@ def _shutdown_ros() -> None:
 
 
 atexit.register(_shutdown_ros)
-
-
-@mcp_camera_v2.tool()
-async def tbot_camera_health() -> dict[str, Any]:
-    """Return current subscriber status for /camera/image_raw/compressed."""
-    try:
-        node = _get_camera_node()
-    except Exception as e:
-        return {
-            "status": "offline",
-            "topic": CAMERA_TOPIC,
-            "ros_available": RCLPY_AVAILABLE,
-            "error": str(e),
-        }
-
-    snapshot = node.snapshot()
-    status = "online" if snapshot["frame_present"] else "waiting_for_frames"
-    return {"status": status, "ros_available": RCLPY_AVAILABLE, **snapshot}
 
 
 @mcp_camera_v2.tool(

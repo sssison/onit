@@ -137,79 +137,11 @@ async def _get_json(path: str) -> dict[str, Any]:
         raise RuntimeError(f"Failed to reach motion server at {url}: {e}") from e
 
 
-async def _probe_motion_api() -> dict[str, Any]:
-    """
-    Probe motion_server.py API reachability.
-
-    motion_server.py exposes POST /move and POST /stop and may expose GET /health.
-    """
-    url = f"{BASE_URL}{MOVE_PATH}"
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-            response = await client.options(url)
-    except httpx.RequestError as e:
-        return {
-            "status": "offline",
-            "base_url": BASE_URL,
-            "api": "motion_server.py",
-            "endpoints": {"move": MOVE_PATH, "stop": STOP_PATH},
-            "reachable": False,
-            "probe_method": "OPTIONS",
-            "probe_url": url,
-            "error": str(e),
-        }
-
-    if response.status_code == 404:
-        return {
-            "status": "offline",
-            "base_url": BASE_URL,
-            "api": "motion_server.py",
-            "endpoints": {"move": MOVE_PATH, "stop": STOP_PATH},
-            "reachable": False,
-            "probe_method": "OPTIONS",
-            "probe_url": url,
-            "status_code": response.status_code,
-            "error": "move endpoint not found",
-        }
-
-    return {
-        "status": "online",
-        "base_url": BASE_URL,
-        "api": "motion_server.py",
-        "endpoints": {"move": MOVE_PATH, "stop": STOP_PATH, "health": "/health"},
-        "reachable": True,
-        "probe_method": "OPTIONS",
-        "probe_url": url,
-        "status_code": response.status_code,
-    }
-
-
 async def _try_get_health() -> tuple[dict[str, Any] | None, str | None]:
     try:
         return await _get_json("/health"), None
     except Exception as e:
         return None, str(e)
-
-
-@mcp_motion.tool()
-async def motion_health() -> dict[str, Any]:
-    """Check whether the motion server is online."""
-    logger.debug("Tool motion_health called")
-    health, health_error = await _try_get_health()
-    if health is not None:
-        return {
-            **health,
-            "base_url": BASE_URL,
-            "api": "motion_server.py",
-            "endpoints": {"move": MOVE_PATH, "stop": STOP_PATH, "health": "/health"},
-            "reachable": True,
-        }
-
-    probe = await _probe_motion_api()
-    return {
-        **probe,
-        "health_error": health_error,
-    }
 
 
 @mcp_motion.tool()
