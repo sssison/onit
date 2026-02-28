@@ -45,6 +45,7 @@ _LINE_FOLLOW_STOP_DISTANCE_M = _env_float("LINE_FOLLOW_STOP_DISTANCE_M", 0.35)
 _SEARCH_STEP_DEG = 10.0
 _SEARCH_ANGULAR_SPEED = 0.3   # rad/s — speed used for each 10° rotation step
 _SEARCH_FRAME_SETTLE_S = 0.3  # seconds to wait after rotation for a fresh frame
+_REPOSITION_DEFAULT_MAX_STEPS = 8
 
 _LINE_FOLLOW_SPEED = _env_float("LINE_FOLLOW_SPEED", 0.1)
 _LINE_FOLLOW_ANGULAR = _env_float("LINE_FOLLOW_ANGULAR", 0.3)
@@ -453,6 +454,69 @@ async def tbot_vision_search_object(
 
 
 @mcp_vision_v3.tool()
+async def tbot_vision_reposition_for_object(
+    object_name: str,
+    min_confidence: float = 0.5,
+    max_steps: int = _REPOSITION_DEFAULT_MAX_STEPS,
+) -> dict[str, Any]:
+    """
+    Verify/reacquire an object with bounded in-place scan rotation.
+
+    This tool is intended for visibility verification only. It never commands
+    forward movement.
+    """
+    object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
+    if not object_name_clean:
+        raise ValueError("object_name must be a non-empty string")
+    if not (0.0 < min_confidence <= 1.0):
+        raise ValueError("min_confidence must be between 0 (exclusive) and 1 (inclusive)")
+    if max_steps < 0:
+        raise ValueError("max_steps must be >= 0")
+
+    current_detection = await tbot_vision_find_object(object_name_clean)
+    if _is_detection_good(current_detection, min_confidence):
+        return {
+            "status": "already_visible",
+            "found": True,
+            "position": current_detection.get("position"),
+            "confidence": float(current_detection.get("confidence", 0.0) or 0.0),
+            "bbox": current_detection.get("bbox"),
+            "steps_taken": 0,
+            "degrees_rotated": 0.0,
+            "model_info": current_detection.get("model_info"),
+        }
+
+    if max_steps == 0:
+        return {
+            "status": "not_found",
+            "found": False,
+            "position": None,
+            "confidence": float(current_detection.get("confidence", 0.0) or 0.0),
+            "bbox": current_detection.get("bbox"),
+            "steps_taken": 0,
+            "degrees_rotated": 0.0,
+            "model_info": current_detection.get("model_info"),
+        }
+
+    reacquire = await tbot_vision_search_object(
+        object_name=object_name_clean,
+        min_confidence=min_confidence,
+        max_steps=max_steps,
+    )
+    found = bool(reacquire.get("found", False))
+    return {
+        "status": "reacquired" if found else "not_found",
+        "found": found,
+        "position": reacquire.get("position"),
+        "confidence": float(reacquire.get("confidence", 0.0) or 0.0),
+        "bbox": reacquire.get("bbox"),
+        "steps_taken": int(reacquire.get("steps_taken") or 0),
+        "degrees_rotated": float(reacquire.get("degrees_rotated", 0.0) or 0.0),
+        "model_info": reacquire.get("model_info"),
+    }
+
+
+@mcp_vision_v3.tool()
 async def tbot_vision_search_and_approach_object(
     object_name: str,
     target_distance_m: float = 0.5,
@@ -464,13 +528,12 @@ async def tbot_vision_search_and_approach_object(
     timeout_s: float = 90.0,
 ) -> dict[str, Any]:
     """
-    Single-pass object approach:
+    Verification-gated single-approach object behavior:
     1) Scan once to locate object.
-    2) Estimate front distance via LiDAR.
-    3) Move forward once using LiDAR-derived duration.
-    4) Stop and return final distance/status.
-
-    This policy intentionally avoids reorientation/reacquisition loops to reduce jitter.
+    2) Verify/reposition object visibility.
+    3) Estimate front distance via LiDAR.
+    4) Move forward at most once (only when needed).
+    5) Verify visibility again and return final status.
     """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
@@ -494,12 +557,18 @@ async def tbot_vision_search_and_approach_object(
 
     close_enough_m = max(0.1, float(stop_distance_m))
     effective_target_distance_m = max(float(target_distance_m), _APPROACH_MIN_TARGET_DISTANCE_M)
+    verification_max_steps = min(_REPOSITION_DEFAULT_MAX_STEPS, max(1, int(initial_search_max_steps)))
 
     started = time.monotonic()
     motion_url = os.getenv("TBOT_MOTION_MCP_URL_V3", MOTION_MCP_URL_V3)
     lidar_url = os.getenv("TBOT_LIDAR_MCP_URL_V3", LIDAR_MCP_URL_V3)
 
-    counters = {"search_steps": 0, "forward_segments": 0}
+    counters = {
+        "search_steps": 0,
+        "verification_scans": 0,
+        "reposition_turns": 0,
+        "forward_segments": 0,
+    }
     last_detection: dict[str, Any] | None = None
     errors: list[str] = []
 
@@ -526,6 +595,34 @@ async def tbot_vision_search_and_approach_object(
             "last_detection": last_detection,
             "history_summary": {"errors_count": 0},
             "timing_s": time.monotonic() - started,
+        }
+
+    # Verification pass before any approach movement.
+    verification = await tbot_vision_reposition_for_object(
+        object_name=object_name_clean,
+        min_confidence=min_confidence,
+        max_steps=verification_max_steps,
+    )
+    counters["verification_scans"] += 1
+    counters["reposition_turns"] += int(verification.get("steps_taken") or 0)
+    last_detection = {
+        "visible": bool(verification.get("found", False)),
+        "confidence": float(verification.get("confidence", 0.0) or 0.0),
+        "position": verification.get("position"),
+        "bbox": verification.get("bbox"),
+    }
+    if not verification.get("found", False):
+        return {
+            "status": "verification_failed",
+            "object_name": object_name_clean,
+            "target_distance_m": effective_target_distance_m,
+            "requested_target_distance_m": float(target_distance_m),
+            "final_front_distance_m": None,
+            "phases": counters,
+            "last_detection": last_detection,
+            "history_summary": {"errors_count": len(errors)},
+            "timing_s": time.monotonic() - started,
+            "errors": errors or None,
         }
 
     async with Client(motion_url) as motion:
@@ -684,7 +781,36 @@ async def tbot_vision_search_and_approach_object(
                         "errors": [*errors, "LiDAR unavailable during forward motion"],
                     }
 
-                # 4) Final LiDAR check after the move.
+                # 4) Verification pass after the one and only approach movement.
+                post_verification = await tbot_vision_reposition_for_object(
+                    object_name=object_name_clean,
+                    min_confidence=min_confidence,
+                    max_steps=verification_max_steps,
+                )
+                counters["verification_scans"] += 1
+                counters["reposition_turns"] += int(post_verification.get("steps_taken") or 0)
+                last_detection = {
+                    "visible": bool(post_verification.get("found", False)),
+                    "confidence": float(post_verification.get("confidence", 0.0) or 0.0),
+                    "position": post_verification.get("position"),
+                    "bbox": post_verification.get("bbox"),
+                }
+                if not post_verification.get("found", False):
+                    await _safe_motion_stop(motion)
+                    return {
+                        "status": "verification_failed",
+                        "object_name": object_name_clean,
+                        "target_distance_m": effective_target_distance_m,
+                        "requested_target_distance_m": float(target_distance_m),
+                        "final_front_distance_m": None,
+                        "phases": counters,
+                        "last_detection": last_detection,
+                        "history_summary": {"errors_count": len(errors)},
+                        "timing_s": time.monotonic() - started,
+                        "errors": errors or None,
+                    }
+
+                # 5) Final LiDAR check after post-approach verification.
                 post_lidar_raw = await lidar.call_tool(
                     "tbot_lidar_get_obstacle_distances",
                     {"sector": "front"},
