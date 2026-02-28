@@ -101,8 +101,7 @@ def _publish_twist_sync(linear: float, angular: float) -> None:
 
 
 async def _publish_twist(linear: float, angular: float) -> dict[str, Any]:
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _publish_twist_sync, linear, angular)
+    _publish_twist_sync(linear, angular)
     return {"linear": linear, "angular": angular, "topic": CMD_VEL_TOPIC}
 
 
