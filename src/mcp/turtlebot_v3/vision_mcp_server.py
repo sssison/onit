@@ -204,6 +204,71 @@ def _is_detection_good(detection: dict[str, Any], min_confidence: float) -> bool
     return visible and confidence >= min_confidence
 
 
+async def _center_object_in_frame(
+    object_name: str,
+    motion: Client,
+    min_confidence: float = 0.5,
+    center_tolerance: float = 0.08,
+    max_iterations: int = 6,
+) -> dict[str, Any]:
+    """
+    Rotate the robot in small proportional steps until the detected object is
+    horizontally centred in the camera frame (bbox.cx ≈ 0.5).
+
+    Returns:
+        status:     "centered" | "lost" | "no_bbox" | "max_iterations_reached"
+        iterations: int
+        final_cx:   float | None
+    """
+    for iteration in range(max_iterations):
+        detection = await tbot_vision_find_object(object_name)
+
+        if not detection.get("visible") or (detection.get("confidence") or 0.0) < min_confidence:
+            return {"status": "lost", "iterations": iteration, "final_cx": None}
+
+        bbox = detection.get("bbox")
+        if bbox is None:
+            return {"status": "no_bbox", "iterations": iteration, "final_cx": None}
+
+        cx: float = bbox["cx"]
+        offset = cx - 0.5  # positive = object is right of frame centre
+
+        if abs(offset) <= center_tolerance:
+            return {"status": "centered", "iterations": iteration, "final_cx": cx}
+
+        # Convert fractional pixel offset to angle using camera HFOV.
+        angle_deg = offset * CAMERA_HFOV_DEG
+        angle_rad = abs(math.radians(angle_deg))
+        duration_s = angle_rad / _SEARCH_ANGULAR_SPEED
+
+        # ROS convention: angular > 0 = CCW = left.
+        # Object right of centre (offset > 0) → rotate right → negative angular.
+        angular_cmd = -math.copysign(_SEARCH_ANGULAR_SPEED, offset)
+
+        try:
+            await motion.call_tool(
+                "tbot_motion_move",
+                {"linear": 0.0, "angular": angular_cmd, "duration_s": duration_s},
+            )
+        except Exception:
+            pass  # best-effort; re-evaluate on next iteration
+
+        await asyncio.sleep(_SEARCH_FRAME_SETTLE_S)
+
+    # Final measurement after exhausting iterations
+    final_detection = await tbot_vision_find_object(object_name)
+    final_cx = (final_detection.get("bbox") or {}).get("cx")
+    visible = final_detection.get("visible", False)
+
+    return {
+        "status": "centered" if (
+            visible and final_cx is not None and abs(final_cx - 0.5) <= center_tolerance
+        ) else "max_iterations_reached",
+        "iterations": max_iterations,
+        "final_cx": final_cx,
+    }
+
+
 def _front_distance_from_lidar(data: dict[str, Any]) -> float | None:
     raw = data.get("distance_m")
     if isinstance(raw, (int, float)):
@@ -517,6 +582,33 @@ async def tbot_vision_reposition_for_object(
 
 
 @mcp_vision_v3.tool()
+async def tbot_vision_center_object(
+    object_name: str,
+    min_confidence: float = 0.5,
+    center_tolerance: float = 0.08,
+    max_iterations: int = 6,
+) -> dict[str, Any]:
+    """
+    Rotate in place until a detected object is centred in the camera frame.
+
+    Uses bbox.cx and CAMERA_HFOV_DEG to compute a proportional corrective
+    rotation per iteration. Stops when |cx - 0.5| <= center_tolerance.
+
+    Returns {"status": "centered"|"lost"|"no_bbox"|"max_iterations_reached",
+             "iterations": int, "final_cx": float|None}.
+    """
+    motion_url = os.getenv("TBOT_MOTION_MCP_URL_V3", MOTION_MCP_URL_V3)
+    async with Client(motion_url) as motion:
+        return await _center_object_in_frame(
+            object_name=object_name,
+            motion=motion,
+            min_confidence=min_confidence,
+            center_tolerance=center_tolerance,
+            max_iterations=max_iterations,
+        )
+
+
+@mcp_vision_v3.tool()
 async def tbot_vision_search_and_approach_object(
     object_name: str,
     target_distance_m: float = 0.5,
@@ -627,6 +719,32 @@ async def tbot_vision_search_and_approach_object(
             "timing_s": time.monotonic() - started,
             "errors": errors or None,
         }
+
+    # ── Centre object before approach ─────────────────────────────────
+    motion_url_for_center = os.getenv("TBOT_MOTION_MCP_URL_V3", MOTION_MCP_URL_V3)
+    async with Client(motion_url_for_center) as motion_center:
+        center_result = await _center_object_in_frame(
+            object_name=object_name_clean,
+            motion=motion_center,
+            min_confidence=min_confidence,
+        )
+
+    counters["reposition_turns"] += center_result.get("iterations", 0)
+
+    if center_result["status"] == "lost":
+        return {
+            "status": "verification_failed",
+            "object_name": object_name_clean,
+            "target_distance_m": effective_target_distance_m,
+            "requested_target_distance_m": float(target_distance_m),
+            "final_front_distance_m": None,
+            "phases": counters,
+            "last_detection": last_detection,
+            "history_summary": {"errors_count": len(errors)},
+            "timing_s": time.monotonic() - started,
+            "errors": [*errors, f"Object lost during centering: {center_result}"],
+        }
+    # ── End centering ──────────────────────────────────────────────────
 
     async with Client(motion_url) as motion:
         async with Client(lidar_url) as lidar:
