@@ -42,9 +42,9 @@ MOTION_MCP_URL_V3 = os.getenv("TBOT_MOTION_MCP_URL_V3", "http://127.0.0.1:18210/
 LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
 _LINE_FOLLOW_STOP_DISTANCE_M = _env_float("LINE_FOLLOW_STOP_DISTANCE_M", 0.35)
 
-_SEARCH_STEP_DEG = 10.0
+_SEARCH_STEP_DEG = 20.0
 _SEARCH_ANGULAR_SPEED = 0.3   # rad/s — speed used for each 10° rotation step
-_SEARCH_FRAME_SETTLE_S = 0.3  # seconds to wait after rotation for a fresh frame
+_SEARCH_FRAME_SETTLE_S = 0.15  # seconds to wait after rotation for a fresh frame
 _REPOSITION_DEFAULT_MAX_STEPS = 8
 
 _LINE_FOLLOW_SPEED = _env_float("LINE_FOLLOW_SPEED", 0.1)
@@ -208,8 +208,8 @@ async def _center_object_in_frame(
     object_name: str,
     motion: Client,
     min_confidence: float = 0.5,
-    center_tolerance: float = 0.08,
-    max_iterations: int = 6,
+    center_tolerance: float = 0.10,
+    max_iterations: int = 3,
 ) -> dict[str, Any]:
     """
     Rotate the robot in small proportional steps until the detected object is
@@ -585,10 +585,13 @@ async def tbot_vision_reposition_for_object(
 async def tbot_vision_center_object(
     object_name: str,
     min_confidence: float = 0.5,
-    center_tolerance: float = 0.08,
-    max_iterations: int = 6,
+    center_tolerance: float = 0.10,
+    max_iterations: int = 3,
 ) -> dict[str, Any]:
     """
+    Do NOT call any LiDAR tools before or after this tool.
+    Centering uses rotation only. The motion server enforces collision limits internally.
+
     Rotate in place until a detected object is centred in the camera frame.
 
     Uses bbox.cx and CAMERA_HFOV_DEG to compute a proportional corrective
@@ -620,6 +623,11 @@ async def tbot_vision_search_and_approach_object(
     timeout_s: float = 90.0,
 ) -> dict[str, Any]:
     """
+    IMPORTANT: Do NOT call any LiDAR tools before this tool.
+    All LiDAR collision checking is handled internally on every motion tick.
+    Pre-calling tbot_lidar_check_collision or tbot_lidar_get_obstacle_distances
+    adds 3+ seconds of delay per call with zero safety benefit.
+
     Verification-gated single-approach object behavior:
     1) Scan once to locate object.
     2) Verify/reposition object visibility.
@@ -878,21 +886,16 @@ async def tbot_vision_search_and_approach_object(
                         "errors": [*errors, f"Unexpected approach status: {approach_status!r}"],
                     }
 
-                # 4) Verification pass after the one and only approach movement.
-                post_verification = await tbot_vision_reposition_for_object(
-                    object_name=object_name_clean,
-                    min_confidence=min_confidence,
-                    max_steps=verification_max_steps,
-                )
+                # 4) Lightweight visibility confirmation after approach (single VLM call).
+                post_check = await tbot_vision_find_object(object_name_clean)
                 counters["verification_scans"] += 1
-                counters["reposition_turns"] += int(post_verification.get("steps_taken") or 0)
                 last_detection = {
-                    "visible": bool(post_verification.get("found", False)),
-                    "confidence": float(post_verification.get("confidence", 0.0) or 0.0),
-                    "position": post_verification.get("position"),
-                    "bbox": post_verification.get("bbox"),
+                    "visible": bool(post_check.get("visible", False)),
+                    "confidence": float(post_check.get("confidence", 0.0) or 0.0),
+                    "position": post_check.get("position"),
+                    "bbox": post_check.get("bbox"),
                 }
-                if not post_verification.get("found", False):
+                if not post_check.get("visible") or (post_check.get("confidence") or 0.0) < 0.3:
                     await _safe_motion_stop(motion)
                     return {
                         "status": "verification_failed",
