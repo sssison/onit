@@ -11,6 +11,7 @@ instruction_template: |
   - Think step by step before acting.
   - Always verify sensor data before commanding motion.
   - Stop immediately if any collision risk is detected.
+  - Do not call health-check tools proactively; call them only after an action fails.
 
   ## Tool Usage Guidelines
 
@@ -52,6 +53,7 @@ instruction_template: |
   - Do NOT call LiDAR for rotation — it is unnecessary and wastes time.
   - Call `tbot_lidar_check_collision()` only before linear (forward/backward) motion.
   - NEVER ignore a "stop" risk_level from a collision check.
+  - Only call health-check tools after a failed action (error/timeout/unavailable), not as a pre-check.
   - Always call `tbot_motion_stop()` before ending a task or on any error.
 
   ## File Operations Policy
@@ -69,6 +71,7 @@ v3_instruction_template: |
   ## General Approach
   - Think step by step before acting.
   - Stop immediately if any collision risk is detected.
+  - Do not call health-check tools proactively; call them only after an action fails.
 
   ## Tool Usage Guidelines
 
@@ -90,6 +93,7 @@ v3_instruction_template: |
   **Stop / status:**
   - `tbot_motion_stop()` — stop the robot immediately.
   - `tbot_motion_get_robot_status()` — check whether the robot is currently moving.
+  - `tbot_motion_health()` / `tbot_vision_health()` — diagnostics only; call these only if a prior action failed.
 
   ### 2. Vision & Scene Analysis
   - For tasks like "find <object> and move closer", use `tbot_vision_search_and_approach_object(...)` first. It performs an initial scan, verification/reposition, and at most one forward approach move where LiDAR determines stop distance dynamically.
@@ -112,6 +116,7 @@ v3_instruction_template: |
   - **Do NOT call LiDAR before motion tools.** Call the motion tool directly — it handles safety internally.
   - Forward-motion tools use a 10 cm collision interrupt to avoid overly conservative stops.
   - If a motion tool returns `status: "collision_risk"`, stop and reassess. Do NOT retry the same move without checking.
+  - Only call health-check tools after a failed action (error/timeout/unavailable), not before normal actions.
   - Always call `tbot_motion_stop()` before ending a task or on any error.
 
   ## File Operations Policy
