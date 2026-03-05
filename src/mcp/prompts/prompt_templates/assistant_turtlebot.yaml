@@ -82,6 +82,7 @@ v3_instruction_template: |
   - `tbot_motion_move(linear, angular, duration_s)` — combined velocity for a fixed duration; for forward motion, provide `duration_s` so the 10 cm collision interrupt is enforced.
   - `tbot_motion_approach_until_close(target_distance_m, stop_distance_m, speed)` — drive forward continuously and let LiDAR decide when to stop within range; stop_distance_m ≤ target_distance_m.
   - `tbot_motion_move_along_wall(direction, target_distance_m, speed, timeout_s)` — move forward while holding a fixed lateral distance from a wall.
+  - `tbot_motion_bypass_obstacle(preferred_side, speed, turn_speed, ...)` — sidestep around a blocking object using LiDAR distance, computed turn angle, forward-to-parallel move, return turn, and forward clear-out move.
 
   **Turn-in-place (no LiDAR needed at all):**
   - `tbot_motion_turn(direction, speed, duration_seconds)` — rotate left or right; direction must be "left" or "right".

@@ -55,6 +55,15 @@ MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES = max(
     1,
     int(_env_float("MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES", 3.0)),
 )
+BYPASS_DEFAULT_LINEAR = abs(_env_float("MOTION_BYPASS_DEFAULT_LINEAR", 0.12))
+BYPASS_DEFAULT_TURN_SPEED = abs(_env_float("MOTION_BYPASS_DEFAULT_TURN_SPEED", 0.5))
+BYPASS_LATERAL_CLEARANCE_M = max(0.05, _env_float("MOTION_BYPASS_LATERAL_CLEARANCE_M", 0.45))
+BYPASS_PARALLEL_FRONT_CLEARANCE_M = max(0.05, _env_float("MOTION_BYPASS_PARALLEL_FRONT_CLEARANCE_M", 0.6))
+BYPASS_FINAL_FRONT_CLEARANCE_M = max(0.05, _env_float("MOTION_BYPASS_FINAL_FRONT_CLEARANCE_M", 0.9))
+BYPASS_MIN_TURN_ANGLE_DEG = max(1.0, _env_float("MOTION_BYPASS_MIN_TURN_ANGLE_DEG", 15.0))
+BYPASS_MAX_TURN_ANGLE_DEG = max(BYPASS_MIN_TURN_ANGLE_DEG, _env_float("MOTION_BYPASS_MAX_TURN_ANGLE_DEG", 60.0))
+BYPASS_MIN_PARALLEL_TIME_S = max(0.1, _env_float("MOTION_BYPASS_MIN_PARALLEL_TIME_S", 0.6))
+BYPASS_MIN_SECOND_LEG_TIME_S = max(0.1, _env_float("MOTION_BYPASS_MIN_SECOND_LEG_TIME_S", 0.6))
 
 MOVE_PATH = "/move"
 STOP_PATH = "/stop"
@@ -329,6 +338,67 @@ def _extract_tool_dict(tool_result: Any) -> dict[str, Any]:
     return {}
 
 
+def _to_distance_m(value: Any) -> float | None:
+    if not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
+def _pick_bypass_side(
+    preferred_side: str,
+    left_m: float | None,
+    right_m: float | None,
+) -> str:
+    side_clean = preferred_side.strip().lower() if isinstance(preferred_side, str) else ""
+    if side_clean in ("left", "right"):
+        return side_clean
+    if left_m is None and right_m is None:
+        return "left"
+    if left_m is None:
+        return "right"
+    if right_m is None:
+        return "left"
+    return "left" if left_m >= right_m else "right"
+
+
+def _compute_bypass_turn_angle_deg(
+    front_distance_m: float | None,
+    side_distance_m: float | None,
+    lateral_clearance_m: float,
+    min_turn_angle_deg: float,
+    max_turn_angle_deg: float,
+) -> tuple[float, float, float]:
+    front_ref_m = max(0.05, front_distance_m if front_distance_m is not None else lateral_clearance_m)
+    required_lateral_shift_m = (
+        lateral_clearance_m if side_distance_m is None else max(0.0, lateral_clearance_m - side_distance_m)
+    )
+    raw_angle_deg = math.degrees(math.atan2(required_lateral_shift_m, front_ref_m))
+    clamped_angle_deg = max(min_turn_angle_deg, min(max_turn_angle_deg, raw_angle_deg))
+    return clamped_angle_deg, raw_angle_deg, required_lateral_shift_m
+
+
+async def _read_lidar_distances(lidar: Client) -> tuple[dict[str, float | None], str | None]:
+    try:
+        raw = await lidar.call_tool("tbot_lidar_get_obstacle_distances", {"sector": "all"})
+        parsed = _extract_tool_dict(raw)
+    except Exception as e:
+        return {"front": None, "left": None, "right": None, "rear": None}, str(e)
+
+    distances_raw = parsed.get("distances")
+    if not isinstance(distances_raw, dict):
+        return {"front": None, "left": None, "right": None, "rear": None}, "missing_distances"
+
+    return {
+        "front": _to_distance_m(distances_raw.get("front")),
+        "left": _to_distance_m(distances_raw.get("left")),
+        "right": _to_distance_m(distances_raw.get("right")),
+        "rear": _to_distance_m(distances_raw.get("rear")),
+    }, None
+
+
 @mcp_motion_v3.tool()
 async def tbot_motion_health() -> dict[str, Any]:
     """Check whether the TurtleBot motion server is online."""
@@ -441,6 +511,276 @@ async def tbot_motion_move_forward(
         "command_refresh_s": guarded_result["command_refresh_s"],
         "collision_poll_s": guarded_result["collision_poll_s"],
     }
+
+
+@mcp_motion_v3.tool()
+async def tbot_motion_bypass_obstacle(
+    preferred_side: str = "auto",
+    speed: float = BYPASS_DEFAULT_LINEAR,
+    turn_speed: float = BYPASS_DEFAULT_TURN_SPEED,
+    lateral_clearance_m: float = BYPASS_LATERAL_CLEARANCE_M,
+    parallel_front_clearance_m: float = BYPASS_PARALLEL_FRONT_CLEARANCE_M,
+    final_front_clearance_m: float = BYPASS_FINAL_FRONT_CLEARANCE_M,
+    max_first_leg_s: float = 6.0,
+    max_second_leg_s: float = 6.0,
+    min_turn_angle_deg: float = BYPASS_MIN_TURN_ANGLE_DEG,
+    max_turn_angle_deg: float = BYPASS_MAX_TURN_ANGLE_DEG,
+) -> dict[str, Any]:
+    """
+    Bypass a blocking object using a two-rotation / two-forward maneuver.
+
+    Sequence:
+    1) LiDAR measures front and side distances.
+    2) Compute turn angle to create lateral clearance.
+    3) Rotate toward bypass side, then move forward until object is parallel.
+    4) Rotate back, then move forward until front path is clear.
+    """
+    speed_f = _validate_finite("speed", speed)
+    turn_speed_f = _validate_finite("turn_speed", turn_speed)
+    lateral_clearance_f = _validate_finite("lateral_clearance_m", lateral_clearance_m)
+    parallel_front_clearance_f = _validate_finite("parallel_front_clearance_m", parallel_front_clearance_m)
+    final_front_clearance_f = _validate_finite("final_front_clearance_m", final_front_clearance_m)
+    max_first_leg_f = _validate_finite("max_first_leg_s", max_first_leg_s)
+    max_second_leg_f = _validate_finite("max_second_leg_s", max_second_leg_s)
+    min_turn_deg_f = _validate_finite("min_turn_angle_deg", min_turn_angle_deg)
+    max_turn_deg_f = _validate_finite("max_turn_angle_deg", max_turn_angle_deg)
+
+    side_clean = preferred_side.strip().lower() if isinstance(preferred_side, str) else ""
+    if side_clean not in ("auto", "left", "right"):
+        raise ValueError("preferred_side must be 'auto', 'left', or 'right'")
+    if lateral_clearance_f <= 0:
+        raise ValueError("lateral_clearance_m must be > 0")
+    if parallel_front_clearance_f <= 0:
+        raise ValueError("parallel_front_clearance_m must be > 0")
+    if final_front_clearance_f <= 0:
+        raise ValueError("final_front_clearance_m must be > 0")
+    if max_first_leg_f <= 0:
+        raise ValueError("max_first_leg_s must be > 0")
+    if max_second_leg_f <= 0:
+        raise ValueError("max_second_leg_s must be > 0")
+    if min_turn_deg_f <= 0:
+        raise ValueError("min_turn_angle_deg must be > 0")
+    if max_turn_deg_f < min_turn_deg_f:
+        raise ValueError("max_turn_angle_deg must be >= min_turn_angle_deg")
+
+    linear_cmd = _clamp(abs(speed_f), MAX_LINEAR)
+    angular_speed_cmd = _clamp(abs(turn_speed_f), MAX_ANGULAR)
+    if linear_cmd == 0.0:
+        raise ValueError("speed is too small after clamping; pass a larger non-zero speed")
+    if angular_speed_cmd == 0.0:
+        raise ValueError("turn_speed is too small after clamping; pass a larger non-zero turn_speed")
+
+    await _set_continuous_motion(None)
+
+    first_leg_status = "not_started"
+    second_leg_status = "not_started"
+    first_leg_elapsed_s = 0.0
+    second_leg_elapsed_s = 0.0
+    first_leg_parallel_confirmations = 0
+    second_leg_clear_confirmations = 0
+
+    initial_distances: dict[str, float | None] = {"front": None, "left": None, "right": None, "rear": None}
+    final_distances: dict[str, float | None] = {"front": None, "left": None, "right": None, "rear": None}
+    chosen_side = "left"
+    required_lateral_shift_m = 0.0
+    raw_turn_angle_deg = 0.0
+    turn_angle_deg = min_turn_deg_f
+
+    try:
+        async with Client(LIDAR_MCP_URL_V3) as lidar:
+            initial_distances, lidar_error = await _read_lidar_distances(lidar)
+            if lidar_error is not None:
+                stop_result = await _post_json(STOP_PATH)
+                return {
+                    **stop_result,
+                    "status": "lidar_unavailable",
+                    "phase": "initial_scan",
+                    "error": lidar_error,
+                }
+
+            front_start = initial_distances.get("front")
+            left_start = initial_distances.get("left")
+            right_start = initial_distances.get("right")
+
+            chosen_side = _pick_bypass_side(side_clean, left_start, right_start)
+            side_start = left_start if chosen_side == "left" else right_start
+
+            turn_angle_deg, raw_turn_angle_deg, required_lateral_shift_m = _compute_bypass_turn_angle_deg(
+                front_distance_m=front_start,
+                side_distance_m=side_start,
+                lateral_clearance_m=lateral_clearance_f,
+                min_turn_angle_deg=min_turn_deg_f,
+                max_turn_angle_deg=max_turn_deg_f,
+            )
+
+            # If the path is already clear, avoid unnecessary sidestep.
+            if front_start is not None and front_start >= final_front_clearance_f:
+                stop_result = await _post_json(STOP_PATH)
+                return {
+                    **stop_result,
+                    "status": "no_obstacle",
+                    "chosen_side": chosen_side,
+                    "turn_angle_deg": turn_angle_deg,
+                    "turn_angle_raw_deg": raw_turn_angle_deg,
+                    "required_lateral_shift_m": required_lateral_shift_m,
+                    "initial_distances": initial_distances,
+                    "final_distances": initial_distances,
+                }
+
+            turn_duration_s = math.radians(turn_angle_deg) / angular_speed_cmd
+            turn_out_direction = "left" if chosen_side == "left" else "right"
+            turn_back_direction = "right" if chosen_side == "left" else "left"
+
+            await tbot_motion_turn(
+                direction=turn_out_direction,
+                speed=angular_speed_cmd,
+                duration_seconds=turn_duration_s,
+            )
+
+            first_leg_start = time.monotonic()
+            first_leg_status = "timeout"
+            first_leg_consecutive_lidar_failures = 0
+
+            await _set_continuous_motion(linear_cmd, 0.0)
+            try:
+                while True:
+                    first_leg_elapsed_s = time.monotonic() - first_leg_start
+                    if first_leg_elapsed_s >= max_first_leg_f:
+                        first_leg_status = "timeout"
+                        break
+
+                    distances, lidar_read_error = await _read_lidar_distances(lidar)
+                    if lidar_read_error is not None:
+                        first_leg_consecutive_lidar_failures += 1
+                        if first_leg_consecutive_lidar_failures >= MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES:
+                            first_leg_status = "lidar_unavailable"
+                            break
+                    else:
+                        first_leg_consecutive_lidar_failures = 0
+                        final_distances = distances
+                        front_dist = distances.get("front")
+                        side_dist = distances.get(chosen_side)
+
+                        if front_dist is not None and front_dist <= FORWARD_COLLISION_INTERRUPT_M:
+                            first_leg_status = "collision_risk"
+                            break
+
+                        front_clear = front_dist is not None and front_dist >= parallel_front_clearance_f
+                        has_signal = front_dist is not None or side_dist is not None
+                        parallel_detected = (
+                            has_signal
+                            and front_clear
+                            and (side_dist is not None or first_leg_elapsed_s >= BYPASS_MIN_PARALLEL_TIME_S)
+                        )
+                        if parallel_detected:
+                            first_leg_parallel_confirmations += 1
+                        else:
+                            first_leg_parallel_confirmations = 0
+
+                        if first_leg_parallel_confirmations >= 2:
+                            first_leg_status = "parallel_reached"
+                            break
+
+                    await asyncio.sleep(MOTION_COLLISION_POLL_S)
+            finally:
+                await _set_continuous_motion(None)
+
+            if first_leg_status != "parallel_reached":
+                stop_result = await _post_json(STOP_PATH)
+                return {
+                    **stop_result,
+                    "status": first_leg_status,
+                    "phase": "first_leg",
+                    "chosen_side": chosen_side,
+                    "turn_angle_deg": turn_angle_deg,
+                    "turn_angle_raw_deg": raw_turn_angle_deg,
+                    "required_lateral_shift_m": required_lateral_shift_m,
+                    "initial_distances": initial_distances,
+                    "final_distances": final_distances,
+                    "first_leg_elapsed_s": first_leg_elapsed_s,
+                    "first_leg_parallel_confirmations": first_leg_parallel_confirmations,
+                }
+
+            await tbot_motion_turn(
+                direction=turn_back_direction,
+                speed=angular_speed_cmd,
+                duration_seconds=turn_duration_s,
+            )
+
+            second_leg_start = time.monotonic()
+            second_leg_status = "timeout"
+            second_leg_consecutive_lidar_failures = 0
+
+            await _set_continuous_motion(linear_cmd, 0.0)
+            try:
+                while True:
+                    second_leg_elapsed_s = time.monotonic() - second_leg_start
+                    if second_leg_elapsed_s >= max_second_leg_f:
+                        second_leg_status = "timeout"
+                        break
+
+                    distances, lidar_read_error = await _read_lidar_distances(lidar)
+                    if lidar_read_error is not None:
+                        second_leg_consecutive_lidar_failures += 1
+                        if second_leg_consecutive_lidar_failures >= MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES:
+                            second_leg_status = "lidar_unavailable"
+                            break
+                    else:
+                        second_leg_consecutive_lidar_failures = 0
+                        final_distances = distances
+                        front_dist = distances.get("front")
+                        if front_dist is not None and front_dist <= FORWARD_COLLISION_INTERRUPT_M:
+                            second_leg_status = "collision_risk"
+                            break
+                        if (
+                            front_dist is not None
+                            and front_dist >= final_front_clearance_f
+                            and second_leg_elapsed_s >= BYPASS_MIN_SECOND_LEG_TIME_S
+                        ):
+                            second_leg_clear_confirmations += 1
+                        else:
+                            second_leg_clear_confirmations = 0
+
+                        if second_leg_clear_confirmations >= 2:
+                            second_leg_status = "clear_path_reached"
+                            break
+
+                    await asyncio.sleep(MOTION_COLLISION_POLL_S)
+            finally:
+                await _set_continuous_motion(None)
+
+            stop_result = await _post_json(STOP_PATH)
+            final_status = "completed" if second_leg_status == "clear_path_reached" else second_leg_status
+            return {
+                **stop_result,
+                "status": final_status,
+                "chosen_side": chosen_side,
+                "turn_angle_deg": turn_angle_deg,
+                "turn_angle_raw_deg": raw_turn_angle_deg,
+                "required_lateral_shift_m": required_lateral_shift_m,
+                "turn_duration_s": turn_duration_s,
+                "turn_speed": angular_speed_cmd,
+                "forward_speed": linear_cmd,
+                "initial_distances": initial_distances,
+                "final_distances": final_distances,
+                "first_leg_status": first_leg_status,
+                "first_leg_elapsed_s": first_leg_elapsed_s,
+                "first_leg_parallel_confirmations": first_leg_parallel_confirmations,
+                "first_leg_move_posts": max(1, int(math.ceil(first_leg_elapsed_s / MOTION_COMMAND_REFRESH_S))),
+                "second_leg_status": second_leg_status,
+                "second_leg_elapsed_s": second_leg_elapsed_s,
+                "second_leg_clear_confirmations": second_leg_clear_confirmations,
+                "second_leg_move_posts": max(1, int(math.ceil(second_leg_elapsed_s / MOTION_COMMAND_REFRESH_S))),
+                "interrupt_distance_m": FORWARD_COLLISION_INTERRUPT_M,
+                "parallel_front_clearance_m": parallel_front_clearance_f,
+                "final_front_clearance_m": final_front_clearance_f,
+            }
+    finally:
+        try:
+            await _set_continuous_motion(None)
+            await _post_json(STOP_PATH)
+        except Exception:
+            pass
 
 
 @mcp_motion_v3.tool()

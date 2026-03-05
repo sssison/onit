@@ -42,8 +42,8 @@ MOTION_MCP_URL_V3 = os.getenv("TBOT_MOTION_MCP_URL_V3", "http://127.0.0.1:18210/
 LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
 _LINE_FOLLOW_STOP_DISTANCE_M = _env_float("LINE_FOLLOW_STOP_DISTANCE_M", 0.35)
 
-_SEARCH_STEP_DEG = 20.0
-_SEARCH_ANGULAR_SPEED = 0.3   # rad/s — speed used for each 10° rotation step
+_SEARCH_STEP_DEG = 15.0
+_SEARCH_ANGULAR_SPEED = 0.3   # rad/s — speed used for each 15° rotation step
 _SEARCH_FRAME_SETTLE_S = 0.15  # seconds to wait after rotation for a fresh frame
 _REPOSITION_DEFAULT_MAX_STEPS = 8
 
@@ -444,16 +444,16 @@ async def tbot_vision_find_object(object_name: str) -> dict[str, Any]:
 async def _vision_search_object(
     object_name: str,
     min_confidence: float = 0.5,
-    max_steps: int = 36,
+    max_steps: int = 24,
 ) -> dict[str, Any]:
     """
-    Rotate the robot in 10-degree steps and search for a named object.
+    Rotate the robot in 15-degree steps and search for a named object.
 
-    Checks the current frame first, then rotates left (CCW) 10° at a time until the
-    object is found or max_steps rotations have been completed (default 36 = full 360°).
+    Checks the current frame first, then rotates left (CCW) 15° at a time until the
+    object is found or max_steps rotations have been completed (default 24 = full 360°).
 
     min_confidence: minimum confidence threshold (0–1) to accept a detection as found.
-    max_steps: maximum number of 10° rotation steps before giving up (default 36 = 360°).
+    max_steps: maximum number of 15° rotation steps before giving up (default 24 = 360°).
 
     Returns {"found": bool, "position": "left"|"center"|"right"|null, "confidence": float,
              "bbox": ..., "steps_taken": int, "degrees_rotated": float}.
@@ -497,7 +497,7 @@ async def _vision_search_object(
             if step == max_steps:
                 break
 
-            # Rotate 10° left; duration_seconds causes auto-stop after the step
+            # Rotate one 15° step left; duration_seconds causes auto-stop after the step
             await motion.call_tool(
                 "tbot_motion_turn",
                 {"direction": "left", "speed": _SEARCH_ANGULAR_SPEED, "duration_seconds": step_duration_s},
@@ -648,7 +648,7 @@ async def tbot_vision_search_and_approach_object(
     forward_speed: float = 0.1,
     forward_step_s: float = 90.0,
     min_confidence: float = 0.5,
-    initial_search_max_steps: int = 36,
+    initial_search_max_steps: int = 24,
     timeout_s: float = 90.0,
 ) -> dict[str, Any]:
     """
