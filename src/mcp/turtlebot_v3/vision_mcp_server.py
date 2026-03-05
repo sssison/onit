@@ -247,7 +247,7 @@ async def _center_object_in_frame(
 
         try:
             await motion.call_tool(
-                "tbot_motion_move",
+                "tbot_motion_move_timed",
                 {"linear": 0.0, "angular": angular_cmd, "duration_s": duration_s},
             )
         except Exception:
@@ -441,8 +441,7 @@ async def tbot_vision_find_object(object_name: str) -> dict[str, Any]:
     }
 
 
-@mcp_vision_v3.tool()
-async def tbot_vision_search_object(
+async def _vision_search_object(
     object_name: str,
     min_confidence: float = 0.5,
     max_steps: int = 36,
@@ -498,10 +497,10 @@ async def tbot_vision_search_object(
             if step == max_steps:
                 break
 
-            # Rotate 10° left; duration_s causes auto-stop after the step
+            # Rotate 10° left; duration_seconds causes auto-stop after the step
             await motion.call_tool(
-                "tbot_motion_move",
-                {"linear": 0.0, "angular": _SEARCH_ANGULAR_SPEED, "duration_s": step_duration_s},
+                "tbot_motion_turn",
+                {"direction": "left", "speed": _SEARCH_ANGULAR_SPEED, "duration_seconds": step_duration_s},
             )
             steps_taken += 1
             # Wait for the camera frame to update after rotation
@@ -518,8 +517,7 @@ async def tbot_vision_search_object(
     }
 
 
-@mcp_vision_v3.tool()
-async def tbot_vision_reposition_for_object(
+async def _vision_reposition_for_object(
     object_name: str,
     min_confidence: float = 0.5,
     max_steps: int = _REPOSITION_DEFAULT_MAX_STEPS,
@@ -563,7 +561,7 @@ async def tbot_vision_reposition_for_object(
             "model_info": current_detection.get("model_info"),
         }
 
-    reacquire = await tbot_vision_search_object(
+    reacquire = await _vision_search_object(
         object_name=object_name_clean,
         min_confidence=min_confidence,
         max_steps=max_steps,
@@ -581,17 +579,13 @@ async def tbot_vision_reposition_for_object(
     }
 
 
-@mcp_vision_v3.tool()
-async def tbot_vision_center_object(
+async def _vision_center_object(
     object_name: str,
     min_confidence: float = 0.5,
     center_tolerance: float = 0.10,
     max_iterations: int = 3,
 ) -> dict[str, Any]:
     """
-    Do NOT call any LiDAR tools before or after this tool.
-    Centering uses rotation only. The motion server enforces collision limits internally.
-
     Rotate in place until a detected object is centred in the camera frame.
 
     Uses bbox.cx and CAMERA_HFOV_DEG to compute a proportional corrective
@@ -609,6 +603,41 @@ async def tbot_vision_center_object(
             center_tolerance=center_tolerance,
             max_iterations=max_iterations,
         )
+
+
+@mcp_vision_v3.tool()
+async def tbot_vision_find_and_center_object(object_name: str) -> dict[str, Any]:
+    """
+    Search for a named object with a 360° scan, then rotate to center it in the
+    camera frame. Use this when you want to face an object without driving toward it.
+    Returns {"found": bool, "center_status": str, "final_cx": float|None,
+             "steps_taken": int, "degrees_rotated": float}.
+    """
+    object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
+    if not object_name_clean:
+        raise ValueError("object_name must be a non-empty string")
+
+    search_result = await _vision_search_object(object_name_clean)
+    if not search_result.get("found"):
+        return {
+            "found": False,
+            "center_status": "not_found",
+            "steps_taken": search_result.get("steps_taken", 0),
+            "degrees_rotated": search_result.get("degrees_rotated", 0.0),
+            "final_cx": None,
+        }
+
+    motion_url = os.getenv("TBOT_MOTION_MCP_URL_V3", MOTION_MCP_URL_V3)
+    async with Client(motion_url) as motion:
+        center_result = await _center_object_in_frame(object_name_clean, motion)
+
+    return {
+        "found": True,
+        "center_status": center_result.get("status"),
+        "steps_taken": search_result.get("steps_taken", 0),
+        "degrees_rotated": search_result.get("degrees_rotated", 0.0),
+        "final_cx": center_result.get("final_cx"),
+    }
 
 
 @mcp_vision_v3.tool()
@@ -675,7 +704,7 @@ async def tbot_vision_search_and_approach_object(
     last_detection: dict[str, Any] | None = None
     errors: list[str] = []
 
-    initial_search = await tbot_vision_search_object(
+    initial_search = await _vision_search_object(
         object_name=object_name_clean,
         min_confidence=min_confidence,
         max_steps=initial_search_max_steps,
@@ -701,7 +730,7 @@ async def tbot_vision_search_and_approach_object(
         }
 
     # Verification pass before any approach movement.
-    verification = await tbot_vision_reposition_for_object(
+    verification = await _vision_reposition_for_object(
         object_name=object_name_clean,
         min_confidence=min_confidence,
         max_steps=verification_max_steps,
@@ -775,8 +804,8 @@ async def tbot_vision_search_and_approach_object(
 
                 # 1) Estimate front distance first.
                 lidar_raw = await lidar.call_tool(
-                    "tbot_lidar_get_obstacle_distances",
-                    {"sector": "front"},
+                    "tbot_lidar_check_collision",
+                    {"front_threshold_m": collision_interrupt_m},
                 )
                 lidar_data = _extract_tool_result_dict(lidar_raw)
                 front_distance = _front_distance_from_lidar(lidar_data)
@@ -912,8 +941,8 @@ async def tbot_vision_search_and_approach_object(
 
                 # 5) Final LiDAR check after post-approach verification.
                 post_lidar_raw = await lidar.call_tool(
-                    "tbot_lidar_get_obstacle_distances",
-                    {"sector": "front"},
+                    "tbot_lidar_check_collision",
+                    {"front_threshold_m": collision_interrupt_m},
                 )
                 post_lidar_data = _extract_tool_result_dict(post_lidar_raw)
                 post_front_distance = _front_distance_from_lidar(post_lidar_data)
@@ -1073,7 +1102,7 @@ async def tbot_vision_follow_line(
                 speed = _LINE_FOLLOW_SPEED * 0.5 if risk_level == "caution" else _LINE_FOLLOW_SPEED
 
                 await motion.call_tool(
-                    "tbot_motion_move",
+                    "tbot_motion_move_timed",
                     {"linear": speed, "angular": angular, "duration_s": _LINE_FOLLOW_TICK_S},
                 )
                 ticks_followed += 1

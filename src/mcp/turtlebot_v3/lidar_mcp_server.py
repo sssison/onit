@@ -358,27 +358,6 @@ async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, An
 
 
 @mcp_lidar_v3.tool()
-async def tbot_lidar_is_path_clear(threshold_m: float = 0.5) -> dict[str, Any]:
-    """
-    Check if the forward path is clear (front sector min distance > threshold_m).
-
-    NOTE: Do NOT call this before tbot_motion_move_forward or tbot_motion_move.
-    Those tools check for obstacles internally. Pre-calling adds ~3 s delay.
-    """
-    try:
-        scan = await _get_one_scan()
-    except Exception as e:
-        return {"clear": False, "min_forward_distance": None, "error": str(e)}
-
-    stats = _compute_sector_stats(scan, center_deg=0.0, half_width_deg=45.0)
-    if stats["status"] != "ok" or stats["min_m"] is None:
-        return {"clear": False, "min_forward_distance": None}
-
-    min_dist = float(stats["min_m"])
-    return {"clear": min_dist > threshold_m, "min_forward_distance": min_dist}
-
-
-@mcp_lidar_v3.tool()
 async def tbot_lidar_check_collision(
     front_threshold_m: float = 0.1,
     side_threshold_m: float = 0.2,
@@ -392,10 +371,10 @@ async def tbot_lidar_check_collision(
       "caution" — front distance between front_threshold_m and 2 × front_threshold_m
       "clear"   — front distance >= 2 × front_threshold_m
 
-    Returns {risk_level, distances: {front, left, right, rear}}.
+    Returns {risk_level, min_forward_distance_m, distances: {front, left, right, rear}}.
 
-    NOTE: Do NOT call this before tbot_motion_move_forward, tbot_motion_move (with
-    duration_s), tbot_motion_approach_until_close, or tbot_motion_move_along_wall.
+    NOTE: Do NOT call this before tbot_motion_move_forward, tbot_motion_move_timed,
+    tbot_motion_approach_until_close, or tbot_motion_move_along_wall.
     Those tools already run this check internally on every tick. Pre-calling adds
     ~3 s of scan delay before the robot starts moving.
     """
@@ -404,6 +383,7 @@ async def tbot_lidar_check_collision(
     except Exception as e:
         return {
             "risk_level": "stop",
+            "min_forward_distance_m": None,
             "distances": {"front": None, "left": None, "right": None, "rear": None},
             "error": str(e),
         }
@@ -426,7 +406,7 @@ async def tbot_lidar_check_collision(
     else:
         risk_level = "clear"
 
-    return {"risk_level": risk_level, "distances": distances}
+    return {"risk_level": risk_level, "min_forward_distance_m": distances.get("front"), "distances": distances}
 
 
 @mcp_lidar_v3.tool()
