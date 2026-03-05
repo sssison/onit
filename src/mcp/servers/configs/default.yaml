@@ -49,7 +49,7 @@ servers:
   - name: TurtlebotMotionMCPServerV2
     module: src.mcp.turtlebot_v2.motion_mcp_server
     description: "TurtleBot motion MCP server V2"
-    enabled: true
+    enabled: false
     host : 0.0.0.0
     port : 18205
     path : /turtlebot-motion-v2
@@ -58,7 +58,7 @@ servers:
   - name: TurtlebotCameraMCPServerV2
     module: src.mcp.turtlebot_v2.camera_mcp_server
     description: "TurtleBot camera MCP server V2"
-    enabled: true
+    enabled: false
     host : 0.0.0.0
     port : 18206
     path : /turtlebot-camera-v2
@@ -67,7 +67,7 @@ servers:
   - name: TurtlebotVisionMCPServerV2
     module: src.mcp.turtlebot_v2.vision_mcp_server
     description: "TurtleBot vision MCP server V2"
-    enabled: true
+    enabled: false
     host : 0.0.0.0
     port : 18207
     path : /turtlebot-vision-v2
@@ -76,7 +76,7 @@ servers:
   - name: TurtlebotLidarMCPServerV2
     module: src.mcp.turtlebot_v2.lidar_mcp_server
     description: "TurtleBot LiDAR MCP server V2"
-    enabled: true
+    enabled: false
     host : 0.0.0.0
     port : 18208
     path : /turtlebot-lidar-v2
@@ -108,4 +108,3 @@ servers:
     port : 18212
     path : /turtlebot-lidar-v3
     transport : 'streamable-http'
-

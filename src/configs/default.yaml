@@ -93,7 +93,7 @@ mcp:
     - name: TurtlebotCameraServerV2
       description: Connects to TurtleBot camera MCP server V2
       url: "http://localhost:18206/turtlebot-camera-v2"
-      enabled: true
+      enabled: false
 
     - name: TurtlebotVisionServerV2
       description: Connects to TurtleBot vision MCP server V2
@@ -103,9 +103,24 @@ mcp:
     - name: TurtlebotLidarServerV2
       description: Connects to TurtleBot LiDAR MCP server V2
       url: "http://localhost:18208/turtlebot-lidar-v2"
-      enabled: true
+      enabled: false
 
     - name: TurtlebotSearchServerV2
       description: Connects to TurtleBot composite search MCP server V2
       url: "http://localhost:18209/turtlebot-search-v2"
+      enabled: false
+
+    - name: TurtlebotMotionServerV3
+      description: Connects to TurtleBot motion MCP server V3
+      url: "http://localhost:18210/turtlebot-motion-v3"
+      enabled: true
+
+    - name: TurtlebotVisionServerV3
+      description: Connects to TurtleBot vision MCP server V3 (reads /dev/shm/latest_frame.jpg)
+      url: "http://localhost:18211/turtlebot-vision-v3"
+      enabled: true
+
+    - name: TurtlebotLidarServerV3
+      description: Connects to TurtleBot LiDAR MCP server V3
+      url: "http://localhost:18212/turtlebot-lidar-v3"
       enabled: true

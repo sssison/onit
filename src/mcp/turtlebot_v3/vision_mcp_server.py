@@ -652,10 +652,8 @@ async def tbot_vision_search_and_approach_object(
     timeout_s: float = 90.0,
 ) -> dict[str, Any]:
     """
-    IMPORTANT: Do NOT call any LiDAR tools before this tool.
-    All LiDAR collision checking is handled internally on every motion tick.
-    Pre-calling tbot_lidar_check_collision or tbot_lidar_get_obstacle_distances
-    adds 3+ seconds of delay per call with zero safety benefit.
+    This tool performs LiDAR reads while stationary to plan forward travel.
+    Do not perform redundant pre-calls to the same LiDAR checks right before this tool.
 
     Verification-gated single-approach object behavior:
     1) Scan once to locate object.
@@ -854,8 +852,8 @@ async def tbot_vision_search_and_approach_object(
                         "errors": errors or None,
                     }
 
-                # 2) LiDAR-guided forward approach: let the motion server decide
-                # dynamic forward distance using live LiDAR feedback.
+                # 2) Planned forward approach: motion tool precomputes move distance
+                # from front LiDAR before executing the forward segment.
                 remaining_timeout = max(0.1, timeout_s - (time.monotonic() - started))
                 approach_raw = await motion.call_tool(
                     "tbot_motion_approach_until_close",

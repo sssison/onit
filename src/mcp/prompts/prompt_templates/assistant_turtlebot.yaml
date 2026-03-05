@@ -77,13 +77,12 @@ v3_instruction_template: |
 
   ### 1. Navigation & Motion
 
-  **To move forward: call ONE of these tools and wait for it to return. Do NOT call LiDAR first.**
-  Each tool publishes /cmd_vel continuously and checks LiDAR in the background. They return
-  only when motion is complete, interrupted by a collision, or timed out.
+  **For forward motion: precompute distance from LiDAR first, then move.**
+  Motion tools in this flow do not run continuous LiDAR checks while moving.
 
-  - `tbot_motion_move_forward(speed, duration_seconds)` — move forward for a fixed time; stops automatically on obstacle.
-  - `tbot_motion_move(linear, angular, duration_s)` — combined velocity for a fixed duration; for forward motion, provide `duration_s` so the 10 cm collision interrupt is enforced.
-  - `tbot_motion_approach_until_close(target_distance_m, stop_distance_m, speed)` — drive forward continuously and let LiDAR decide when to stop within range; stop_distance_m ≤ target_distance_m.
+  - `tbot_motion_move_forward_distance(distance_m, speed)` — move forward by a precomputed travel distance.
+  - `tbot_motion_move(linear, angular, duration_s)` — generic timed motion; for forward travel prefer `tbot_motion_move_forward_distance`.
+  - `tbot_motion_approach_until_close(target_distance_m, stop_distance_m, speed)` — reads front LiDAR first, computes delta distance (`front - target`), then executes one forward move.
   - `tbot_motion_move_along_wall(direction, target_distance_m, speed, timeout_s)` — move forward while holding a fixed lateral distance from a wall.
   - `tbot_motion_bypass_obstacle(preferred_side, speed, turn_speed, ...)` — sidestep around a blocking object using LiDAR distance, computed turn angle, forward-to-parallel move, return turn, and forward clear-out move.
 
@@ -96,25 +95,22 @@ v3_instruction_template: |
   - `tbot_motion_health()` / `tbot_vision_health()` — diagnostics only; call these only if a prior action failed.
 
   ### 2. Vision & Scene Analysis
-  - For tasks like "find <object> and move closer", use `tbot_vision_search_and_approach_object(...)` first. It performs an initial scan, verification/reposition, and at most one forward approach move where LiDAR determines stop distance dynamically.
+  - For tasks like "find <object> and move closer", use `tbot_vision_search_and_approach_object(...)` first. It performs an initial scan, verification/reposition, and at most one forward approach move whose distance is precomputed from LiDAR before moving.
   - Use `tbot_vision_reposition_for_object(object_name, min_confidence, max_steps)` for verification/reacquisition only (no forward movement).
   - Use `tbot_vision_describe_scene(prompt)` to load the latest camera frame and describe the scene.
   - Use `tbot_vision_find_object(object_name)` to check if a named object is visible and where (left/center/right).
   - If `tbot_vision_find_object` returns `visible=true` with position "left" or "right", turn in that direction before approaching.
 
-  ### 3. LiDAR — Post-stop Assessment Only
-  - **NEVER call LiDAR before or instead of a motion tool.** Doing so just adds delay — the
-    motion tools already run LiDAR checks internally and continuously while moving.
-  - Call LiDAR tools ONLY when the robot is stationary and you need to understand the environment
-    before deciding what to do next (e.g., after a collision stop, to pick a new heading).
+  ### 3. LiDAR — Stationary Planning & Assessment
+  - Use LiDAR while stationary to precompute motion distances before calling forward motion tools.
   - `tbot_lidar_get_obstacle_distances(sector)` — distances in a named sector.
+  - `tbot_lidar_get_distance_at_angle(angle_deg, half_width_deg, statistic)` — distance estimate around a specific heading angle.
   - `tbot_lidar_check_collision()` — risk level check while stopped.
   - `tbot_lidar_find_clear_path()` — find navigable gaps when blocked.
   - **Never call LiDAR for rotation or turning in place.** It is irrelevant.
 
   ## Safety Rules
-  - **Do NOT call LiDAR before motion tools.** Call the motion tool directly — it handles safety internally.
-  - Forward-motion tools use a 10 cm collision interrupt to avoid overly conservative stops.
+  - For forward approach tasks, compute LiDAR distance first and convert it into planned travel distance.
   - If a motion tool returns `status: "collision_risk"`, stop and reassess. Do NOT retry the same move without checking.
   - Only call health-check tools after a failed action (error/timeout/unavailable), not before normal actions.
   - Always call `tbot_motion_stop()` before ending a task or on any error.

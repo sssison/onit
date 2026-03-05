@@ -309,10 +309,8 @@ async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, An
     sector: "front" | "left" | "right" | "rear" | "all"
     Returns {status, sector, distance_m, distances: {front, left, right, rear}}.
 
-    NOTE: Do NOT call this as a pre-check before motion tools. tbot_motion_move_forward,
-    tbot_motion_move (with duration_s), tbot_motion_approach_until_close, and
-    tbot_motion_move_along_wall all poll LiDAR internally. Pre-calling queues an
-    extra ~3 s scan and delays the robot's movement.
+    NOTE: Motion planners may call this to precompute movement distances.
+    For preplanned forward motion in V3, LiDAR is read before moving.
     """
     sector_clean = sector.strip().lower() if isinstance(sector, str) else "all"
     valid_sectors = set(_SECTOR_CENTERS.keys()) | {"all"}
@@ -358,6 +356,75 @@ async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, An
 
 
 @mcp_lidar_v3.tool()
+async def tbot_lidar_get_distance_at_angle(
+    angle_deg: float,
+    half_width_deg: float = 2.0,
+    statistic: str = "min",
+) -> dict[str, Any]:
+    """
+    Return LiDAR distance around a specific heading angle.
+
+    angle_deg: heading to sample (0=front, 90=left, -90=right).
+    half_width_deg: half-width of the cone around angle_deg.
+    statistic: "min" or "mean" distance within the cone.
+    """
+    if not isinstance(angle_deg, (int, float)) or not math.isfinite(float(angle_deg)):
+        raise ValueError("angle_deg must be a finite number")
+    if not isinstance(half_width_deg, (int, float)) or not math.isfinite(float(half_width_deg)):
+        raise ValueError("half_width_deg must be a finite number")
+    half_width_f = float(half_width_deg)
+    if half_width_f <= 0:
+        raise ValueError("half_width_deg must be > 0")
+
+    statistic_clean = statistic.strip().lower() if isinstance(statistic, str) else "min"
+    if statistic_clean not in ("min", "mean"):
+        raise ValueError("statistic must be 'min' or 'mean'")
+
+    try:
+        scan = await _get_one_scan()
+    except Exception as e:
+        return {
+            "status": "no_scan",
+            "angle_deg": float(angle_deg),
+            "half_width_deg": half_width_f,
+            "statistic": statistic_clean,
+            "distance_m": None,
+            "error": str(e),
+        }
+
+    stats = _compute_sector_stats(
+        scan,
+        center_deg=float(angle_deg),
+        half_width_deg=half_width_f,
+    )
+    if stats["status"] != "ok":
+        return {
+            "status": stats["status"],
+            "angle_deg": float(angle_deg),
+            "half_width_deg": half_width_f,
+            "statistic": statistic_clean,
+            "distance_m": None,
+            "valid_count": stats["valid_count"],
+            "total_count": stats["total_count"],
+            "closest_angle_deg": stats["closest_angle_deg"],
+        }
+
+    distance_m = float(stats["min_m"]) if statistic_clean == "min" else float(stats["mean_m"])
+    return {
+        "status": "ok",
+        "angle_deg": float(angle_deg),
+        "half_width_deg": half_width_f,
+        "statistic": statistic_clean,
+        "distance_m": distance_m,
+        "min_m": float(stats["min_m"]),
+        "mean_m": float(stats["mean_m"]),
+        "valid_count": stats["valid_count"],
+        "total_count": stats["total_count"],
+        "closest_angle_deg": stats["closest_angle_deg"],
+    }
+
+
+@mcp_lidar_v3.tool()
 async def tbot_lidar_check_collision(
     front_threshold_m: float = 0.1,
     side_threshold_m: float = 0.2,
@@ -373,10 +440,7 @@ async def tbot_lidar_check_collision(
 
     Returns {risk_level, min_forward_distance_m, distances: {front, left, right, rear}}.
 
-    NOTE: Do NOT call this before tbot_motion_move_forward, tbot_motion_move_timed,
-    tbot_motion_approach_until_close, or tbot_motion_move_along_wall.
-    Those tools already run this check internally on every tick. Pre-calling adds
-    ~3 s of scan delay before the robot starts moving.
+    NOTE: This tool is intended for pre-move assessment and stationary checks.
     """
     try:
         scan = await _get_one_scan()
