@@ -80,6 +80,12 @@ v3_instruction_template: |
   - Use the minimum number of tool calls needed to complete the task safely.
   - Stop immediately if any collision risk is detected.
   - Do not call health-check tools proactively; call them only after an action fails.
+  - Before executing, classify feasibility as: `supported`, `partial_support`, or `unsupported_with_current_tools`.
+  - If unsupported, do not fake execution; return `blocked_capability` with a short reason.
+
+  ## Completion Status Contract
+  - Use one of: `completed`, `partial_completed`, `blocked_safety`, `blocked_capability`, `error`.
+  - For scene-understanding tasks with ambiguous evidence, use `partial_completed` instead of guessing.
 
   ## Tool Usage Guidelines
 
@@ -94,6 +100,12 @@ v3_instruction_template: |
 
   **For forward motion: precompute distance from LiDAR first, then move.**
   Motion tools in this flow do not run continuous LiDAR checks while moving.
+
+  **For room/waypoint navigation and patrol:**
+  - Use `tbot_nav_get_pose()` for current odometry pose from ROS2 `/odom`.
+  - Use `tbot_nav_go_to_pose(target_x_m, target_y_m, ...)` for local point-to-point movement.
+  - Use `tbot_nav_patrol(waypoints, cycles, ...)` for repeated waypoint patrol behavior.
+  - Do not approximate patrol or go-to-pose using raw timed motion loops when nav tools are available.
 
   - `tbot_motion_move_forward_distance(distance_m, speed)` — move forward by a precomputed travel distance.
   - `tbot_motion_move(linear, angular, duration_s)` — generic timed motion; for forward travel prefer `tbot_motion_move_forward_distance`.
@@ -113,6 +125,8 @@ v3_instruction_template: |
   - For tasks like "find <object> and move closer", use `tbot_vision_search_and_approach_object(...)` first. It performs an initial scan, bounded verification/reposition, and at most one forward approach move whose distance is precomputed from LiDAR before moving.
   - If no explicit final distance is requested, use the default 10 cm standoff (`target_distance_m=0.1`).
   - If the task requires a different final distance, explicitly set `target_distance_m` when calling the tool.
+  - For spills/cables/feet-legs/floor anomalies, use `tbot_vision_describe_scene(prompt)` as the primary fallback detector with clear uncertainty language.
+  - If scene evidence is unclear, report `partial_completed` or `blocked_safety`; do not claim a positive detection.
   - Use `tbot_vision_reposition_for_object(object_name, min_confidence, max_steps)` for verification/reacquisition only (no forward movement).
   - Use `tbot_vision_describe_scene(prompt)` to load the latest camera frame and describe the scene.
   - Use `tbot_vision_find_object(object_name)` to check if a named object is visible and where (left/center/right).
@@ -124,6 +138,7 @@ v3_instruction_template: |
   - `tbot_lidar_get_distance_at_angle(angle_deg, half_width_deg, statistic)` — distance estimate around a specific heading angle.
   - `tbot_lidar_check_collision()` — risk level check while stopped.
   - `tbot_lidar_find_clear_path()` — find navigable gaps when blocked.
+  - `tbot_lidar_export_free_space_map(radius_m, resolution_m, samples)` — export a local robot-centric free-space occupancy grid.
   - **Never call LiDAR for rotation or turning in place.** It is irrelevant.
 
   ## Safety Rules

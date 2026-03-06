@@ -218,6 +218,51 @@ def _compute_sector_stats(scan: dict[str, Any], center_deg: float, half_width_de
     }
 
 
+def _grid_index_from_xy(
+    x_m: float,
+    y_m: float,
+    resolution_m: float,
+    width: int,
+    height: int,
+) -> tuple[int, int] | None:
+    if resolution_m <= 0:
+        return None
+    cx = width // 2
+    cy = height // 2
+    gx = int(round(x_m / resolution_m)) + cx
+    gy = cy - int(round(y_m / resolution_m))
+    if gx < 0 or gx >= width or gy < 0 or gy >= height:
+        return None
+    return gx, gy
+
+
+def _mark_ray_free_cells(
+    grid: list[list[int]],
+    angle_rad: float,
+    distance_m: float,
+    resolution_m: float,
+) -> None:
+    width = len(grid[0]) if grid else 0
+    height = len(grid)
+    if width == 0 or height == 0:
+        return
+    if distance_m <= 0:
+        return
+
+    step = 0.0
+    while step < distance_m:
+        x_m = step * math.cos(angle_rad)
+        y_m = step * math.sin(angle_rad)
+        index = _grid_index_from_xy(x_m, y_m, resolution_m, width, height)
+        if index is None:
+            step += resolution_m
+            continue
+        gx, gy = index
+        if grid[gy][gx] != 100:
+            grid[gy][gx] = 0
+        step += resolution_m
+
+
 # --- Short-lived rclpy node pattern ---
 
 
@@ -542,6 +587,118 @@ async def tbot_lidar_find_clear_path(
     gaps.sort(key=lambda g: g["width_m"], reverse=True)
     best_gap = gaps[0] if gaps else None
     return {"gaps": gaps, "best_gap": best_gap}
+
+
+@mcp_lidar_v3.tool()
+async def tbot_lidar_export_free_space_map(
+    radius_m: float = 2.0,
+    resolution_m: float = 0.1,
+    samples: int = 1,
+) -> dict[str, Any]:
+    """
+    Export a local robot-centric free-space occupancy grid.
+
+    Grid encoding:
+      -1 = unknown
+       0 = free
+     100 = occupied
+    """
+    if not isinstance(radius_m, (int, float)) or not math.isfinite(float(radius_m)):
+        raise ValueError("radius_m must be a finite number")
+    if not isinstance(resolution_m, (int, float)) or not math.isfinite(float(resolution_m)):
+        raise ValueError("resolution_m must be a finite number")
+    if not isinstance(samples, int):
+        raise ValueError("samples must be an integer")
+
+    radius_f = float(radius_m)
+    resolution_f = float(resolution_m)
+    if radius_f <= 0:
+        raise ValueError("radius_m must be > 0")
+    if resolution_f <= 0:
+        raise ValueError("resolution_m must be > 0")
+    if samples < 1:
+        raise ValueError("samples must be >= 1")
+
+    scans: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for _ in range(samples):
+        try:
+            scans.append(await _get_one_scan())
+        except Exception as e:
+            errors.append(str(e))
+            if not scans:
+                return {
+                    "status": "no_scan",
+                    "grid": [],
+                    "best_effort_samples": 0,
+                    "error": str(e),
+                }
+            break
+
+    base_scan = scans[0]
+    ranges = list(base_scan["ranges"])
+    range_min = float(base_scan["range_min"])
+    range_max = float(base_scan["range_max"])
+
+    # Merge multiple scans conservatively by taking nearest valid range per ray.
+    if len(scans) > 1:
+        merged_ranges: list[float] = []
+        for i in range(len(ranges)):
+            candidates: list[float] = []
+            for scan in scans:
+                value = scan["ranges"][i]
+                if _is_valid_range(value, range_min, range_max):
+                    candidates.append(float(value))
+            merged_ranges.append(min(candidates) if candidates else float("inf"))
+        ranges = merged_ranges
+
+    grid_size = int(math.ceil((2.0 * radius_f) / resolution_f)) + 1
+    grid = [[-1 for _ in range(grid_size)] for _ in range(grid_size)]
+
+    for i, value in enumerate(ranges):
+        angle_rad = float(base_scan["angle_min"]) + i * float(base_scan["angle_increment"])
+        valid = _is_valid_range(value, range_min, range_max)
+        ray_distance = min(float(value), radius_f) if valid else radius_f
+
+        _mark_ray_free_cells(grid, angle_rad=angle_rad, distance_m=ray_distance, resolution_m=resolution_f)
+
+        if valid and float(value) <= radius_f:
+            obstacle_x = float(value) * math.cos(angle_rad)
+            obstacle_y = float(value) * math.sin(angle_rad)
+            obstacle_idx = _grid_index_from_xy(
+                obstacle_x,
+                obstacle_y,
+                resolution_f,
+                grid_size,
+                grid_size,
+            )
+            if obstacle_idx is not None:
+                gx, gy = obstacle_idx
+                grid[gy][gx] = 100
+
+    free_cells = sum(1 for row in grid for cell in row if cell == 0)
+    occupied_cells = sum(1 for row in grid for cell in row if cell == 100)
+    known_cells = free_cells + occupied_cells
+    free_space_ratio = (free_cells / known_cells) if known_cells > 0 else 0.0
+
+    response: dict[str, Any] = {
+        "status": "ok",
+        "frame_id": base_scan.get("frame_id"),
+        "radius_m": radius_f,
+        "resolution_m": resolution_f,
+        "width": grid_size,
+        "height": grid_size,
+        "origin_cell": {"x": grid_size // 2, "y": grid_size // 2},
+        "grid": grid,
+        "free_cells": free_cells,
+        "occupied_cells": occupied_cells,
+        "unknown_cells": (grid_size * grid_size) - known_cells,
+        "free_space_ratio": free_space_ratio,
+        "best_effort_samples": len(scans),
+    }
+    if errors:
+        response["errors"] = errors
+    return response
 
 
 def run(
