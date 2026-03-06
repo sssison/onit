@@ -46,12 +46,13 @@ _SEARCH_STEP_DEG = 15.0
 _SEARCH_ANGULAR_SPEED = 0.3   # rad/s — speed used for each 15° rotation step
 _SEARCH_FRAME_SETTLE_S = 0.15  # seconds to wait after rotation for a fresh frame
 _REPOSITION_DEFAULT_MAX_STEPS = 8
+_SEARCH_REPOSITION_MAX_STEPS = 3
 
 _LINE_FOLLOW_SPEED = _env_float("LINE_FOLLOW_SPEED", 0.1)
 _LINE_FOLLOW_ANGULAR = _env_float("LINE_FOLLOW_ANGULAR", 0.3)
 _LINE_FOLLOW_TICK_S = _env_float("LINE_FOLLOW_TICK_S", 0.2)
 _VISION_FORWARD_COLLISION_INTERRUPT_M = _env_float("VISION_FORWARD_COLLISION_INTERRUPT_M", 0.1)
-_APPROACH_MIN_TARGET_DISTANCE_M = _env_float("APPROACH_MIN_TARGET_DISTANCE_M", 0.25)
+_APPROACH_MIN_TARGET_DISTANCE_M = _env_float("APPROACH_MIN_TARGET_DISTANCE_M", 0.10)
 
 
 def _extract_tool_result_dict(tool_result: Any) -> dict[str, Any]:
@@ -643,7 +644,7 @@ async def tbot_vision_find_and_center_object(object_name: str) -> dict[str, Any]
 @mcp_vision_v3.tool()
 async def tbot_vision_search_and_approach_object(
     object_name: str,
-    target_distance_m: float = 0.5,
+    target_distance_m: float = 0.1,
     stop_distance_m: float = 0.1,
     forward_speed: float = 0.1,
     forward_step_s: float = 90.0,
@@ -660,7 +661,9 @@ async def tbot_vision_search_and_approach_object(
     2) Verify/reposition object visibility.
     3) Estimate front distance via LiDAR.
     4) Move forward at most once (only when needed).
-    5) Verify visibility again and return final status.
+
+    target_distance_m defaults to 10 cm when the caller does not provide
+    a specific distance.
 
     stop_distance_m is retained for compatibility; forward collision interrupt
     uses a fixed 10 cm threshold.
@@ -687,7 +690,7 @@ async def tbot_vision_search_and_approach_object(
 
     collision_interrupt_m = max(0.1, float(_VISION_FORWARD_COLLISION_INTERRUPT_M))
     effective_target_distance_m = max(float(target_distance_m), _APPROACH_MIN_TARGET_DISTANCE_M)
-    verification_max_steps = min(_REPOSITION_DEFAULT_MAX_STEPS, max(1, int(initial_search_max_steps)))
+    verification_max_steps = min(_SEARCH_REPOSITION_MAX_STEPS, max(1, int(initial_search_max_steps)))
 
     started = time.monotonic()
     motion_url = os.getenv("TBOT_MOTION_MCP_URL_V3", MOTION_MCP_URL_V3)
@@ -913,53 +916,15 @@ async def tbot_vision_search_and_approach_object(
                         "errors": [*errors, f"Unexpected approach status: {approach_status!r}"],
                     }
 
-                # 4) Lightweight visibility confirmation after approach (single VLM call).
-                post_check = await tbot_vision_find_object(object_name_clean)
-                counters["verification_scans"] += 1
-                last_detection = {
-                    "visible": bool(post_check.get("visible", False)),
-                    "confidence": float(post_check.get("confidence", 0.0) or 0.0),
-                    "position": post_check.get("position"),
-                    "bbox": post_check.get("bbox"),
-                }
-                if not post_check.get("visible") or (post_check.get("confidence") or 0.0) < 0.3:
-                    await _safe_motion_stop(motion)
-                    return {
-                        "status": "verification_failed",
-                        "object_name": object_name_clean,
-                        "target_distance_m": effective_target_distance_m,
-                        "requested_target_distance_m": float(target_distance_m),
-                        "final_front_distance_m": None,
-                        "phases": counters,
-                        "last_detection": last_detection,
-                        "history_summary": {"errors_count": len(errors)},
-                        "timing_s": time.monotonic() - started,
-                        "errors": errors or None,
-                    }
-
-                # 5) Final LiDAR check after post-approach verification.
-                post_lidar_raw = await lidar.call_tool(
-                    "tbot_lidar_check_collision",
-                    {"front_threshold_m": collision_interrupt_m},
-                )
-                post_lidar_data = _extract_tool_result_dict(post_lidar_raw)
-                post_front_distance = _front_distance_from_lidar(post_lidar_data)
-
                 await _safe_motion_stop(motion)
-
-                if post_front_distance is not None and post_front_distance <= effective_target_distance_m:
-                    final_status = "reached"
-                elif post_front_distance is not None and post_front_distance <= collision_interrupt_m:
-                    final_status = "collision_blocked"
-                else:
-                    final_status = "approached"
+                final_status = "reached" if approach_status == "reached" else "approached"
 
                 return {
                     "status": final_status,
                     "object_name": object_name_clean,
                     "target_distance_m": effective_target_distance_m,
                     "requested_target_distance_m": float(target_distance_m),
-                    "final_front_distance_m": post_front_distance,
+                    "final_front_distance_m": approach_front_distance,
                     "phases": counters,
                     "last_detection": last_detection,
                     "history_summary": {"errors_count": len(errors)},

@@ -9,11 +9,18 @@ instruction_template: |
 
   ## General Approach
   - Think step by step before acting.
+  - Use the minimum number of tool calls needed to complete the task safely.
   - Always verify sensor data before commanding motion.
   - Stop immediately if any collision risk is detected.
   - Do not call health-check tools proactively; call them only after an action fails.
 
   ## Tool Usage Guidelines
+
+  ### 0. Tool Call Efficiency
+  - Do not call multiple tools that provide the same information for the same step.
+  - Do not repeat the same tool call with the same arguments unless the robot state changed (moved/turned), the prior call failed, or the task explicitly requires re-checking.
+  - Prefer single-call combined tools when available (for example, `tbot_vision_capture_and_analyze`) instead of splitting into extra calls.
+  - After a successful step, proceed to the next required action instead of re-verifying immediately.
 
   ### 1. Navigation & Motion
   - Use `tbot_motion_move(linear, angular, duration_s)` for arbitrary motion (forward, backward, arcs).
@@ -70,10 +77,18 @@ v3_instruction_template: |
 
   ## General Approach
   - Think step by step before acting.
+  - Use the minimum number of tool calls needed to complete the task safely.
   - Stop immediately if any collision risk is detected.
   - Do not call health-check tools proactively; call them only after an action fails.
 
   ## Tool Usage Guidelines
+
+  ### 0. Tool Call Efficiency
+  - Avoid redundant checks: do not call multiple tools that return equivalent information for the same decision.
+  - Do not repeat a tool call with identical inputs unless state has changed, the prior call failed, or re-validation is explicitly required.
+  - Prefer higher-level tools that already bundle scan/verify/approach logic (for example, `tbot_vision_search_and_approach_object`) instead of manually chaining extra checks.
+  - After any successful action, make only the next required call; avoid trailing confirmation calls unless safety or task requirements demand them.
+  - Never pre-call health tools before normal actions.
 
   ### 1. Navigation & Motion
 
@@ -95,7 +110,9 @@ v3_instruction_template: |
   - `tbot_motion_health()` / `tbot_vision_health()` — diagnostics only; call these only if a prior action failed.
 
   ### 2. Vision & Scene Analysis
-  - For tasks like "find <object> and move closer", use `tbot_vision_search_and_approach_object(...)` first. It performs an initial scan, verification/reposition, and at most one forward approach move whose distance is precomputed from LiDAR before moving.
+  - For tasks like "find <object> and move closer", use `tbot_vision_search_and_approach_object(...)` first. It performs an initial scan, bounded verification/reposition, and at most one forward approach move whose distance is precomputed from LiDAR before moving.
+  - If no explicit final distance is requested, use the default 10 cm standoff (`target_distance_m=0.1`).
+  - If the task requires a different final distance, explicitly set `target_distance_m` when calling the tool.
   - Use `tbot_vision_reposition_for_object(object_name, min_confidence, max_steps)` for verification/reacquisition only (no forward movement).
   - Use `tbot_vision_describe_scene(prompt)` to load the latest camera frame and describe the scene.
   - Use `tbot_vision_find_object(object_name)` to check if a named object is visible and where (left/center/right).

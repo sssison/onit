@@ -203,8 +203,8 @@ def test_reposition_for_object_returns_already_visible_without_scan():
                 "model_info": {"name": "test-model"},
             }
         ),
-    ), patch.object(vision_v3, "tbot_vision_search_object", new=search_mock):
-        result = asyncio.run(vision_v3.tbot_vision_reposition_for_object(object_name="bottle"))
+    ), patch.object(vision_v3, "_vision_search_object", new=search_mock):
+        result = asyncio.run(vision_v3._vision_reposition_for_object(object_name="bottle"))
 
     assert result["status"] == "already_visible"
     assert result["found"] is True
@@ -228,9 +228,9 @@ def test_reposition_for_object_reacquires_with_search():
         vision_v3,
         "tbot_vision_find_object",
         new=AsyncMock(return_value={"visible": False, "confidence": 0.1, "position": None, "bbox": None}),
-    ), patch.object(vision_v3, "tbot_vision_search_object", new=search_mock):
+    ), patch.object(vision_v3, "_vision_search_object", new=search_mock):
         result = asyncio.run(
-            vision_v3.tbot_vision_reposition_for_object(
+            vision_v3._vision_reposition_for_object(
                 object_name="bottle",
                 min_confidence=0.5,
                 max_steps=6,
@@ -250,9 +250,9 @@ def test_reposition_for_object_not_found_when_max_steps_zero():
         vision_v3,
         "tbot_vision_find_object",
         new=AsyncMock(return_value={"visible": False, "confidence": 0.2, "position": None, "bbox": None}),
-    ), patch.object(vision_v3, "tbot_vision_search_object", new=search_mock):
+    ), patch.object(vision_v3, "_vision_search_object", new=search_mock):
         result = asyncio.run(
-            vision_v3.tbot_vision_reposition_for_object(
+            vision_v3._vision_reposition_for_object(
                 object_name="cup",
                 min_confidence=0.5,
                 max_steps=0,
@@ -331,12 +331,16 @@ def test_search_and_approach_reaches_target_distance():
     )
     with patch.object(
         vision_v3,
-        "tbot_vision_search_object",
+        "_vision_search_object",
         new=AsyncMock(return_value={"found": True, "steps_taken": 2, "confidence": 0.9, "position": "center", "bbox": None}),
     ), patch.object(
         vision_v3,
-        "tbot_vision_reposition_for_object",
+        "_vision_reposition_for_object",
         new=reposition_mock,
+    ), patch.object(
+        vision_v3,
+        "_center_object_in_frame",
+        new=AsyncMock(return_value={"status": "centered", "iterations": 0, "final_cx": 0.5}),
     ), patch.object(vision_v3, "Client", side_effect=fake_client):
         result = asyncio.run(
             vision_v3.tbot_vision_search_and_approach_object(
@@ -348,18 +352,18 @@ def test_search_and_approach_reaches_target_distance():
 
     assert result["status"] == "reached"
     assert result["phases"]["search_steps"] == 2
-    assert result["phases"]["verification_scans"] == 2
+    assert result["phases"]["verification_scans"] == 1
     assert result["phases"]["reposition_turns"] == 0
     assert result["phases"]["forward_segments"] == 1
     assert result["final_front_distance_m"] == pytest.approx(0.45)
     assert len([name for name, _ in state["motion_calls"] if name == "tbot_motion_approach_until_close"]) == 1
     assert any(name == "tbot_motion_stop" for name, _ in state["motion_calls"])
-    assert reposition_mock.await_count == 2
+    assert reposition_mock.await_count == 1
 
 
 def test_search_and_approach_reached_without_forward_when_already_close():
     state = _make_approach_state()
-    state["lidar_results"] = [{"status": "ok", "distance_m": 0.4, "distances": {"front": 0.4}}]
+    state["collision_results"] = [{"risk_level": "clear", "distances": {"front": 0.4}}]
 
     def fake_client(url: str):
         return _FakeApproachClient(url, state)
@@ -376,12 +380,16 @@ def test_search_and_approach_reached_without_forward_when_already_close():
     )
     with patch.object(
         vision_v3,
-        "tbot_vision_search_object",
+        "_vision_search_object",
         new=AsyncMock(return_value={"found": True, "steps_taken": 1, "confidence": 0.9, "position": "center", "bbox": None}),
     ), patch.object(
         vision_v3,
-        "tbot_vision_reposition_for_object",
+        "_vision_reposition_for_object",
         new=reposition_mock,
+    ), patch.object(
+        vision_v3,
+        "_center_object_in_frame",
+        new=AsyncMock(return_value={"status": "centered", "iterations": 0, "final_cx": 0.5}),
     ), patch.object(vision_v3, "Client", side_effect=fake_client):
         result = asyncio.run(
             vision_v3.tbot_vision_search_and_approach_object(
@@ -398,28 +406,36 @@ def test_search_and_approach_reached_without_forward_when_already_close():
     assert reposition_mock.await_count == 1
 
 
-def test_search_and_approach_verification_failed_after_one_forward():
+def test_search_and_approach_returns_approached_after_one_forward():
     state = _make_approach_state()
-    state["approach_results"] = [{"status": "reached", "front_distance": 0.5, "move_posts": 3}]
+    state["approach_results"] = [{"status": "completed", "front_distance": 0.5, "move_posts": 3}]
     state["lidar_results"] = [{"status": "ok", "distance_m": 0.9, "distances": {"front": 0.9}}]
 
     def fake_client(url: str):
         return _FakeApproachClient(url, state)
 
     reposition_mock = AsyncMock(
-        side_effect=[
-            {"status": "already_visible", "found": True, "confidence": 0.9, "position": "center", "bbox": None, "steps_taken": 0},
-            {"status": "not_found", "found": False, "confidence": 0.2, "position": None, "bbox": None, "steps_taken": 4},
-        ]
+        return_value={
+            "status": "already_visible",
+            "found": True,
+            "confidence": 0.9,
+            "position": "center",
+            "bbox": None,
+            "steps_taken": 0,
+        }
     )
     with patch.object(
         vision_v3,
-        "tbot_vision_search_object",
+        "_vision_search_object",
         new=AsyncMock(return_value={"found": True, "steps_taken": 1, "confidence": 0.9, "position": "center", "bbox": None}),
     ), patch.object(
         vision_v3,
-        "tbot_vision_reposition_for_object",
+        "_vision_reposition_for_object",
         new=reposition_mock,
+    ), patch.object(
+        vision_v3,
+        "_center_object_in_frame",
+        new=AsyncMock(return_value={"status": "centered", "iterations": 0, "final_cx": 0.5}),
     ), patch.object(vision_v3, "Client", side_effect=fake_client):
         result = asyncio.run(
             vision_v3.tbot_vision_search_and_approach_object(
@@ -429,12 +445,12 @@ def test_search_and_approach_verification_failed_after_one_forward():
             )
         )
 
-    assert result["status"] == "verification_failed"
+    assert result["status"] == "approached"
     assert result["phases"]["forward_segments"] == 1
-    assert result["phases"]["verification_scans"] == 2
-    assert result["phases"]["reposition_turns"] == 4
+    assert result["phases"]["verification_scans"] == 1
+    assert result["phases"]["reposition_turns"] == 0
     assert len([name for name, _ in state["motion_calls"] if name == "tbot_motion_approach_until_close"]) == 1
-    assert reposition_mock.await_count == 2
+    assert reposition_mock.await_count == 1
 
 
 def test_search_and_approach_returns_collision_blocked():
@@ -447,12 +463,16 @@ def test_search_and_approach_returns_collision_blocked():
 
     with patch.object(
         vision_v3,
-        "tbot_vision_search_object",
+        "_vision_search_object",
         new=AsyncMock(return_value={"found": True, "steps_taken": 0, "confidence": 0.9, "position": "center", "bbox": None}),
     ), patch.object(
         vision_v3,
-        "tbot_vision_reposition_for_object",
+        "_vision_reposition_for_object",
         new=AsyncMock(return_value={"status": "already_visible", "found": True, "confidence": 0.95, "position": "center", "bbox": None, "steps_taken": 0}),
+    ), patch.object(
+        vision_v3,
+        "_center_object_in_frame",
+        new=AsyncMock(return_value={"status": "centered", "iterations": 0, "final_cx": 0.5}),
     ), patch.object(vision_v3, "Client", side_effect=fake_client):
         result = asyncio.run(
             vision_v3.tbot_vision_search_and_approach_object(
@@ -470,7 +490,7 @@ def test_search_and_approach_returns_collision_blocked():
 def test_search_and_approach_returns_not_found_on_initial_scan_failure():
     with patch.object(
         vision_v3,
-        "tbot_vision_search_object",
+        "_vision_search_object",
         new=AsyncMock(return_value={"found": False, "steps_taken": 11}),
     ):
         result = asyncio.run(
@@ -483,3 +503,118 @@ def test_search_and_approach_returns_not_found_on_initial_scan_failure():
 
     assert result["status"] == "not_found"
     assert result["phases"]["search_steps"] == 11
+
+
+def test_search_and_approach_caps_reposition_steps_to_three():
+    state = _make_approach_state()
+    state["collision_results"] = [{"risk_level": "clear", "distances": {"front": 0.4}}]
+
+    def fake_client(url: str):
+        return _FakeApproachClient(url, state)
+
+    reposition_mock = AsyncMock(
+        return_value={
+            "status": "already_visible",
+            "found": True,
+            "confidence": 0.9,
+            "position": "center",
+            "bbox": None,
+            "steps_taken": 0,
+        }
+    )
+
+    with patch.object(
+        vision_v3,
+        "_vision_search_object",
+        new=AsyncMock(return_value={"found": True, "steps_taken": 0, "confidence": 0.9, "position": "center", "bbox": None}),
+    ), patch.object(
+        vision_v3,
+        "_vision_reposition_for_object",
+        new=reposition_mock,
+    ), patch.object(
+        vision_v3,
+        "_center_object_in_frame",
+        new=AsyncMock(return_value={"status": "centered", "iterations": 0, "final_cx": 0.5}),
+    ), patch.object(vision_v3, "Client", side_effect=fake_client):
+        result = asyncio.run(
+            vision_v3.tbot_vision_search_and_approach_object(
+                object_name="bottle",
+                target_distance_m=0.5,
+                initial_search_max_steps=24,
+                timeout_s=10.0,
+            )
+        )
+
+    assert result["status"] == "reached"
+    assert reposition_mock.await_args.kwargs["max_steps"] == 3
+
+
+def test_search_and_approach_uses_10cm_default_target_when_unspecified():
+    state = _make_approach_state()
+    state["collision_results"] = [{"risk_level": "clear", "distances": {"front": 0.5}}]
+    state["approach_results"] = [{"status": "reached", "front_distance": 0.1, "move_posts": 2}]
+
+    def fake_client(url: str):
+        return _FakeApproachClient(url, state)
+
+    with patch.object(
+        vision_v3,
+        "_vision_search_object",
+        new=AsyncMock(return_value={"found": True, "steps_taken": 0, "confidence": 0.9, "position": "center", "bbox": None}),
+    ), patch.object(
+        vision_v3,
+        "_vision_reposition_for_object",
+        new=AsyncMock(return_value={"status": "already_visible", "found": True, "confidence": 0.9, "position": "center", "bbox": None, "steps_taken": 0}),
+    ), patch.object(
+        vision_v3,
+        "_center_object_in_frame",
+        new=AsyncMock(return_value={"status": "centered", "iterations": 0, "final_cx": 0.5}),
+    ), patch.object(vision_v3, "Client", side_effect=fake_client):
+        result = asyncio.run(
+            vision_v3.tbot_vision_search_and_approach_object(
+                object_name="bottle",
+                timeout_s=10.0,
+            )
+        )
+
+    approach_calls = [payload for name, payload in state["motion_calls"] if name == "tbot_motion_approach_until_close"]
+    assert len(approach_calls) == 1
+    assert approach_calls[0]["target_distance_m"] == pytest.approx(0.1)
+    assert result["requested_target_distance_m"] == pytest.approx(0.1)
+    assert result["target_distance_m"] == pytest.approx(0.1)
+
+
+def test_search_and_approach_honors_explicit_target_distance():
+    state = _make_approach_state()
+    state["collision_results"] = [{"risk_level": "clear", "distances": {"front": 0.5}}]
+    state["approach_results"] = [{"status": "reached", "front_distance": 0.2, "move_posts": 2}]
+
+    def fake_client(url: str):
+        return _FakeApproachClient(url, state)
+
+    with patch.object(
+        vision_v3,
+        "_vision_search_object",
+        new=AsyncMock(return_value={"found": True, "steps_taken": 0, "confidence": 0.9, "position": "center", "bbox": None}),
+    ), patch.object(
+        vision_v3,
+        "_vision_reposition_for_object",
+        new=AsyncMock(return_value={"status": "already_visible", "found": True, "confidence": 0.9, "position": "center", "bbox": None, "steps_taken": 0}),
+    ), patch.object(
+        vision_v3,
+        "_center_object_in_frame",
+        new=AsyncMock(return_value={"status": "centered", "iterations": 0, "final_cx": 0.5}),
+    ), patch.object(vision_v3, "Client", side_effect=fake_client):
+        result = asyncio.run(
+            vision_v3.tbot_vision_search_and_approach_object(
+                object_name="bottle",
+                target_distance_m=0.2,
+                timeout_s=10.0,
+            )
+        )
+
+    approach_calls = [payload for name, payload in state["motion_calls"] if name == "tbot_motion_approach_until_close"]
+    assert len(approach_calls) == 1
+    assert approach_calls[0]["target_distance_m"] == pytest.approx(0.2)
+    assert result["requested_target_distance_m"] == pytest.approx(0.2)
+    assert result["target_distance_m"] == pytest.approx(0.2)

@@ -115,6 +115,41 @@ async def test_approach_plans_delta_then_moves_once():
 
 
 @pytest.mark.asyncio
+async def test_approach_keeps_10cm_standoff_by_default_delta():
+    # front=0.5, target=0.1 => required move = 0.4
+    lidar_responses = [
+        {"risk_level": "clear", "min_forward_distance_m": 0.5, "distances": {"front": 0.5}},
+        {"risk_level": "clear", "min_forward_distance_m": 0.12, "distances": {"front": 0.12}},
+    ]
+
+    def _client_factory(url: str):
+        return _FakeLidarClient(url, lidar_responses)
+
+    move_mock = AsyncMock(return_value={"status": "completed", "move_posts": 5})
+
+    async def fake_post(path: str, payload=None):
+        return {"status": "ok", "path": path}
+
+    with patch.object(motion_v3, "Client", side_effect=_client_factory), patch.object(
+        motion_v3, "_execute_forward_distance", new=move_mock
+    ), patch.object(motion_v3, "_set_continuous_motion", new=AsyncMock(return_value=False)), patch.object(
+        motion_v3, "_post_json", side_effect=fake_post
+    ):
+        result = await motion_v3.tbot_motion_approach_until_close(
+            target_distance_m=0.1,
+            stop_distance_m=0.1,
+            speed=0.2,
+            timeout_s=10.0,
+        )
+
+    assert result["status"] == "completed"
+    assert result["required_move_distance_m"] == pytest.approx(0.4)
+    kwargs = move_mock.await_args.kwargs
+    assert kwargs["distance_m"] == pytest.approx(0.4)
+    assert kwargs["speed"] == pytest.approx(0.2)
+
+
+@pytest.mark.asyncio
 async def test_approach_skips_move_when_already_reached():
     lidar_responses = [
         {"risk_level": "clear", "min_forward_distance_m": 0.35, "distances": {"front": 0.35}},
