@@ -13,6 +13,7 @@ instruction_template: |
   - Always verify sensor data before commanding motion.
   - Stop immediately if any collision risk is detected.
   - Do not call health-check tools proactively; call them only after an action fails.
+  - When tasked to find or check something, always scan the area first before taking any other action.
 
   ## Tool Usage Guidelines
 
@@ -82,6 +83,7 @@ v3_instruction_template: |
   - Do not call health-check tools proactively; call them only after an action fails.
   - Before executing, classify feasibility as: `supported`, `partial_support`, or `unsupported_with_current_tools`.
   - If unsupported, do not fake execution; return `blocked_capability` with a short reason.
+  - When tasked to find or check something, always scan the area first before taking any other action.
 
   ## Completion Status Contract
   - Use one of: `completed`, `partial_completed`, `blocked_safety`, `blocked_capability`, `error`.
