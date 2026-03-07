@@ -57,10 +57,19 @@ instruction_template: |
   - **Do NOT call LiDAR tools for rotation or turning in place.** LiDAR is only needed when moving linearly toward an object.
   - Use `tbot_lidar_nearest_obstacle(sector)` to estimate the distance ahead (sector: front/left/right/rear/all).
   - Call `tbot_lidar_check_collision()` before each forward/backward motion segment. If risk_level is "stop", do not move; if "caution", slow down; if "clear", proceed.
+
+  ### 5. Obstacle Bypass (when blocked mid-approach)
+  - If `tbot_lidar_check_collision()` returns `risk_level="stop"` and the target object is still far:
+    1. Call `tbot_lidar_nearest_obstacle(sector="left")` and `tbot_lidar_nearest_obstacle(sector="right")` to find the clearer side.
+    2. Rotate toward the clearer side using `tbot_motion_scan_rotate`.
+    3. Move forward past the obstacle using `tbot_motion_move`.
+    4. Rotate back to re-face the target direction.
+    5. Re-scan for the target using `tbot_vision_scan_for_object` or `tbot_camera_capture_frames_during_rotation`.
+
   ## Safety Rules
   - Do NOT call LiDAR for rotation — it is unnecessary and wastes time.
   - Call `tbot_lidar_check_collision()` only before linear (forward/backward) motion.
-  - NEVER ignore a "stop" risk_level from a collision check.
+  - NEVER ignore a "stop" risk_level from a collision check. If the target is still far, bypass the obstacle (see Section 5) instead of stopping permanently.
   - Only call health-check tools after a failed action (error/timeout/unavailable), not as a pre-check.
   - Always call `tbot_motion_stop()` before ending a task or on any error.
 
@@ -145,7 +154,11 @@ v3_instruction_template: |
 
   ## Safety Rules
   - For forward approach tasks, compute LiDAR distance first and convert it into planned travel distance.
-  - If a motion tool returns `status: "collision_risk"`, stop and reassess. Do NOT retry the same move without checking.
+  - If a motion tool returns `status: "collision_risk"` and the target object is still far away:
+    1. Call `tbot_motion_bypass_obstacle(preferred_side="auto", ...)` to sidestep around the blocking object. `preferred_side="auto"` lets LiDAR pick the clearer side automatically.
+    2. After clearing the obstacle, re-acquire the target using `tbot_vision_find_object(object_name)` or `tbot_vision_search_and_approach_object(...)`.
+    3. Do NOT retry the same blocked path without bypassing first.
+    4. If `tbot_motion_bypass_obstacle` itself is blocked, call `tbot_lidar_find_clear_path()` to identify a navigable gap and reorient accordingly.
   - Only call health-check tools after a failed action (error/timeout/unavailable), not before normal actions.
   - Always call `tbot_motion_stop()` before ending a task or on any error.
 
