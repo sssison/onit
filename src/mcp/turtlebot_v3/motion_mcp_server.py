@@ -1031,39 +1031,53 @@ async def tbot_motion_approach_until_close(
                 if executed_move_duration_s <= 0:
                     final_status = "timeout"
                 else:
-                    move_result = await _execute_forward_distance(
-                        distance_m=clamped_speed * executed_move_duration_s,
-                        speed=clamped_speed,
-                    )
-                    move_posts = int(move_result.get("move_posts") or 0)
-                    try:
-                        post_raw = await lidar.call_tool(
-                            "tbot_lidar_check_collision",
-                            {"front_threshold_m": interrupt_distance_m},
-                        )
-                        collision_checks += 1
-                        post_check = _extract_tool_dict(post_raw)
-                        post_risk = str(post_check.get("risk_level") or "clear")
-                        post_front = _extract_front_distance(post_check)
-                        if post_front is not None:
-                            final_distance_m = post_front
+                    # Closed-loop approach: poll LiDAR every tick and stop early
+                    # when the target distance is reached, preventing overshoot.
+                    approach_start = time.monotonic()
+                    loop_exit = "duration_elapsed"
 
-                        if post_risk == "stop" or (
-                            final_distance_m is not None and final_distance_m <= interrupt_distance_m
-                        ):
-                            final_status = "collision_risk"
-                        elif final_distance_m is not None and final_distance_m <= target_dist:
-                            final_status = "reached"
-                        elif executed_move_duration_s + 1e-6 < requested_move_duration_s:
-                            final_status = "timeout"
-                        else:
-                            final_status = "completed"
-                    except Exception:
-                        consecutive_lidar_failures += 1
-                        if executed_move_duration_s + 1e-6 < requested_move_duration_s:
-                            final_status = "timeout"
-                        else:
-                            final_status = "completed"
+                    while True:
+                        elapsed_loop = time.monotonic() - approach_start
+                        if elapsed_loop >= executed_move_duration_s:
+                            break
+
+                        try:
+                            poll_raw = await lidar.call_tool(
+                                "tbot_lidar_check_collision",
+                                {"front_threshold_m": interrupt_distance_m},
+                            )
+                            collision_checks += 1
+                            poll_check = _extract_tool_dict(poll_raw)
+                            poll_front = _extract_front_distance(poll_check)
+                            if poll_front is not None:
+                                final_distance_m = poll_front
+                            consecutive_lidar_failures = 0
+
+                            if poll_front is not None and poll_front <= interrupt_distance_m:
+                                loop_exit = "collision_risk"
+                                break
+                            if poll_front is not None and poll_front <= target_dist:
+                                loop_exit = "reached"
+                                break
+                        except Exception:
+                            consecutive_lidar_failures += 1
+                            if consecutive_lidar_failures >= MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES:
+                                loop_exit = "lidar_unavailable"
+                                break
+
+                        remaining_loop = executed_move_duration_s - (time.monotonic() - approach_start)
+                        if remaining_loop <= 0:
+                            break
+                        await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
+                        move_posts += 1
+                        await asyncio.sleep(min(MOTION_COMMAND_REFRESH_S, remaining_loop))
+
+                    if loop_exit == "collision_risk":
+                        final_status = "collision_risk"
+                    elif loop_exit == "reached":
+                        final_status = "reached"
+                    else:
+                        final_status = "timeout" if executed_move_duration_s + 1e-6 < requested_move_duration_s else "completed"
     except Exception as e:
         try:
             await _set_continuous_motion(None)
