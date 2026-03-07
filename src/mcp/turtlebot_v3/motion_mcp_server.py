@@ -36,6 +36,7 @@ MAX_ANGULAR = abs(_env_float("MOTION_MAX_ANGULAR", 1.0))
 ANGULAR_SIGN = _env_float("MOTION_ANGULAR_SIGN", -1.0)
 
 LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
+NAV_MCP_URL_V3 = os.getenv("TBOT_NAV_MCP_URL_V3", "http://127.0.0.1:18213/turtlebot-nav-v3")
 
 WALL_FOLLOW_KP = _env_float("WALL_FOLLOW_KP", 2.0)
 WALL_FOLLOW_MAX_ANGULAR = _env_float("WALL_FOLLOW_MAX_ANGULAR", 0.5)
@@ -255,6 +256,18 @@ def _extract_tool_dict(tool_result: Any) -> dict[str, Any]:
                 except Exception:
                     pass
     return {}
+
+
+async def _get_odom_xy(nav: Client) -> tuple[float, float] | None:
+    """Return (x_m, y_m) from the nav server's pose, or None on failure."""
+    try:
+        raw = await nav.call_tool("tbot_nav_get_pose", {})
+        data = _extract_tool_dict(raw)
+        if data.get("status") == "ok":
+            return float(data["x_m"]), float(data["y_m"])
+    except Exception:
+        pass
+    return None
 
 
 def _to_distance_m(value: Any) -> float | None:
@@ -958,6 +971,9 @@ async def tbot_motion_approach_until_close(
     consecutive_lidar_failures = 0
     final_status = "error"
     interrupt_distance_m = FORWARD_COLLISION_INTERRUPT_M
+    final_traveled_m: float | None = None
+    x_start: float | None = None
+    y_start: float | None = None
 
     def _extract_front_distance(collision_data: dict[str, Any]) -> float | None:
         min_fwd = collision_data.get("min_forward_distance_m")
@@ -1031,50 +1047,68 @@ async def tbot_motion_approach_until_close(
                 if executed_move_duration_s <= 0:
                     final_status = "timeout"
                 else:
-                    # Closed-loop approach: poll LiDAR every tick and stop early
-                    # when the target distance is reached, preventing overshoot.
-                    approach_start = time.monotonic()
-                    loop_exit = "duration_elapsed"
+                    # Grab odometry start pose for hard-ceiling stop.
+                    async with Client(NAV_MCP_URL_V3) as nav:
+                        start_xy = await _get_odom_xy(nav)
+                        if start_xy is not None:
+                            x_start, y_start = start_xy
 
-                    while True:
-                        elapsed_loop = time.monotonic() - approach_start
-                        if elapsed_loop >= executed_move_duration_s:
-                            break
+                        # Closed-loop approach: poll LiDAR every tick and stop early
+                        # when the target distance is reached, preventing overshoot.
+                        # Odom is a hard ceiling: stop unconditionally when traveled_m
+                        # reaches required_move_distance_m, regardless of LiDAR.
+                        approach_start = time.monotonic()
+                        loop_exit = "duration_elapsed"
 
-                        try:
-                            poll_raw = await lidar.call_tool(
-                                "tbot_lidar_check_collision",
-                                {"front_threshold_m": interrupt_distance_m},
-                            )
-                            collision_checks += 1
-                            poll_check = _extract_tool_dict(poll_raw)
-                            poll_front = _extract_front_distance(poll_check)
-                            if poll_front is not None:
-                                final_distance_m = poll_front
-                            consecutive_lidar_failures = 0
-
-                            if poll_front is not None and poll_front <= interrupt_distance_m:
-                                loop_exit = "collision_risk"
-                                break
-                            if poll_front is not None and poll_front <= target_dist:
-                                loop_exit = "reached"
-                                break
-                        except Exception:
-                            consecutive_lidar_failures += 1
-                            if consecutive_lidar_failures >= MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES:
-                                loop_exit = "lidar_unavailable"
+                        while True:
+                            elapsed_loop = time.monotonic() - approach_start
+                            if elapsed_loop >= executed_move_duration_s:
                                 break
 
-                        remaining_loop = executed_move_duration_s - (time.monotonic() - approach_start)
-                        if remaining_loop <= 0:
-                            break
-                        await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
-                        move_posts += 1
-                        await asyncio.sleep(min(MOTION_COMMAND_REFRESH_S, remaining_loop))
+                            try:
+                                poll_raw = await lidar.call_tool(
+                                    "tbot_lidar_check_collision",
+                                    {"front_threshold_m": interrupt_distance_m},
+                                )
+                                collision_checks += 1
+                                poll_check = _extract_tool_dict(poll_raw)
+                                poll_front = _extract_front_distance(poll_check)
+                                if poll_front is not None:
+                                    final_distance_m = poll_front
+                                consecutive_lidar_failures = 0
+
+                                if poll_front is not None and poll_front <= interrupt_distance_m:
+                                    loop_exit = "collision_risk"
+                                    break
+                                if poll_front is not None and poll_front <= target_dist:
+                                    loop_exit = "reached"
+                                    break
+                            except Exception:
+                                consecutive_lidar_failures += 1
+                                if consecutive_lidar_failures >= MOTION_LIDAR_MAX_CONSECUTIVE_FAILURES:
+                                    loop_exit = "lidar_unavailable"
+                                    break
+
+                            # Odometry hard-ceiling check.
+                            if x_start is not None:
+                                cur_xy = await _get_odom_xy(nav)
+                                if cur_xy is not None:
+                                    traveled_m = math.hypot(cur_xy[0] - x_start, cur_xy[1] - y_start)
+                                    final_traveled_m = traveled_m
+                                    if traveled_m >= required_move_distance_m:
+                                        loop_exit = "odom_distance_reached"
+                                        break
+
+                            remaining_loop = executed_move_duration_s - (time.monotonic() - approach_start)
+                            if remaining_loop <= 0:
+                                break
+                            await _post_json(MOVE_PATH, {"linear": clamped_speed, "angular": 0.0})
+                            move_posts += 1
+                            await asyncio.sleep(min(MOTION_COMMAND_REFRESH_S, remaining_loop))
 
                     if loop_exit == "collision_risk":
                         final_status = "collision_risk"
-                    elif loop_exit == "reached":
+                    elif loop_exit in ("reached", "odom_distance_reached"):
                         final_status = "reached"
                     else:
                         final_status = "timeout" if executed_move_duration_s + 1e-6 < requested_move_duration_s else "completed"
@@ -1097,6 +1131,8 @@ async def tbot_motion_approach_until_close(
             "collision_checks": collision_checks,
             "consecutive_lidar_failures": consecutive_lidar_failures,
             "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+            "traveled_m": final_traveled_m,
+            "odom_available": x_start is not None,
             "error": str(e),
         }
     finally:
@@ -1124,6 +1160,8 @@ async def tbot_motion_approach_until_close(
         "collision_checks": collision_checks,
         "consecutive_lidar_failures": consecutive_lidar_failures,
         "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+        "traveled_m": final_traveled_m,
+        "odom_available": x_start is not None,
     }
 
 
