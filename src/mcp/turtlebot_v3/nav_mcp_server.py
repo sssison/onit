@@ -112,18 +112,6 @@ def _extract_tool_result_dict(tool_result: Any) -> dict[str, Any]:
     return {}
 
 
-def _front_distance_from_lidar(collision_data: dict[str, Any]) -> float | None:
-    min_fwd = collision_data.get("min_forward_distance_m")
-    if isinstance(min_fwd, (int, float)) and math.isfinite(float(min_fwd)):
-        return float(min_fwd)
-    distances = collision_data.get("distances")
-    if isinstance(distances, dict):
-        front = distances.get("front")
-        if isinstance(front, (int, float)) and math.isfinite(float(front)):
-            return float(front)
-    return None
-
-
 def _is_odom_stale(odom: dict[str, Any], stale_timeout_s: float) -> bool:
     if stale_timeout_s <= 0:
         return False
@@ -380,12 +368,15 @@ async def tbot_nav_go_to_pose(
 
                 try:
                     collision_raw = await lidar.call_tool(
-                        "tbot_lidar_check_collision",
-                        {"front_threshold_m": NAV_FRONT_THRESHOLD_M},
+                        "tbot_lidar_get_obstacle_distances",
+                        {"sector": "front"},
                     )
                     collision = _extract_tool_result_dict(collision_raw)
-                    risk_level = str(collision.get("risk_level") or "clear")
-                    front_distance = _front_distance_from_lidar(collision)
+                    front_distance = (collision.get("distances") or {}).get("front")
+                    if isinstance(front_distance, (int, float)):
+                        risk_level = "stop" if front_distance < NAV_FRONT_THRESHOLD_M else "clear"
+                    else:
+                        risk_level = "stop"
                 except Exception as e:
                     risk_level = "stop"
                     front_distance = None
@@ -438,106 +429,6 @@ async def tbot_nav_go_to_pose(
                     }
 
                 steps += 1
-
-
-@mcp_nav_v3.tool()
-async def tbot_nav_patrol(
-    waypoints: list[dict[str, Any]],
-    cycles: int = 1,
-    pos_tolerance_m: float = 0.10,
-    yaw_tolerance_rad: float = 0.15,
-    max_linear_mps: float = 0.12,
-    max_angular_rps: float = 0.6,
-    timeout_s_total: float = 180.0,
-) -> dict[str, Any]:
-    """
-    Patrol through waypoint list for N cycles using /odom-backed go-to-pose.
-    """
-    if not isinstance(waypoints, list) or len(waypoints) == 0:
-        raise ValueError("waypoints must be a non-empty list")
-    if not isinstance(cycles, int) or cycles < 1:
-        raise ValueError("cycles must be an integer >= 1")
-
-    timeout_total = _validate_finite("timeout_s_total", timeout_s_total)
-    if timeout_total <= 0:
-        raise ValueError("timeout_s_total must be > 0")
-
-    started = time.monotonic()
-    completed_cycles = 0
-    completed_waypoints = 0
-    last_result: dict[str, Any] | None = None
-
-    for cycle_idx in range(cycles):
-        for wp_idx, waypoint in enumerate(waypoints):
-            if not isinstance(waypoint, dict):
-                return {
-                    "status": "error",
-                    "completed_cycles": completed_cycles,
-                    "completed_waypoints": completed_waypoints,
-                    "error": f"Waypoint at index {wp_idx} is not an object",
-                    "last_result": last_result,
-                }
-
-            x_raw = waypoint.get("x_m")
-            y_raw = waypoint.get("y_m")
-            yaw_raw = waypoint.get("yaw_rad")
-
-            try:
-                x_target = _validate_finite("waypoint.x_m", x_raw)
-                y_target = _validate_finite("waypoint.y_m", y_raw)
-                yaw_target = _validate_finite("waypoint.yaw_rad", yaw_raw) if yaw_raw is not None else None
-            except ValueError as e:
-                return {
-                    "status": "error",
-                    "completed_cycles": completed_cycles,
-                    "completed_waypoints": completed_waypoints,
-                    "error": str(e),
-                    "last_result": last_result,
-                }
-
-            elapsed = time.monotonic() - started
-            remaining = timeout_total - elapsed
-            if remaining <= 0:
-                return {
-                    "status": "timeout",
-                    "completed_cycles": completed_cycles,
-                    "completed_waypoints": completed_waypoints,
-                    "elapsed_s": elapsed,
-                    "last_result": last_result,
-                }
-
-            last_result = await tbot_nav_go_to_pose(
-                target_x_m=x_target,
-                target_y_m=y_target,
-                target_yaw_rad=yaw_target,
-                pos_tolerance_m=pos_tolerance_m,
-                yaw_tolerance_rad=yaw_tolerance_rad,
-                max_linear_mps=max_linear_mps,
-                max_angular_rps=max_angular_rps,
-                timeout_s=remaining,
-            )
-
-            if last_result.get("status") != "reached":
-                return {
-                    "status": "partial_completed",
-                    "completed_cycles": completed_cycles,
-                    "completed_waypoints": completed_waypoints,
-                    "elapsed_s": time.monotonic() - started,
-                    "failure_status": last_result.get("status"),
-                    "last_result": last_result,
-                }
-
-            completed_waypoints += 1
-
-        completed_cycles += 1
-
-    return {
-        "status": "completed",
-        "completed_cycles": completed_cycles,
-        "completed_waypoints": completed_waypoints,
-        "elapsed_s": time.monotonic() - started,
-        "last_result": last_result,
-    }
 
 
 def run(

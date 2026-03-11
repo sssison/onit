@@ -52,6 +52,13 @@ mcp_lidar_v3 = FastMCP("TurtleBot LiDAR MCP Server V3")
 
 _rclpy_init_lock = threading.Lock()
 
+# --- Persistent streaming subscriber state ---
+_latest_scan: dict[str, Any] | None = None
+_scan_version: int = 0
+_scan_condition = threading.Condition()   # protects _latest_scan and _scan_version
+_listener_node: Any = None                # _ScanListenerNode instance
+_ros_thread: threading.Thread | None = None
+
 _SECTOR_CENTERS: dict[str, float] = {
     "front": 0.0,
     "left": 90.0,
@@ -263,84 +270,119 @@ def _mark_ray_free_cells(
         step += resolution_m
 
 
-# --- Short-lived rclpy node pattern ---
+# --- Persistent background subscriber ---
 
 
-def _get_one_scan_sync(timeout_s: float) -> dict[str, Any]:
-    """
-    Spin a short-lived rclpy node to receive one LaserScan message.
+class _ScanListenerNode(Node):  # type: ignore[misc]
+    """Long-lived node that caches every incoming LaserScan."""
 
-    Initializes rclpy if not already running, creates a temporary subscriber node,
-    spins until one scan arrives or timeout is reached, then destroys the node.
-    Raises RuntimeError if no scan is received within timeout_s.
-    """
+    def __init__(self) -> None:
+        super().__init__(f"{NODE_NAME_PREFIX}_listener")
+        self.create_subscription(
+            LaserScan,
+            LIDAR_TOPIC,
+            self._callback,
+            qos_profile_sensor_data,
+        )
+
+    def _callback(self, msg: Any) -> None:
+        global _latest_scan, _scan_version
+        now_mono = time.monotonic()
+        stamp_s: float | None = None
+        if msg.header.stamp.sec != 0 or msg.header.stamp.nanosec != 0:
+            stamp_s = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) / 1_000_000_000.0
+        scan_data: dict[str, Any] = {
+            "topic": LIDAR_TOPIC,
+            "frame_id": msg.header.frame_id,
+            "ranges": [float(v) for v in msg.ranges],
+            "intensities": [float(v) for v in msg.intensities],
+            "angle_min": float(msg.angle_min),
+            "angle_max": float(msg.angle_max),
+            "angle_increment": float(msg.angle_increment),
+            "range_min": float(msg.range_min),
+            "range_max": float(msg.range_max),
+            "stamp_s": stamp_s,
+            "received_mono_s": now_mono,
+            "received_unix_s": time.time(),
+            "age_s": 0.0,
+        }
+        with _scan_condition:
+            _latest_scan = scan_data
+            _scan_version += 1
+            _scan_condition.notify_all()
+
+
+def _ensure_listener_running() -> None:
+    global _listener_node, _ros_thread
+    if _ros_thread is not None and _ros_thread.is_alive():
+        return
     if not RCLPY_AVAILABLE:
         raise RuntimeError(f"rclpy is not available: {RCLPY_IMPORT_ERROR}")
-
     with _rclpy_init_lock:
         if not rclpy.ok():
             rclpy.init()
+    _listener_node = _ScanListenerNode()
+    _ros_thread = threading.Thread(
+        target=rclpy.spin, args=(_listener_node,), daemon=True, name="lidar_spin"
+    )
+    _ros_thread.start()
 
-    import uuid
 
-    node_name = f"{NODE_NAME_PREFIX}_{uuid.uuid4().hex[:8]}"
-    scan_data: dict[str, Any] = {}
-    received = threading.Event()
+def _shutdown_lidar_ros() -> None:
+    global _listener_node
+    if _listener_node is not None:
+        try:
+            _listener_node.destroy_node()
+        except Exception:
+            pass
+        _listener_node = None
 
-    class _OneShotNode(Node):  # type: ignore[misc]
-        def __init__(self) -> None:
-            super().__init__(node_name)
-            self.create_subscription(
-                LaserScan,
-                LIDAR_TOPIC,
-                self._callback,
-                qos_profile_sensor_data,
-            )
 
-        def _callback(self, msg: Any) -> None:
-            if received.is_set():
-                return
-            now_mono = time.monotonic()
-            stamp_s: float | None = None
-            if msg.header.stamp.sec != 0 or msg.header.stamp.nanosec != 0:
-                stamp_s = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) / 1_000_000_000.0
-            scan_data.update({
-                "topic": LIDAR_TOPIC,
-                "frame_id": msg.header.frame_id,
-                "ranges": [float(v) for v in msg.ranges],
-                "intensities": [float(v) for v in msg.intensities],
-                "angle_min": float(msg.angle_min),
-                "angle_max": float(msg.angle_max),
-                "angle_increment": float(msg.angle_increment),
-                "range_min": float(msg.range_min),
-                "range_max": float(msg.range_max),
-                "stamp_s": stamp_s,
-                "received_mono_s": now_mono,
-                "received_unix_s": time.time(),
-            })
-            received.set()
+import atexit
+atexit.register(_shutdown_lidar_ros)
 
-    node = _OneShotNode()
-    try:
-        deadline = time.monotonic() + timeout_s
-        while not received.is_set():
+
+def _get_cached_scan_sync(timeout_s: float = SCAN_TIMEOUT_S) -> dict[str, Any]:
+    """Return the latest cached scan; block until one arrives if cache is empty."""
+    _ensure_listener_running()
+    with _scan_condition:
+        if _latest_scan is not None:
+            scan = dict(_latest_scan)
+            scan["age_s"] = max(0.0, time.monotonic() - scan["received_mono_s"])
+            return scan
+        arrived = _scan_condition.wait(timeout=timeout_s)
+    if not arrived or _latest_scan is None:
+        raise RuntimeError(f"No LiDAR scan received within {timeout_s}s on topic {LIDAR_TOPIC!r}")
+    scan = dict(_latest_scan)
+    scan["age_s"] = max(0.0, time.monotonic() - scan["received_mono_s"])
+    return scan
+
+
+def _get_next_scan_sync(current_version: int, timeout_s: float = SCAN_TIMEOUT_S) -> dict[str, Any]:
+    """Block until a scan newer than current_version arrives; used by multi-sample export."""
+    _ensure_listener_running()
+    deadline = time.monotonic() + timeout_s
+    with _scan_condition:
+        while _scan_version <= current_version:
             remaining = deadline - time.monotonic()
-            if remaining <= 0.0:
-                raise RuntimeError(
-                    f"No LiDAR scan received within {timeout_s}s on topic {LIDAR_TOPIC!r}"
-                )
-            rclpy.spin_once(node, timeout_sec=min(0.1, remaining))
-    finally:
-        node.destroy_node()
-
-    scan_data["age_s"] = max(0.0, time.monotonic() - scan_data["received_mono_s"])
-    return scan_data
+            if remaining <= 0:
+                raise RuntimeError(f"Timed out waiting for new LiDAR scan after {timeout_s}s")
+            _scan_condition.wait(timeout=min(0.1, remaining))
+        scan = dict(_latest_scan)  # type: ignore[arg-type]
+    scan["age_s"] = max(0.0, time.monotonic() - scan["received_mono_s"])
+    return scan
 
 
-async def _get_one_scan(timeout_s: float = SCAN_TIMEOUT_S) -> dict[str, Any]:
-    """Async wrapper: run _get_one_scan_sync in a thread pool executor."""
+async def _get_cached_scan(timeout_s: float = SCAN_TIMEOUT_S) -> dict[str, Any]:
+    """Async wrapper for _get_cached_scan_sync."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _get_one_scan_sync, timeout_s)
+    return await loop.run_in_executor(None, _get_cached_scan_sync, timeout_s)
+
+
+async def _get_next_scan(current_version: int, timeout_s: float = SCAN_TIMEOUT_S) -> dict[str, Any]:
+    """Async wrapper for _get_next_scan_sync."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _get_next_scan_sync, current_version, timeout_s)
 
 
 # --- Tools ---
@@ -363,7 +405,7 @@ async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, An
         raise ValueError(f"sector must be one of: front, left, right, rear, all. Got: {sector!r}")
 
     try:
-        scan = await _get_one_scan()
+        scan = await _get_cached_scan()
     except Exception as e:
         return {
             "status": "no_scan",
@@ -426,7 +468,7 @@ async def tbot_lidar_get_distance_at_angle(
         raise ValueError("statistic must be 'min' or 'mean'")
 
     try:
-        scan = await _get_one_scan()
+        scan = await _get_cached_scan()
     except Exception as e:
         return {
             "status": "no_scan",
@@ -470,123 +512,49 @@ async def tbot_lidar_get_distance_at_angle(
 
 
 @mcp_lidar_v3.tool()
-async def tbot_lidar_check_collision(
-    front_threshold_m: float = 0.1,
-    side_threshold_m: float = 0.2,
-    back_threshold_m: float = 0.1,
+async def tbot_lidar_get_wall_profile(
+    step_deg: float = 15.0,
 ) -> dict[str, Any]:
     """
-    Check for collision risk.
+    Return distance measurements sampled around the full 360° at fixed angular steps.
 
-    risk_level:
-      "stop"    — front distance < front_threshold_m (default 0.1 m / 10 cm)
-      "caution" — front distance between front_threshold_m and 2 × front_threshold_m
-      "clear"   — front distance >= 2 × front_threshold_m
-
-    Returns {risk_level, min_forward_distance_m, distances: {front, left, right, rear}}.
-
-    NOTE: This tool is intended for pre-move assessment and stationary checks.
+    Gives the agent a compact map of walls and open space in all directions.
+    step_deg: angular spacing between samples (default 15° = 24 readings).
+    Returns readings[], nearest obstacle, farthest open direction, and open_headings_deg (> 1.0 m).
     """
+    if not isinstance(step_deg, (int, float)) or not math.isfinite(float(step_deg)):
+        raise ValueError("step_deg must be a finite number")
+    step_f = float(step_deg)
+    if step_f <= 0 or step_f > 180:
+        raise ValueError("step_deg must be in (0, 180]")
+
     try:
-        scan = await _get_one_scan()
+        scan = await _get_cached_scan()
     except Exception as e:
-        return {
-            "risk_level": "stop",
-            "min_forward_distance_m": None,
-            "distances": {"front": None, "left": None, "right": None, "rear": None},
-            "error": str(e),
-        }
+        return {"status": "no_scan", "error": str(e), "readings": []}
 
-    distances: dict[str, float | None] = {}
-    for name, center_deg in _SECTOR_CENTERS.items():
-        # Use a narrow 20° half-width for front to avoid picking up side obstacles;
-        # wider 45° for side/rear sectors (informational only, not used for risk_level).
-        half_width = 20.0 if name == "front" else 45.0
-        stats = _compute_sector_stats(scan, center_deg=center_deg, half_width_deg=half_width)
-        distances[name] = float(stats["min_m"]) if stats["status"] == "ok" and stats["min_m"] is not None else None
+    readings: list[dict[str, Any]] = []
+    angle = -180.0
+    while angle < 180.0:
+        stats = _compute_sector_stats(scan, center_deg=angle, half_width_deg=step_f / 2.0)
+        dist = float(stats["min_m"]) if stats["status"] == "ok" and stats["min_m"] is not None else None
+        readings.append({"angle_deg": round(angle, 1), "distance_m": dist})
+        angle += step_f
 
-    front_dist = distances.get("front")
-    if front_dist is None:
-        risk_level = "stop"
-    elif front_dist < front_threshold_m:
-        risk_level = "stop"
-    elif front_dist < 2.0 * front_threshold_m:
-        risk_level = "caution"
-    else:
-        risk_level = "clear"
+    valid = [(r["angle_deg"], r["distance_m"]) for r in readings if r["distance_m"] is not None]
+    nearest = min(valid, key=lambda x: x[1]) if valid else None
+    farthest = max(valid, key=lambda x: x[1]) if valid else None
+    open_headings = [r["angle_deg"] for r in readings if r["distance_m"] is not None and r["distance_m"] > 1.0]
 
-    return {"risk_level": risk_level, "min_forward_distance_m": distances.get("front"), "distances": distances}
-
-
-@mcp_lidar_v3.tool()
-async def tbot_lidar_find_clear_path(
-    min_gap_width_m: float = 0.5,
-    clearance_threshold_m: float = 1.0,
-) -> dict[str, Any]:
-    """
-    Find navigable gaps in the current LiDAR scan.
-
-    min_gap_width_m: only report gaps at least this wide (arc-length approximation).
-    clearance_threshold_m: a range reading must be >= this value to be counted as clear.
-
-    Returns {"gaps": [...], "best_gap": {...}|null} where each gap has
-    {"heading_degrees": float, "width_m": float, "center_distance_m": float}.
-    Heading convention matches _SECTOR_CENTERS: 0° = forward, 90° = left, -90° = right.
-    """
-    try:
-        scan = await _get_one_scan()
-    except Exception as e:
-        return {"gaps": [], "best_gap": None, "error": str(e)}
-
-    ranges = scan["ranges"]
-    range_min = float(scan["range_min"])
-    range_max = float(scan["range_max"])
-    angle_increment_rad = float(scan["angle_increment"])
-    n = len(ranges)
-
-    # Mark each index as clear or occupied
-    clear = [
-        _is_valid_range(ranges[i], range_min, range_max) and ranges[i] >= clearance_threshold_m
-        for i in range(n)
-    ]
-
-    # Group consecutive clear indices into gap runs
-    runs: list[tuple[int, int]] = []
-    in_run = False
-    run_start = 0
-    for i in range(n):
-        if clear[i]:
-            if not in_run:
-                run_start = i
-                in_run = True
-        else:
-            if in_run:
-                runs.append((run_start, i - 1))
-                in_run = False
-    if in_run:
-        runs.append((run_start, n - 1))
-
-    # Compute gap fields for each run
-    gaps: list[dict[str, Any]] = []
-    for start_idx, end_idx in runs:
-        indices = range(start_idx, end_idx + 1)
-        angles_deg = [_angle_for_index_deg(scan, i) for i in indices]
-        clear_ranges = [float(ranges[i]) for i in indices]
-        center_distance_m = sum(clear_ranges) / len(clear_ranges)
-        heading_degrees = (angles_deg[0] + angles_deg[-1]) / 2.0
-        angle_span_rad = len(clear_ranges) * angle_increment_rad
-        width_m = angle_span_rad * center_distance_m
-
-        if width_m >= min_gap_width_m:
-            gaps.append({
-                "heading_degrees": heading_degrees,
-                "width_m": width_m,
-                "center_distance_m": center_distance_m,
-            })
-
-    gaps.sort(key=lambda g: g["width_m"], reverse=True)
-    best_gap = gaps[0] if gaps else None
-    return {"gaps": gaps, "best_gap": best_gap}
+    return {
+        "status": "ok",
+        "step_deg": step_f,
+        "readings": readings,
+        "nearest": {"angle_deg": nearest[0], "distance_m": nearest[1]} if nearest else None,
+        "farthest": {"angle_deg": farthest[0], "distance_m": farthest[1]} if farthest else None,
+        "open_headings_deg": open_headings,
+        "scan_age_s": scan.get("age_s"),
+    }
 
 
 @mcp_lidar_v3.tool()
@@ -621,18 +589,25 @@ async def tbot_lidar_export_free_space_map(
 
     scans: list[dict[str, Any]] = []
     errors: list[str] = []
-    for _ in range(samples):
+    try:
+        first = await _get_cached_scan()
+        scans.append(first)
+    except Exception as e:
+        return {
+            "status": "no_scan",
+            "grid": [],
+            "best_effort_samples": 0,
+            "error": str(e),
+        }
+    with _scan_condition:
+        last_version = _scan_version
+    for _ in range(samples - 1):
         try:
-            scans.append(await _get_one_scan())
+            scans.append(await _get_next_scan(last_version))
+            with _scan_condition:
+                last_version = _scan_version
         except Exception as e:
             errors.append(str(e))
-            if not scans:
-                return {
-                    "status": "no_scan",
-                    "grid": [],
-                    "best_effort_samples": 0,
-                    "error": str(e),
-                }
             break
 
     base_scan = scans[0]
