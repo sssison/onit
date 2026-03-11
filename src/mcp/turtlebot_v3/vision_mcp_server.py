@@ -34,9 +34,16 @@ def _env_float(name: str, default: float) -> float:
 
 FRAME_PATH = os.getenv("TBOT_FRAME_PATH", "/dev/shm/latest_frame.jpg")
 DEFAULT_VISION_HOST = os.getenv("TBOT_VISION_HOST") or os.getenv("ONIT_HOST", "http://202.92.159.240:8001/v1")
-DEFAULT_VISION_MODEL = os.getenv("TBOT_VISION_MODEL", "Qwen/Qwen3.5-35B-A3B")
+DEFAULT_VISION_MODEL = os.getenv("TBOT_VISION_MODEL", "Qwen/Qwen3.5-9B")
 DEFAULT_VISION_API_KEY = os.getenv("TBOT_VISION_API_KEY", "EMPTY")
 VISION_TIMEOUT_S = _env_float("TBOT_VISION_TIMEOUT_S", 60.0)
+VISION_THINKING_ENABLED = os.getenv("TBOT_VISION_THINKING", "false").strip().lower() == "true"
+
+
+def _vision_extra_body() -> dict:
+    if VISION_THINKING_ENABLED:
+        return {}
+    return {"chat_template_kwargs": {"enable_thinking": False}}
 
 MOTION_BASE_URL = os.getenv("MOTION_SERVER_BASE_URL", "http://10.158.38.26:5001").rstrip("/")
 MOTION_ANGULAR_SIGN = _env_float("MOTION_ANGULAR_SIGN", -1.0)
@@ -201,6 +208,7 @@ async def tbot_vision_describe_scene(
             model=model,
             messages=messages,
             timeout=VISION_TIMEOUT_S,
+            extra_body=_vision_extra_body(),
         )
         raw_response = completion.choices[0].message.content or ""
         return {"description": raw_response, "model_info": model_info}
@@ -243,6 +251,7 @@ async def _find_object_in_frame(object_name: str) -> dict[str, Any]:
         client = AsyncOpenAI(base_url=host, api_key=api_key)
         completion = await client.chat.completions.create(
             model=model, messages=messages, timeout=VISION_TIMEOUT_S,
+            extra_body=_vision_extra_body(),
         )
         raw = completion.choices[0].message.content or ""
         parsed = _extract_first_json_object(raw) or {}
