@@ -103,12 +103,16 @@ v3_instruction_template: |
   **Turn duration formula:** `duration_s = degrees × π / (180 × speed_rad_s)`
   Default speed 0.5 rad/s → 90°=3.14s, 45°=1.57s, 30°=1.05s
 
+  **Arc motion:** `tbot_motion_move_timed(linear, angular, duration_s)` with both linear and angular
+  non-zero traces a curved arc path. Use this to steer through a gap without stopping to turn first.
+  Example: `tbot_motion_move_timed(linear=0.1, angular=0.4, duration_s=2.0)` curves left while moving forward.
+
   ### Vision
   - `tbot_vision_describe_scene(prompt)` — load latest frame and describe scene
   - `tbot_vision_find_object(object_name)` — check if object is visible; returns position left/center/right
   - `tbot_vision_scan_for_object(object_name, step_deg, max_rotation_deg, direction, turn_speed, confidence_threshold)` — rotate until object found; returns bbox for recentering; **do NOT call find_object after this succeeds**
   **Heading conversion:** `angle_deg = (bbox.cx - 0.5) × 62.0`
-  (positive = left, negative = right; e.g. cx=0.2 → −18.6°, cx=0.8 → +18.6°)
+  (positive = right, negative = left; e.g. cx=0.2 → −18.6°, cx=0.8 → +18.6°)
 
   ### LiDAR
   - `tbot_lidar_get_obstacle_distances(sector)` — sector: "front"|"left"|"right"|"rear"|"all"
@@ -139,7 +143,7 @@ v3_instruction_template: |
   | Patrol between two locations | `tbot_nav_get_pose` → `tbot_nav_go_to_pose` (loop) | Do NOT use raw motion loops |
   | Move along a wall | `tbot_lidar_get_obstacle_distances` → `tbot_motion_move_timed` (loop with angular correction) | Wall-follow recipe |
   | Map free floor space | `tbot_lidar_export_free_space_map` | Stationary; no motion needed |
-  | Find a clear path / gap | `tbot_vision_find_object` → `tbot_lidar_get_distance_at_angle` (×2) → compute midpoint | Heading from bbox.cx; see Gap Finding recipe |
+  | Find a clear path / gap between two objects | `tbot_vision_scan_for_object` (×2 with heading reset) → `tbot_lidar_get_distance_at_angle` (×2) → compute midpoint | See **Path Between Two Objects** recipe |
   | Understand room layout / find open space | `tbot_lidar_get_wall_profile` | Returns nearest, farthest, and open_headings_deg |
   | Follow a floor line | `tbot_vision_describe_scene` → `tbot_motion_move_timed` (loop) | Line-follow recipe |
   | Detect floor hazards | `tbot_vision_describe_scene` before each forward move | Stop on detection |
@@ -222,15 +226,33 @@ v3_instruction_template: |
   4. Use `farthest` to find the most open direction for navigation
   5. For sub-degree precision on a specific heading: `tbot_lidar_get_distance_at_angle(angle_deg)`
 
-  ### Gap Finding (between two named objects)
-  1. `tbot_vision_find_object(object_A)` → get bbox.cx_A; compute angle_A = (cx_A - 0.5) × 62.0
-  2. `tbot_vision_find_object(object_B)` → get bbox.cx_B; compute angle_B = (cx_B - 0.5) × 62.0
-  3. `tbot_lidar_get_distance_at_angle(angle_A, half_width_deg=5.0)` → dist_A
-  4. `tbot_lidar_get_distance_at_angle(angle_B, half_width_deg=5.0)` → dist_B
-  5. Compute gap heading = (angle_A + angle_B) / 2.0
-  6. `tbot_lidar_get_distance_at_angle(gap_heading, half_width_deg=10.0)` → gap clearance
-  7. Report: object positions (angle + distance), gap heading, gap clearance
-     - If either object not visible: scan first with Object Search Loop, then repeat
+  ### Path Between Two Objects
+  Goal: determine the heading and clearance of the gap between two named objects, then navigate through it.
+
+  **Step 1 — Locate object A and record its heading:**
+  1. `tbot_vision_scan_for_object("object_A", direction="left", max_rotation_deg=360)`
+     - If status="not_found": report `blocked_capability` — object A not visible
+     - Robot is now facing object A; `total_rotation_deg` = angle_A (degrees rotated left from start)
+  2. `tbot_lidar_get_distance_at_angle(0)` → dist_A
+  3. Reset heading: `tbot_motion_turn(direction="right", speed=0.5, duration_seconds = angle_A × π / (180 × 0.5))`
+
+  **Step 2 — Locate object B and record its heading:**
+  4. `tbot_vision_scan_for_object("object_B", direction="left", max_rotation_deg=360)`
+     - If status="not_found": report `blocked_capability` — object B not visible
+     - `total_rotation_deg` = angle_B (degrees rotated left from the re-established start heading)
+  5. `tbot_lidar_get_distance_at_angle(0)` → dist_B
+  6. Reset heading: `tbot_motion_turn(direction="right", speed=0.5, duration_seconds = angle_B × π / (180 × 0.5))`
+
+  **Step 3 — Compute gap and navigate:**
+  7. gap_angle = (angle_A + angle_B) / 2  — midpoint heading (left of start)
+  8. `tbot_motion_turn(direction="left", speed=0.5, duration_seconds = gap_angle × π / (180 × 0.5))` — face gap
+  9. `tbot_lidar_get_obstacle_distances("front")` — get clearance at gap heading
+     - If front < 0.10 m: report `blocked_safety` — gap is obstructed
+  10. **Navigate through the gap** (choose one):
+      - **Straight**: `tbot_motion_move_forward_distance(travel_m, speed=0.1)` — if gap is directly ahead
+      - **Arc**: `tbot_motion_move_timed(linear=0.1, angular=±0.3, duration_s=X)` — if the gap requires a
+        curved path; sign of angular follows gap direction (positive=left, negative=right)
+  11. Report: object A heading + distance, object B heading + distance, gap heading, gap clearance, path taken
 
   ### Line Following
   Loop until line lost, obstacle reached, or timeout:

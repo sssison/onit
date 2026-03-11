@@ -333,11 +333,10 @@ async def tbot_motion_turn(
             "Pass a non-zero speed within the allowed range."
         )
 
-    # ROS convention: angular.z > 0 = CCW = left, angular.z < 0 = CW = right.
-    # ANGULAR_SIGN flips the mapping when the robot's frame differs (default -1.0).
-    # "right" → positive input frame → +1 * ANGULAR_SIGN
-    # "left"  → negative input frame → -1 * ANGULAR_SIGN
-    input_frame_sign = 1.0 if direction_clean == "right" else -1.0
+    # Map semantic direction ("left"/"right") into the local input frame first,
+    # then adapt to hardware/frame conventions via MOTION_ANGULAR_SIGN.
+    # Default ANGULAR_SIGN=-1.0 keeps V3 turn semantics aligned with vision scan turns.
+    input_frame_sign = 1.0 if direction_clean == "left" else -1.0
     angular_cmd = input_frame_sign * clamped_speed * ANGULAR_SIGN
 
     if angular_cmd == 0.0:
