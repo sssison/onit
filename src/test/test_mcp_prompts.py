@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 import yaml
@@ -93,3 +94,17 @@ class TestAssistantInstruction:
             file_server_url=None,
         )
         assert "uploads" not in result
+
+    @pytest.mark.asyncio
+    async def test_turtlebot_template_path_uses_instruction_template(self):
+        template_path = Path(__file__).resolve().parents[1] / "mcp" / "prompts" / "prompt_templates" / "assistant_turtlebot.yaml"
+        result = await _assistant_fn(
+            task="move toward the bottle",
+            session_id="turtlebot-session",
+            template_path=str(template_path),
+        )
+
+        assert "You are a TurtleBot robot agent. Complete the following task:" in result
+        assert "standoff_m = 0.20" in result
+        assert "v3_instruction_template" not in result
+        assert "(V3)" not in result

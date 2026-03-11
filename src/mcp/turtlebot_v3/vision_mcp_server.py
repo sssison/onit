@@ -292,7 +292,9 @@ async def tbot_vision_find_object(object_name: str) -> dict[str, Any]:
 
 async def _turn_step_async(direction: str, speed_rad_s: float, duration_s: float) -> None:
     """Issue a timed turn to the motion HTTP server."""
-    sign = 1.0 if direction == "left" else -1.0
+    # Keep scan turn semantics aligned with motion server direction mapping.
+    # For this robot convention, "right" maps to +1 before applying MOTION_ANGULAR_SIGN.
+    sign = 1.0 if direction == "right" else -1.0
     angular = sign * speed_rad_s * MOTION_ANGULAR_SIGN
     deadline = asyncio.get_event_loop().time() + duration_s
     try:
@@ -333,13 +335,22 @@ async def tbot_vision_scan_for_object(
 
     direction: "left" | "right"
     turn_speed: rotation speed in rad/s (default 0.3)
+    max_rotation_deg is clamped to a full 360° sweep.
     """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
         raise ValueError("object_name must be a non-empty string")
 
     step_f = float(step_deg) if isinstance(step_deg, (int, float)) else 10.0
-    max_rot_f = float(max_rotation_deg) if isinstance(max_rotation_deg, (int, float)) else 360.0
+    requested_max_rot = (
+        float(max_rotation_deg)
+        if isinstance(max_rotation_deg, (int, float))
+        else 360.0
+    )
+    if not math.isfinite(requested_max_rot):
+        requested_max_rot = 360.0
+    # Enforce full scan coverage even if callers request 180°.
+    max_rot_f = 360.0 if requested_max_rot < 360.0 else requested_max_rot
     direction_clean = direction.strip().lower() if isinstance(direction, str) else "left"
     if direction_clean not in ("left", "right"):
         direction_clean = "left"
