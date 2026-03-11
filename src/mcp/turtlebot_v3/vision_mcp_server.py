@@ -327,8 +327,8 @@ async def tbot_vision_scan_for_object(
     Scan for a named object by rotating in steps until it is found.
 
     Checks the current frame first; if not found, turns step_deg and checks again.
-    Stops as soon as the object is found (confidence >= confidence_threshold) or
-    the full max_rotation_deg budget is used.
+    Stops as soon as the object is visible, or when the full
+    max_rotation_deg budget is used.
 
     Returns status="found" with bbox (for recentering) or status="not_found".
     After "found", do NOT call tbot_vision_find_object — use the returned bbox directly.
@@ -336,12 +336,16 @@ async def tbot_vision_scan_for_object(
     direction: "left" | "right"
     turn_speed: rotation speed in rad/s (default 0.3)
     max_rotation_deg is clamped to a full 360° sweep.
+    confidence_threshold is accepted for backward compatibility but does
+    not gate stop behavior; visibility alone stops the scan.
     """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
         raise ValueError("object_name must be a non-empty string")
 
-    step_f = float(step_deg) if isinstance(step_deg, (int, float)) else 10.0
+    step_f = float(step_deg) if isinstance(step_deg, (int, float)) else 15.0
+    if not math.isfinite(step_f) or step_f <= 0:
+        step_f = 15.0
     requested_max_rot = (
         float(max_rotation_deg)
         if isinstance(max_rotation_deg, (int, float))
@@ -355,7 +359,7 @@ async def tbot_vision_scan_for_object(
     if direction_clean not in ("left", "right"):
         direction_clean = "left"
     speed_f = float(turn_speed) if isinstance(turn_speed, (int, float)) else 0.3
-    threshold_f = float(confidence_threshold) if isinstance(confidence_threshold, (int, float)) else 0.5
+    _ = float(confidence_threshold) if isinstance(confidence_threshold, (int, float)) else 0.5
 
     step_duration_s = step_f * math.pi / (180.0 * max(speed_f, 0.01))
 
@@ -365,15 +369,15 @@ async def tbot_vision_scan_for_object(
 
     for _ in range(max_steps + 1):  # +1: check current frame before any turn
         result = await _find_object_in_frame(object_name_clean)
-        if result["visible"] and result["confidence"] >= threshold_f:
+        if bool(result.get("visible", False)):
             return {
                 "status": "found",
                 "object_name": object_name_clean,
                 "total_rotation_deg": total_rotation,
                 "steps_taken": steps_taken,
-                "confidence": result["confidence"],
-                "bbox": result["bbox"],
-                "position": result["position"],
+                "confidence": result.get("confidence"),
+                "bbox": result.get("bbox"),
+                "position": result.get("position"),
             }
         if steps_taken >= max_steps:
             break
