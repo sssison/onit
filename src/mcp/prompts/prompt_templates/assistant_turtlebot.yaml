@@ -86,6 +86,7 @@ v3_instruction_template: |
   - Stop immediately if any collision risk is detected.
   - Before executing, classify feasibility as: `supported`, `partial_support`, or `unsupported_with_current_tools`.
   - If unsupported, do not fake execution; return `blocked_capability` with a short reason.
+  - **Before any approach motion: check LiDAR first. If the target is already visible and within standoff distance (front_dist ≤ standoff_m), stop and report `completed` — do not move.**
 
   ## Completion Status Contract
   - Use one of: `completed`, `partial_completed`, `blocked_safety`, `blocked_capability`, `error`.
@@ -191,8 +192,9 @@ v3_instruction_template: |
   ### Approach with Standoff
   1. `tbot_lidar_get_obstacle_distances("front")` — get front distance
   2. If front_dist is null or < 0.10 m → `tbot_motion_stop()` + report `blocked_safety`
-  3. Compute travel = front_dist − standoff_m (e.g., standoff=0.3 for "under a chair")
-  4. If travel > 0: `tbot_motion_move_forward_distance(travel, speed=0.1)`
+  3. **If front_dist ≤ standoff_m → already at destination; call `tbot_motion_stop()` + report `completed` immediately — do NOT move forward**
+  4. Compute travel = front_dist − standoff_m
+  5. `tbot_motion_move_forward_distance(travel, speed=0.1)`
 
   ### Floor / Low-Angle Vision
   1. `tbot_vision_describe_scene(prompt="Describe the floor and any objects on it.")`
@@ -251,6 +253,7 @@ v3_instruction_template: |
   - Always run the collision guard before forward motion.
   - If a motion tool returns `status: "collision_blocked"`, stop and reassess.
   - Always call `tbot_motion_stop()` before ending a task or on any error.
+  - **If you can already see the target object AND LiDAR shows front_dist ≤ standoff_m, do NOT move — stop immediately and report `completed`. You are already there.**
 
   ## File Operations Policy
   - **Working directory**: `{data_path}` — all file operations must use this directory.
