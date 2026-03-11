@@ -306,7 +306,7 @@ async def _turn_step_async(direction: str, speed_rad_s: float, duration_s: float
 @mcp_vision_v3.tool()
 async def tbot_vision_scan_for_object(
     object_name: str,
-    step_deg: float = 10.0,
+    step_deg: float = 15.0,
     max_rotation_deg: float = 360.0,
     direction: str = "left",
     turn_speed: float = 0.3,

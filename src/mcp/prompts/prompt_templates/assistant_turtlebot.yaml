@@ -181,7 +181,7 @@ v3_instruction_template: |
   4. Repeat for requested number of cycles
 
   ### Object Search + Recenter
-  1. `tbot_vision_scan_for_object(object_name)` — single call; scans up to 360° in 10° steps
+  1. `tbot_vision_scan_for_object(object_name)` — single call; scans up to 360° in 15° steps
      - If status="found": object located; **use the returned bbox directly — do NOT call tbot_vision_find_object again**
      - If status="not_found": object not visible in any direction; report blocked_capability
   2. **Recenter** (if bbox.position ≠ "center"):
