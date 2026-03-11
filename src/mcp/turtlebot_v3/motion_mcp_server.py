@@ -333,10 +333,10 @@ async def tbot_motion_turn(
             "Pass a non-zero speed within the allowed range."
         )
 
-    # Map semantic direction ("left"/"right") into the local input frame first,
-    # then adapt to hardware/frame conventions via MOTION_ANGULAR_SIGN.
-    # Default ANGULAR_SIGN=-1.0 keeps V3 turn semantics aligned with vision scan turns.
-    input_frame_sign = 1.0 if direction_clean == "left" else -1.0
+    # Keep turn(direction=...) aligned with signed angular convention used by
+    # tbot_motion_move_timed on this robot (+angular = left/CCW, -angular = right/CW).
+    # MOTION_ANGULAR_SIGN remains the hardware/frame adapter.
+    input_frame_sign = 1.0 if direction_clean == "right" else -1.0
     angular_cmd = input_frame_sign * clamped_speed * ANGULAR_SIGN
 
     if angular_cmd == 0.0:

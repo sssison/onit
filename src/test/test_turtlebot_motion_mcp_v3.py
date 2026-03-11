@@ -78,7 +78,7 @@ async def _run_turn(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("direction", "input_multiplier"), [("left", 1.0), ("right", -1.0)])
+@pytest.mark.parametrize(("direction", "input_multiplier"), [("left", -1.0), ("right", 1.0)])
 async def test_turn_direction_maps_to_expected_angular_cmd(direction: str, input_multiplier: float):
     speed = 0.4
     result, captured = await _run_turn(
@@ -100,8 +100,8 @@ async def test_turn_respects_angular_sign_override():
         result_right, _ = await _run_turn(direction="right", speed=0.5, duration_seconds=0.2)
         result_left, _ = await _run_turn(direction="left", speed=0.5, duration_seconds=0.2)
 
-    assert result_right["angular_cmd"] == pytest.approx(-0.5)
-    assert result_left["angular_cmd"] == pytest.approx(0.5)
+    assert result_right["angular_cmd"] == pytest.approx(0.5)
+    assert result_left["angular_cmd"] == pytest.approx(-0.5)
 
 
 @pytest.mark.asyncio
