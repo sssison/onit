@@ -22,6 +22,9 @@ instruction_template: |
   - Do not repeat the same tool call with the same arguments unless the robot state changed (moved/turned), the prior call failed, or the task explicitly requires re-checking.
   - Prefer single-call combined tools when available (for example, `tbot_vision_capture_and_analyze`) instead of splitting into extra calls.
   - After a successful step, proceed to the next required action instead of re-verifying immediately.
+  - After `tbot_vision_scan_for_object` returns status="found", use its returned `bbox` and `position` directly — do NOT call `tbot_vision_find_object` for the same object.
+  - `tbot_motion_turn` does not require a LiDAR check — never call `tbot_lidar_get_obstacle_distances` before a rotation.
+  - Do not call `tbot_nav_get_pose` unless you need to record or compare a specific coordinate.
 
   ### 1. Navigation & Motion
   - Use `tbot_motion_move(linear, angular, duration_s)` for arbitrary motion (forward, backward, arcs).
@@ -88,7 +91,7 @@ v3_instruction_template: |
   - Use one of: `completed`, `partial_completed`, `blocked_safety`, `blocked_capability`, `error`.
   - For scene-understanding tasks with ambiguous evidence, use `partial_completed` instead of guessing.
 
-  ## Available Tools (12 primitives)
+  ## Available Tools (13 primitives)
 
   ### Motion
   - `tbot_motion_move_timed(linear, angular, duration_s)` — timed velocity command; no LiDAR guard
@@ -102,6 +105,7 @@ v3_instruction_template: |
   ### Vision
   - `tbot_vision_describe_scene(prompt)` — load latest frame and describe scene
   - `tbot_vision_find_object(object_name)` — check if object is visible; returns position left/center/right
+  - `tbot_vision_scan_for_object(object_name, step_deg, max_rotation_deg, direction, turn_speed, confidence_threshold)` — rotate until object found; returns bbox for recentering; **do NOT call find_object after this succeeds**
   **Heading conversion:** `angle_deg = (bbox.cx - 0.5) × 62.0`
   (positive = left, negative = right; e.g. cx=0.2 → −18.6°, cx=0.8 → +18.6°)
 
@@ -126,7 +130,7 @@ v3_instruction_template: |
 
   | Task type | Primary tools | Notes |
   |-----------|--------------|-------|
-  | Find/locate an object | `tbot_vision_find_object` → `tbot_motion_turn` → `tbot_motion_move_forward_distance` | Search loop; collision guard before each forward step |
+  | Find/locate an object | `tbot_vision_scan_for_object` → `tbot_motion_turn` (recenter if needed) → `tbot_motion_move_forward_distance` | Single call replaces the manual search loop |
   | Describe/inspect scene or floor | `tbot_vision_describe_scene` | No motion needed first |
   | Approach an object at specific distance | `tbot_lidar_get_obstacle_distances("front")` → `tbot_motion_move_forward_distance` | travel = front_dist − standoff |
   | Move around an obstacle | `tbot_lidar_get_obstacle_distances("all")` → `tbot_motion_turn` → `tbot_motion_move_forward_distance` | Bypass recipe |
@@ -175,12 +179,14 @@ v3_instruction_template: |
   3. If status="reached": `tbot_nav_go_to_pose(x_A, y_A, ...)` — navigate back to A
   4. Repeat for requested number of cycles
 
-  ### Object Search Loop
-  Loop up to 24 × 15° steps (full 360°):
-  1. `tbot_vision_find_object(object_name)` — check current frame
-  2. If visible and confidence ≥ 0.5: stop rotation, proceed to approach
-  3. Else: `tbot_motion_turn(direction="left", speed=0.3, duration_seconds=0.87)` — rotate 15°
-  4. Wait ~0.15s for frame to update (factor into timing), then repeat
+  ### Object Search + Recenter
+  1. `tbot_vision_scan_for_object(object_name)` — single call; scans up to 360° in 10° steps
+     - If status="found": object located; **use the returned bbox directly — do NOT call tbot_vision_find_object again**
+     - If status="not_found": object not visible in any direction; report blocked_capability
+  2. **Recenter** (if bbox.position ≠ "center"):
+     - Turn in the direction bbox.position indicates: `tbot_motion_turn(direction=bbox.position, speed=0.3, duration_seconds=0.58)`
+     - 0.58s ≈ 10° at 0.3 rad/s — repeat once if still off-center
+  3. Proceed to Approach with Standoff recipe
 
   ### Approach with Standoff
   1. `tbot_lidar_get_obstacle_distances("front")` — get front distance
@@ -253,7 +259,7 @@ v3_instruction_template: |
 
 metadata:
   version: "2.0"
-  description: "TurtleBot robot agent template — 12 primitive tools, all compound behavior in prompt"
+  description: "TurtleBot robot agent template — 13 primitive tools, all compound behavior in prompt"
   use_case: "TurtleBot navigation, object detection, and autonomous task execution"
   focus_areas:
     - Collision avoidance

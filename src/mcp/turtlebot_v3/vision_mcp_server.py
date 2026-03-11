@@ -4,6 +4,7 @@ TurtleBot Vision MCP Server V3.
 Reads frames directly from /dev/shm/latest_frame.jpg — no ROS dependency.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -12,6 +13,7 @@ import os
 import re
 from typing import Any
 
+import httpx
 from fastmcp import FastMCP
 from openai import APITimeoutError, AsyncOpenAI, OpenAIError
 
@@ -35,6 +37,11 @@ DEFAULT_VISION_HOST = os.getenv("TBOT_VISION_HOST") or os.getenv("ONIT_HOST", "h
 DEFAULT_VISION_MODEL = os.getenv("TBOT_VISION_MODEL", "Qwen/Qwen3.5-35B-A3B")
 DEFAULT_VISION_API_KEY = os.getenv("TBOT_VISION_API_KEY", "EMPTY")
 VISION_TIMEOUT_S = _env_float("TBOT_VISION_TIMEOUT_S", 60.0)
+
+MOTION_BASE_URL = os.getenv("MOTION_SERVER_BASE_URL", "http://10.158.38.26:5001").rstrip("/")
+MOTION_ANGULAR_SIGN = _env_float("MOTION_ANGULAR_SIGN", -1.0)
+MOTION_HTTP_TIMEOUT_S = _env_float("MOTION_TIMEOUT_S", 5.0)
+MOTION_REFRESH_S = 0.05
 
 
 def _resolve_api_key(host: str) -> str:
@@ -207,6 +214,53 @@ async def tbot_vision_describe_scene(
     return {"description": raw_response, "model_info": model_info}
 
 
+async def _find_object_in_frame(object_name: str) -> dict[str, Any]:
+    """
+    Check if object_name is visible in the current frame.
+    Returns {"visible": bool, "confidence": float, "bbox": dict|None, "position": str|None}.
+    """
+    frame_path = os.getenv("TBOT_FRAME_PATH", FRAME_PATH)
+    host = os.getenv("TBOT_VISION_HOST", DEFAULT_VISION_HOST)
+    model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
+    api_key = _resolve_api_key(host)
+
+    image_b64 = _load_frame_as_base64(frame_path)
+    system_prompt = (
+        "Return only JSON with keys: matched (boolean), confidence (0..1), "
+        "bbox (object with normalized cx, cy, w, h or null)."
+    )
+    user_prompt = f"Is the target object '{object_name}' visible in this image?"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": [
+            {"type": "text", "text": user_prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+        ]},
+    ]
+
+    parsed: dict[str, Any] = {}
+    try:
+        client = AsyncOpenAI(base_url=host, api_key=api_key)
+        completion = await client.chat.completions.create(
+            model=model, messages=messages, timeout=VISION_TIMEOUT_S,
+        )
+        raw = completion.choices[0].message.content or ""
+        parsed = _extract_first_json_object(raw) or {}
+    except Exception:
+        pass
+
+    matched = bool(parsed.get("matched", False))
+    confidence = _normalize_confidence(parsed.get("confidence")) or 0.0
+    bbox: dict[str, float] | None = None
+    position: str | None = None
+    if matched:
+        bbox = _normalize_bbox(parsed.get("bbox"))
+        if bbox is not None:
+            cx = bbox["cx"]
+            position = "left" if cx < 0.33 else ("right" if cx > 0.66 else "center")
+    return {"visible": matched, "confidence": confidence, "bbox": bbox, "position": position}
+
+
 @mcp_vision_v3.tool()
 async def tbot_vision_find_object(object_name: str) -> dict[str, Any]:
     """
@@ -219,72 +273,102 @@ async def tbot_vision_find_object(object_name: str) -> dict[str, Any]:
     if not object_name_clean:
         raise ValueError("object_name must be a non-empty string")
 
-    frame_path = os.getenv("TBOT_FRAME_PATH", FRAME_PATH)
     host = os.getenv("TBOT_VISION_HOST", DEFAULT_VISION_HOST)
     model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
-    api_key = _resolve_api_key(host)
-
     model_info = {"host": host, "model": model, "timeout_s": VISION_TIMEOUT_S}
 
-    image_b64 = _load_frame_as_base64(frame_path)
+    result = await _find_object_in_frame(object_name_clean)
+    return {**result, "model_info": model_info}
 
-    system_prompt = (
-        "Return only JSON with keys: matched (boolean), confidence (0..1), "
-        "bbox (object with normalized cx, cy, w, h or null)."
-    )
-    user_prompt = f"Is the target object '{object_name_clean}' visible in this image?"
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": user_prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-            ],
-        },
-    ]
 
-    raw_response = ""
-    parsed: dict[str, Any] | None = None
+async def _turn_step_async(direction: str, speed_rad_s: float, duration_s: float) -> None:
+    """Issue a timed turn to the motion HTTP server."""
+    sign = 1.0 if direction == "left" else -1.0
+    angular = sign * speed_rad_s * MOTION_ANGULAR_SIGN
+    deadline = asyncio.get_event_loop().time() + duration_s
     try:
-        client = AsyncOpenAI(base_url=host, api_key=api_key)
-        completion = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            timeout=VISION_TIMEOUT_S,
-        )
-        raw_response = completion.choices[0].message.content or ""
-        parsed = _extract_first_json_object(raw_response)
-    except APITimeoutError:
-        raw_response = f"Vision request timed out after {VISION_TIMEOUT_S}s."
-    except OpenAIError as e:
-        raw_response = f"Vision model request failed: {e}"
-    except Exception as e:
-        raw_response = f"Unexpected vision processing error: {e}"
+        async with httpx.AsyncClient(timeout=MOTION_HTTP_TIMEOUT_S) as client:
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    await client.post(f"{MOTION_BASE_URL}/move",
+                                      json={"linear": 0.0, "angular": angular})
+                except Exception:
+                    break
+                await asyncio.sleep(MOTION_REFRESH_S)
+            try:
+                await client.post(f"{MOTION_BASE_URL}/stop", json={})
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    parsed = parsed or {}
-    matched = bool(parsed.get("matched", False))
-    confidence = _normalize_confidence(parsed.get("confidence")) or 0.0
 
-    position: str | None = None
-    bbox: dict[str, float] | None = None
-    if matched:
-        bbox = _normalize_bbox(parsed.get("bbox"))
-        if bbox is not None:
-            cx = bbox["cx"]
-            if cx < 0.33:
-                position = "left"
-            elif cx <= 0.66:
-                position = "center"
-            else:
-                position = "right"
+@mcp_vision_v3.tool()
+async def tbot_vision_scan_for_object(
+    object_name: str,
+    step_deg: float = 10.0,
+    max_rotation_deg: float = 360.0,
+    direction: str = "left",
+    turn_speed: float = 0.3,
+    confidence_threshold: float = 0.5,
+) -> dict[str, Any]:
+    """
+    Scan for a named object by rotating in steps until it is found.
+
+    Checks the current frame first; if not found, turns step_deg and checks again.
+    Stops as soon as the object is found (confidence >= confidence_threshold) or
+    the full max_rotation_deg budget is used.
+
+    Returns status="found" with bbox (for recentering) or status="not_found".
+    After "found", do NOT call tbot_vision_find_object — use the returned bbox directly.
+
+    direction: "left" | "right"
+    turn_speed: rotation speed in rad/s (default 0.3)
+    """
+    object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
+    if not object_name_clean:
+        raise ValueError("object_name must be a non-empty string")
+
+    step_f = float(step_deg) if isinstance(step_deg, (int, float)) else 10.0
+    max_rot_f = float(max_rotation_deg) if isinstance(max_rotation_deg, (int, float)) else 360.0
+    direction_clean = direction.strip().lower() if isinstance(direction, str) else "left"
+    if direction_clean not in ("left", "right"):
+        direction_clean = "left"
+    speed_f = float(turn_speed) if isinstance(turn_speed, (int, float)) else 0.3
+    threshold_f = float(confidence_threshold) if isinstance(confidence_threshold, (int, float)) else 0.5
+
+    step_duration_s = step_f * math.pi / (180.0 * max(speed_f, 0.01))
+
+    total_rotation = 0.0
+    steps_taken = 0
+    max_steps = int(math.ceil(max_rot_f / step_f)) if step_f > 0 else 0
+
+    for _ in range(max_steps + 1):  # +1: check current frame before any turn
+        result = await _find_object_in_frame(object_name_clean)
+        if result["visible"] and result["confidence"] >= threshold_f:
+            return {
+                "status": "found",
+                "object_name": object_name_clean,
+                "total_rotation_deg": total_rotation,
+                "steps_taken": steps_taken,
+                "confidence": result["confidence"],
+                "bbox": result["bbox"],
+                "position": result["position"],
+            }
+        if steps_taken >= max_steps:
+            break
+        await _turn_step_async(direction_clean, speed_f, step_duration_s)
+        total_rotation += step_f
+        steps_taken += 1
 
     return {
-        "visible": matched,
-        "position": position,
-        "confidence": confidence,
-        "bbox": bbox,
-        "model_info": model_info,
+        "status": "not_found",
+        "object_name": object_name_clean,
+        "total_rotation_deg": total_rotation,
+        "steps_taken": steps_taken,
+        "confidence": None,
+        "bbox": None,
+        "position": None,
     }
 
 
