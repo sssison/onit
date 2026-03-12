@@ -368,15 +368,14 @@ async def tbot_nav_go_to_pose(
 
                 try:
                     collision_raw = await lidar.call_tool(
-                        "tbot_lidar_get_obstacle_distances",
-                        {"sector": "front"},
+                        "tbot_lidar_check_collision",
+                        {"front_threshold_m": NAV_FRONT_THRESHOLD_M},
                     )
                     collision = _extract_tool_result_dict(collision_raw)
-                    front_distance = (collision.get("distances") or {}).get("front")
-                    if isinstance(front_distance, (int, float)):
-                        risk_level = "stop" if front_distance < NAV_FRONT_THRESHOLD_M else "clear"
-                    else:
-                        risk_level = "stop"
+                    risk_level = collision.get("risk_level", "unknown")
+                    front_distance = collision.get("min_forward_distance_m")
+                    if not isinstance(front_distance, (int, float)):
+                        front_distance = (collision.get("distances") or {}).get("front")
                 except Exception as e:
                     risk_level = "stop"
                     front_distance = None
@@ -429,6 +428,71 @@ async def tbot_nav_go_to_pose(
                     }
 
                 steps += 1
+
+
+@mcp_nav_v3.tool()
+async def tbot_nav_patrol(
+    waypoints: list[dict[str, Any]],
+    cycles: int = 1,
+    timeout_s_total: float = 120.0,
+) -> dict[str, Any]:
+    """Patrol through waypoints for N cycles using tbot_nav_go_to_pose."""
+    if not isinstance(waypoints, list) or not waypoints:
+        raise ValueError("waypoints must be a non-empty list")
+    cycles_i = int(cycles)
+    if cycles_i <= 0:
+        raise ValueError("cycles must be >= 1")
+    timeout_total = _validate_finite("timeout_s_total", timeout_s_total)
+    if timeout_total <= 0:
+        raise ValueError("timeout_s_total must be > 0")
+
+    started = time.monotonic()
+    completed_waypoints = 0
+    total_targets = len(waypoints) * cycles_i
+
+    for _cycle in range(cycles_i):
+        for waypoint in waypoints:
+            elapsed = time.monotonic() - started
+            remaining = timeout_total - elapsed
+            if remaining <= 0:
+                return {
+                    "status": "timeout",
+                    "completed_waypoints": completed_waypoints,
+                    "total_waypoints": total_targets,
+                    "elapsed_s": elapsed,
+                }
+
+            x = waypoint.get("x_m")
+            y = waypoint.get("y_m")
+            if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                raise ValueError("each waypoint must include numeric x_m and y_m")
+
+            result = await tbot_nav_go_to_pose(
+                target_x_m=float(x),
+                target_y_m=float(y),
+                target_yaw_rad=float(waypoint["yaw_rad"]) if isinstance(waypoint.get("yaw_rad"), (int, float)) else None,
+                timeout_s=min(float(waypoint.get("timeout_s", remaining)), remaining),
+            )
+
+            if result.get("status") == "reached":
+                completed_waypoints += 1
+                continue
+
+            return {
+                "status": "partial_completed",
+                "completed_waypoints": completed_waypoints,
+                "total_waypoints": total_targets,
+                "failed_waypoint": waypoint,
+                "last_result": result,
+                "elapsed_s": time.monotonic() - started,
+            }
+
+    return {
+        "status": "completed",
+        "completed_waypoints": completed_waypoints,
+        "total_waypoints": total_targets,
+        "elapsed_s": time.monotonic() - started,
+    }
 
 
 def run(

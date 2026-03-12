@@ -5,6 +5,7 @@ Duration-based motion commands via the HTTP API exposed by the motion server.
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -13,7 +14,7 @@ import time
 from typing import Any
 
 import httpx
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ MOTION_COMMAND_REFRESH_S = (
 MOVE_PATH = "/move"
 STOP_PATH = "/stop"
 HEALTH_PATH = "/health"
+LIDAR_MCP_URL = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
 
 mcp_motion_v3 = FastMCP("TurtleBot Motion MCP Server V3")
 _continuous_motion_thread: threading.Thread | None = None
@@ -205,6 +207,50 @@ async def _try_get_health() -> tuple[dict[str, Any] | None, str | None]:
         return await _get_json(HEALTH_PATH), None
     except Exception as e:
         return None, str(e)
+
+
+def _extract_tool_result_dict(tool_result: Any) -> dict[str, Any]:
+    if isinstance(tool_result, dict):
+        return tool_result
+    structured = getattr(tool_result, "structured_content", None)
+    if isinstance(structured, dict):
+        return structured
+    structured_camel = getattr(tool_result, "structuredContent", None)
+    if isinstance(structured_camel, dict):
+        return structured_camel
+    content = getattr(tool_result, "content", None)
+    if isinstance(content, list):
+        for part in content:
+            text = getattr(part, "text", None)
+            if isinstance(text, str):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+    return {}
+
+
+async def _get_collision_snapshot(lidar: Client | None = None) -> dict[str, Any]:
+    if lidar is None:
+        async with Client(LIDAR_MCP_URL) as lidar_client:
+            raw = await lidar_client.call_tool("tbot_lidar_check_collision", {})
+    else:
+        raw = await lidar.call_tool("tbot_lidar_check_collision", {})
+    return _extract_tool_result_dict(raw)
+
+
+def _extract_front_distance(collision: dict[str, Any]) -> float | None:
+    value = collision.get("min_forward_distance_m")
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    distances = collision.get("distances")
+    if isinstance(distances, dict):
+        front = distances.get("front")
+        if isinstance(front, (int, float)) and math.isfinite(float(front)):
+            return float(front)
+    return None
 
 
 async def _execute_forward_distance(distance_m: float, speed: float) -> dict[str, Any]:
@@ -378,6 +424,247 @@ async def tbot_motion_turn(
         "preempted_continuous_stream": preempted_stream,
         "health_angular_after_move": health_angular,
         "command_received_by_server": command_received,
+    }
+
+
+def _pick_bypass_side(preferred_side: str, left_distance_m: float | None, right_distance_m: float | None) -> str:
+    side_clean = preferred_side.strip().lower() if isinstance(preferred_side, str) else "auto"
+    if side_clean in ("left", "right"):
+        return side_clean
+
+    left = left_distance_m if isinstance(left_distance_m, (int, float)) else -1.0
+    right = right_distance_m if isinstance(right_distance_m, (int, float)) else -1.0
+    return "left" if left >= right else "right"
+
+
+def _compute_bypass_turn_angle_deg(
+    front_distance_m: float | None,
+    side_distance_m: float | None,
+    lateral_clearance_m: float,
+    min_turn_angle_deg: float,
+    max_turn_angle_deg: float,
+) -> tuple[float, float, float]:
+    front = float(front_distance_m) if isinstance(front_distance_m, (int, float)) else lateral_clearance_m
+    side = float(side_distance_m) if isinstance(side_distance_m, (int, float)) else 0.0
+    lateral_shift_m = max(0.0, lateral_clearance_m - side)
+    raw_angle_deg = math.degrees(math.atan2(lateral_shift_m, max(front, 1e-6)))
+    angle_deg = max(min_turn_angle_deg, min(max_turn_angle_deg, raw_angle_deg))
+    return angle_deg, raw_angle_deg, lateral_shift_m
+
+
+async def _sample_front_distance(lidar: Client | None = None) -> tuple[float | None, dict[str, Any]]:
+    if lidar is None:
+        async with Client(LIDAR_MCP_URL) as lidar_client:
+            raw = await lidar_client.call_tool("tbot_lidar_get_obstacle_distances", {"sector": "all"})
+    else:
+        raw = await lidar.call_tool("tbot_lidar_get_obstacle_distances", {"sector": "all"})
+    result = _extract_tool_result_dict(raw)
+    distances = result.get("distances")
+    front: float | None = None
+    if isinstance(distances, dict):
+        value = distances.get("front")
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            front = float(value)
+    return front, result
+
+
+@mcp_motion_v3.tool()
+async def tbot_motion_approach_until_close(
+    target_distance_m: float = 0.1,
+    stop_distance_m: float = 0.1,
+    speed: float = 0.1,
+    timeout_s: float = 20.0,
+) -> dict[str, Any]:
+    """
+    Safely approach until the front LiDAR distance is near target_distance_m.
+    Uses collision checks before and after a single planned forward segment.
+    """
+    target_f = _validate_finite("target_distance_m", target_distance_m)
+    stop_f = _validate_finite("stop_distance_m", stop_distance_m)
+    timeout_f = _validate_finite("timeout_s", timeout_s)
+    speed_f = _validate_finite("speed", speed)
+    if target_f <= 0:
+        raise ValueError("target_distance_m must be > 0")
+    if stop_f < 0:
+        raise ValueError("stop_distance_m must be >= 0")
+    if timeout_f <= 0:
+        raise ValueError("timeout_s must be > 0")
+
+    started = time.monotonic()
+    try:
+        async with Client(LIDAR_MCP_URL) as lidar:
+            initial_collision = await _get_collision_snapshot(lidar)
+            initial_front = _extract_front_distance(initial_collision)
+            if initial_front is None:
+                return {
+                    "status": "collision_risk",
+                    "initial_front_distance_m": None,
+                    "front_distance": None,
+                    "required_move_distance_m": None,
+                    "requested_move_duration_s": None,
+                    "executed_move_duration_s": 0.0,
+                    "collision": initial_collision,
+                }
+
+            required_distance = max(0.0, initial_front - target_f)
+            clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
+            if clamped_speed <= 0:
+                raise ValueError("speed must produce a non-zero command after clamping")
+            requested_duration = required_distance / clamped_speed if required_distance > 0 else 0.0
+            executed_duration = min(requested_duration, timeout_f)
+
+            if required_distance <= 0.0:
+                await _post_json(STOP_PATH)
+                status = "completed" if target_f <= stop_f else "reached"
+                return {
+                    "status": status,
+                    "target_distance_m": target_f,
+                    "stop_distance_m": stop_f,
+                    "initial_front_distance_m": initial_front,
+                    "front_distance": initial_front,
+                    "required_move_distance_m": 0.0,
+                    "requested_move_duration_s": 0.0,
+                    "executed_move_duration_s": 0.0,
+                    "elapsed_s": time.monotonic() - started,
+                    "move_posts": 0,
+                }
+
+            move_result = await _execute_forward_distance(distance_m=required_distance, speed=clamped_speed)
+            elapsed = time.monotonic() - started
+            timeout_hit = requested_duration > timeout_f or elapsed >= timeout_f
+
+            final_collision = await _get_collision_snapshot(lidar)
+            final_front = _extract_front_distance(final_collision)
+    except Exception as e:
+        return {
+            "status": "lidar_unavailable",
+            "initial_front_distance_m": None,
+            "front_distance": None,
+            "required_move_distance_m": None,
+            "requested_move_duration_s": None,
+            "executed_move_duration_s": 0.0,
+            "error": str(e),
+        }
+
+    if timeout_hit:
+        status = "timeout"
+    elif isinstance(final_collision, dict) and final_collision.get("risk_level") == "stop":
+        status = "collision_risk"
+    else:
+        status = "completed" if target_f <= stop_f else "reached"
+
+    return {
+        "status": status,
+        "target_distance_m": target_f,
+        "stop_distance_m": stop_f,
+        "initial_front_distance_m": initial_front,
+        "front_distance": final_front if final_front is not None else initial_front,
+        "required_move_distance_m": required_distance,
+        "requested_move_duration_s": requested_duration,
+        "executed_move_duration_s": executed_duration,
+        "elapsed_s": elapsed,
+        "move_posts": move_result.get("move_posts"),
+        "move_result": move_result,
+        "collision": final_collision,
+    }
+
+
+@mcp_motion_v3.tool()
+async def tbot_motion_bypass_obstacle(
+    preferred_side: str = "auto",
+    speed: float = 0.1,
+    turn_speed: float = 0.4,
+    lateral_clearance_m: float = 0.45,
+    min_turn_angle_deg: float = 15.0,
+    max_turn_angle_deg: float = 60.0,
+    parallel_front_clearance_m: float = 0.6,
+    final_front_clearance_m: float = 0.9,
+    max_first_leg_s: float = 3.0,
+    max_second_leg_s: float = 4.0,
+) -> dict[str, Any]:
+    """
+    Perform a two-leg obstacle bypass maneuver using LiDAR front/side clearances.
+    """
+    speed_f = _clamp(abs(_validate_finite("speed", speed)), MAX_LINEAR)
+    turn_speed_f = _clamp(abs(_validate_finite("turn_speed", turn_speed)), MAX_ANGULAR)
+    lateral_clearance = _validate_finite("lateral_clearance_m", lateral_clearance_m)
+    min_angle = _validate_finite("min_turn_angle_deg", min_turn_angle_deg)
+    max_angle = _validate_finite("max_turn_angle_deg", max_turn_angle_deg)
+    parallel_clearance = _validate_finite("parallel_front_clearance_m", parallel_front_clearance_m)
+    final_clearance = _validate_finite("final_front_clearance_m", final_front_clearance_m)
+    max_first_leg = _validate_finite("max_first_leg_s", max_first_leg_s)
+    max_second_leg = _validate_finite("max_second_leg_s", max_second_leg_s)
+    if speed_f <= 0:
+        raise ValueError("speed must be > 0 after clamping")
+    if turn_speed_f <= 0:
+        raise ValueError("turn_speed must be > 0 after clamping")
+
+    async with Client(LIDAR_MCP_URL) as lidar:
+        front0, first_scan = await _sample_front_distance(lidar)
+        distances0 = first_scan.get("distances") if isinstance(first_scan.get("distances"), dict) else {}
+        left0 = distances0.get("left") if isinstance(distances0, dict) else None
+        right0 = distances0.get("right") if isinstance(distances0, dict) else None
+        if isinstance(front0, (int, float)) and front0 >= final_clearance:
+            await _post_json(STOP_PATH)
+            return {
+                "status": "no_obstacle",
+                "initial_distances": distances0,
+                "front_distance_m": front0,
+            }
+
+        chosen_side = _pick_bypass_side(preferred_side, left0 if isinstance(left0, (int, float)) else None, right0 if isinstance(right0, (int, float)) else None)
+        side_distance = left0 if chosen_side == "left" else right0
+        turn_angle_deg, raw_turn_angle_deg, lateral_shift_m = _compute_bypass_turn_angle_deg(
+            front_distance_m=front0,
+            side_distance_m=side_distance if isinstance(side_distance, (int, float)) else None,
+            lateral_clearance_m=lateral_clearance,
+            min_turn_angle_deg=min_angle,
+            max_turn_angle_deg=max_angle,
+        )
+
+        turn_duration = math.radians(turn_angle_deg) / max(turn_speed_f, 1e-6)
+        opposite_side = "right" if chosen_side == "left" else "left"
+
+        await tbot_motion_turn(direction=chosen_side, speed=turn_speed_f, duration_seconds=turn_duration)
+        await _set_continuous_motion(None)
+
+        first_leg_status = "timeout"
+        first_leg_started = time.monotonic()
+        while (time.monotonic() - first_leg_started) < max_first_leg:
+            await _post_json(MOVE_PATH, {"linear": speed_f, "angular": 0.0})
+            front, _scan = await _sample_front_distance(lidar)
+            if isinstance(front, (int, float)) and front >= parallel_clearance:
+                first_leg_status = "parallel_reached"
+                break
+            await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
+        await _post_json(STOP_PATH)
+
+        await tbot_motion_turn(direction=opposite_side, speed=turn_speed_f, duration_seconds=turn_duration)
+        await _set_continuous_motion(None)
+
+        second_leg_status = "timeout"
+        second_leg_started = time.monotonic()
+        front_end: float | None = None
+        while (time.monotonic() - second_leg_started) < max_second_leg:
+            await _post_json(MOVE_PATH, {"linear": speed_f, "angular": 0.0})
+            front_end, _scan = await _sample_front_distance(lidar)
+            if isinstance(front_end, (int, float)) and front_end >= final_clearance:
+                second_leg_status = "clear_path_reached"
+                break
+            await asyncio.sleep(MOTION_COMMAND_REFRESH_S)
+        await _post_json(STOP_PATH)
+
+    status = "completed" if first_leg_status == "parallel_reached" and second_leg_status == "clear_path_reached" else "timeout"
+    return {
+        "status": status,
+        "chosen_side": chosen_side,
+        "turn_angle_deg": turn_angle_deg,
+        "raw_turn_angle_deg": raw_turn_angle_deg,
+        "lateral_shift_m": lateral_shift_m,
+        "initial_distances": distances0,
+        "first_leg_status": first_leg_status,
+        "second_leg_status": second_leg_status,
+        "final_front_distance_m": front_end,
     }
 
 

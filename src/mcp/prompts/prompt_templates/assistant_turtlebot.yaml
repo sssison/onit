@@ -20,7 +20,7 @@ instruction_template: |
   - Use one of: `completed`, `partial_completed`, `blocked_safety`, `blocked_capability`, `error`.
   - For scene-understanding tasks with ambiguous evidence, use `partial_completed` instead of guessing.
 
-  ## Available Tools (13 primitives)
+  ## Available Tools (Primitives + Composite Behaviors)
 
   ### Motion
   - `tbot_motion_move_timed(linear, angular, duration_s)` — timed velocity command; no LiDAR guard
@@ -37,12 +37,18 @@ instruction_template: |
 
   ### Vision
   - `tbot_vision_describe_scene(prompt)` — load latest frame and describe scene
+  - `tbot_vision_health()` — confirms camera frame availability
   - `tbot_vision_find_object(object_name)` — check if object is visible; returns position left/center/right
   - `tbot_vision_scan_for_object(object_name, step_deg, max_rotation_deg, direction, turn_speed, confidence_threshold)` — rotate until object found; returns bbox for recentering; uses a full 360° scan budget by default (do not set 180°); **do NOT call find_object after this succeeds**
+  - `tbot_vision_search_and_approach_object(object_name, target_distance_m, ...)` — merged behavior for search + recenter + safe approach
+  - `tbot_vision_inspect_floor(targets, region, near_object)` — structured floor hazard/object scan (cables, spill, feet/legs, fallen items, power strip, floor tape)
   **Heading conversion:** `angle_deg = (bbox.cx - 0.5) × 62.0`
   (positive = right, negative = left; e.g. cx=0.2 → −18.6°, cx=0.8 → +18.6°)
 
   ### LiDAR
+  - `tbot_lidar_health()` — confirms LiDAR scan availability
+  - `tbot_lidar_is_path_clear(threshold_m)` — quick forward-clearance check
+  - `tbot_lidar_check_collision(...)` — multi-sector risk classification (`clear|caution|stop|unknown`)
   - `tbot_lidar_get_obstacle_distances(sector)` — sector: "front"|"left"|"right"|"rear"|"all"
   - `tbot_lidar_get_distance_at_angle(angle_deg, half_width_deg, statistic)` — distance at a specific heading; use after vision gives bbox.cx to get exact object distance
   - `tbot_lidar_get_wall_profile(step_deg)` — 360° wall/obstacle distance profile at fixed angular steps; use for spatial awareness and finding open headings
@@ -51,30 +57,37 @@ instruction_template: |
   ### Navigation
   - `tbot_nav_get_pose()` — current odometry pose from ROS2 /odom
   - `tbot_nav_go_to_pose(target_x_m, target_y_m, target_yaw_rad, ...)` — go to pose with odom feedback and collision guard
+  - `tbot_nav_patrol(waypoints, cycles, timeout_s_total)` — patrol loop between waypoints
 
   ## Collision Guard (before any forward motion)
-  1. Call `tbot_lidar_get_obstacle_distances(sector="front")`
-  2. If `distances.front` is null or < 0.10 m → call `tbot_motion_stop()` + report `blocked_safety`
-  3. If `distances.front` < 0.30 m → reduce speed or use a smaller step
+  1. Prefer `tbot_lidar_check_collision(...)`
+  2. If `risk_level` is `stop` or `unknown` → call `tbot_motion_stop()` + report `blocked_safety`
+  3. If `risk_level` is `caution` → reduce speed or use a smaller step
 
   ## Tool Selection Guide
 
   Before acting, classify the task:
 
+  ### Task Categories
+  - Landmark navigation/positioning: bench, door, chair, stool, cabinet, workstation
+  - Scene verification/inspection: door state, blocked path, floor anomalies
+  - Obstacle-aware motion: bypass aisle blockers, avoid cables, stop on feet/legs
+  - Patrol/mapping: waypoint patrol and free-space map export
+
   | Task type | Primary tools | Notes |
   |-----------|--------------|-------|
-  | Find/locate an object | `tbot_vision_scan_for_object` → `tbot_motion_turn` (recenter if needed) → `tbot_motion_move_forward_distance` | Single call replaces the manual search loop |
+  | Find/locate and approach an object | `tbot_vision_search_and_approach_object` | Preferred merged behavior for search + recenter + standoff |
   | Describe/inspect scene or floor | `tbot_vision_describe_scene` | No motion needed first |
-  | Approach an object at specific distance | `tbot_lidar_get_obstacle_distances("front")` → `tbot_motion_move_forward_distance` | travel = front_dist − standoff (default standoff 0.20 m if unspecified) |
-  | Move around an obstacle | `tbot_lidar_get_obstacle_distances("all")` → `tbot_motion_turn` → `tbot_motion_move_forward_distance` | Bypass recipe |
+  | Approach an object at specific distance | `tbot_motion_approach_until_close` | Uses LiDAR collision checks and stop distance |
+  | Move around an obstacle | `tbot_motion_bypass_obstacle` | Two-leg bypass with auto side selection |
   | Navigate to a known/estimated pose | `tbot_nav_go_to_pose` | Odometry-backed; handles its own collision |
-  | Patrol between two locations | `tbot_nav_get_pose` → `tbot_nav_go_to_pose` (loop) | Do NOT use raw motion loops |
+  | Patrol between two locations | `tbot_nav_patrol` | Do NOT use raw motion loops |
   | Move along a wall | `tbot_lidar_get_obstacle_distances` → `tbot_motion_move_timed` (loop with angular correction) | Wall-follow recipe |
   | Map free floor space | `tbot_lidar_export_free_space_map` | Stationary; no motion needed |
   | Find a clear path / gap between two objects | `tbot_vision_scan_for_object` (×2 with heading reset) → `tbot_lidar_get_distance_at_angle` (×2) → compute midpoint | See **Path Between Two Objects** recipe |
   | Understand room layout / find open space | `tbot_lidar_get_wall_profile` | Returns nearest, farthest, and open_headings_deg |
   | Follow a floor line | `tbot_vision_describe_scene` → `tbot_motion_move_timed` (loop) | Line-follow recipe |
-  | Detect floor hazards | `tbot_vision_describe_scene` before each forward move | Stop on detection |
+  | Detect floor hazards | `tbot_vision_inspect_floor` before each forward move | Stop on detection |
   | Stop when specific object detected | `tbot_vision_find_object` before each move segment | Check every tick |
   | Identify blocking obstacles | `tbot_lidar_get_obstacle_distances("all")` + `tbot_vision_describe_scene` | Combine sensor modalities |
   | Check if area is clear | `tbot_lidar_get_obstacle_distances("front")` | < 0.10 m → blocked |

@@ -14,7 +14,7 @@ import re
 from typing import Any
 
 import httpx
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
 from openai import APITimeoutError, AsyncOpenAI, OpenAIError
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,14 @@ MOTION_BASE_URL = os.getenv("MOTION_SERVER_BASE_URL", "http://10.158.38.26:5001"
 MOTION_ANGULAR_SIGN = _env_float("MOTION_ANGULAR_SIGN", -1.0)
 MOTION_HTTP_TIMEOUT_S = _env_float("MOTION_TIMEOUT_S", 5.0)
 MOTION_REFRESH_S = 0.05
+MOTION_MCP_URL_V3 = os.getenv("TBOT_MOTION_MCP_URL_V3", "http://127.0.0.1:18210/turtlebot-motion-v3")
+LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
+
+_SEARCH_STEP_DEG = 15.0
+_SEARCH_ANGULAR_SPEED = 0.3
+_CENTER_TURN_DEG = 10.0
+_CENTER_TURN_SPEED = 0.3
+_SEARCH_APPROACH_DEFAULT_TARGET_M = 0.1
 
 
 def _resolve_api_key(host: str) -> str:
@@ -171,6 +179,70 @@ def _load_frame_as_base64(path: str) -> str:
         raise RuntimeError(f"Could not read frame file {path!r}: {e}")
 
 
+def _extract_tool_result_dict(tool_result: Any) -> dict[str, Any]:
+    if isinstance(tool_result, dict):
+        return tool_result
+    structured = getattr(tool_result, "structured_content", None)
+    if isinstance(structured, dict):
+        return structured
+    structured_camel = getattr(tool_result, "structuredContent", None)
+    if isinstance(structured_camel, dict):
+        return structured_camel
+    content = getattr(tool_result, "content", None)
+    if isinstance(content, list):
+        for part in content:
+            text = getattr(part, "text", None)
+            if isinstance(text, str):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+    return {}
+
+
+def _build_object_query(
+    object_name: str,
+    attributes: list[str] | None = None,
+    anchor_object: str | None = None,
+    relation: str | None = None,
+) -> str:
+    fragments = [object_name]
+    if attributes:
+        attrs = [a.strip() for a in attributes if isinstance(a, str) and a.strip()]
+        if attrs:
+            fragments.append(f"with attributes: {', '.join(attrs)}")
+    if anchor_object and isinstance(anchor_object, str) and anchor_object.strip():
+        fragments.append(f"near/relative to: {anchor_object.strip()}")
+    if relation and isinstance(relation, str) and relation.strip():
+        fragments.append(f"spatial relation: {relation.strip()}")
+    return "; ".join(fragments)
+
+
+@mcp_vision_v3.tool()
+async def tbot_vision_health() -> dict[str, Any]:
+    """Check whether the latest frame file is available for vision inference."""
+    frame_path = os.getenv("TBOT_FRAME_PATH", FRAME_PATH)
+    try:
+        stat = os.stat(frame_path)
+    except OSError as e:
+        return {
+            "status": "no_frame",
+            "frame_exists": False,
+            "frame_size_bytes": None,
+            "frame_path": frame_path,
+            "error": str(e),
+        }
+
+    return {
+        "status": "online",
+        "frame_exists": True,
+        "frame_size_bytes": int(stat.st_size),
+        "frame_path": frame_path,
+    }
+
+
 @mcp_vision_v3.tool()
 async def tbot_vision_describe_scene(
     prompt: str = "Describe what you see.",
@@ -222,7 +294,12 @@ async def tbot_vision_describe_scene(
     return {"description": raw_response, "model_info": model_info}
 
 
-async def _find_object_in_frame(object_name: str) -> dict[str, Any]:
+async def _find_object_in_frame(
+    object_name: str,
+    attributes: list[str] | None = None,
+    anchor_object: str | None = None,
+    relation: str | None = None,
+) -> dict[str, Any]:
     """
     Check if object_name is visible in the current frame.
     Returns {"visible": bool, "confidence": float, "bbox": dict|None, "position": str|None}.
@@ -237,7 +314,13 @@ async def _find_object_in_frame(object_name: str) -> dict[str, Any]:
         "Return only JSON with keys: matched (boolean), confidence (0..1), "
         "bbox (object with normalized cx, cy, w, h or null)."
     )
-    user_prompt = f"Is the target object '{object_name}' visible in this image?"
+    query = _build_object_query(
+        object_name=object_name,
+        attributes=attributes,
+        anchor_object=anchor_object,
+        relation=relation,
+    )
+    user_prompt = f"Is the target object visible in this image? Target description: {query}"
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
@@ -271,7 +354,12 @@ async def _find_object_in_frame(object_name: str) -> dict[str, Any]:
 
 
 @mcp_vision_v3.tool()
-async def tbot_vision_find_object(object_name: str) -> dict[str, Any]:
+async def tbot_vision_find_object(
+    object_name: str,
+    attributes: list[str] | None = None,
+    anchor_object: str | None = None,
+    relation: str | None = None,
+) -> dict[str, Any]:
     """
     Check if a named object is visible in the latest camera frame.
 
@@ -286,7 +374,12 @@ async def tbot_vision_find_object(object_name: str) -> dict[str, Any]:
     model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
     model_info = {"host": host, "model": model, "timeout_s": VISION_TIMEOUT_S}
 
-    result = await _find_object_in_frame(object_name_clean)
+    result = await _find_object_in_frame(
+        object_name_clean,
+        attributes=attributes,
+        anchor_object=anchor_object,
+        relation=relation,
+    )
     return {**result, "model_info": model_info}
 
 
@@ -322,6 +415,9 @@ async def tbot_vision_scan_for_object(
     direction: str = "left",
     turn_speed: float = 0.3,
     confidence_threshold: float = 0.5,
+    attributes: list[str] | None = None,
+    anchor_object: str | None = None,
+    relation: str | None = None,
 ) -> dict[str, Any]:
     """
     Scan for a named object by rotating in steps until it is found.
@@ -368,7 +464,12 @@ async def tbot_vision_scan_for_object(
     max_steps = int(math.ceil(max_rot_f / step_f)) if step_f > 0 else 0
 
     for _ in range(max_steps + 1):  # +1: check current frame before any turn
-        result = await _find_object_in_frame(object_name_clean)
+        result = await _find_object_in_frame(
+            object_name_clean,
+            attributes=attributes,
+            anchor_object=anchor_object,
+            relation=relation,
+        )
         if bool(result.get("visible", False)):
             return {
                 "status": "found",
@@ -393,6 +494,383 @@ async def tbot_vision_scan_for_object(
         "confidence": None,
         "bbox": None,
         "position": None,
+    }
+
+
+async def _vision_search_object(
+    object_name: str,
+    min_confidence: float = 0.5,
+    max_steps: int = 24,
+    direction: str = "left",
+    attributes: list[str] | None = None,
+    anchor_object: str | None = None,
+    relation: str | None = None,
+) -> dict[str, Any]:
+    max_steps_i = max(0, int(max_steps))
+    confidence_threshold = _normalize_confidence(min_confidence) or 0.5
+    direction_clean = direction.strip().lower() if isinstance(direction, str) else "left"
+    if direction_clean not in ("left", "right"):
+        direction_clean = "left"
+
+    steps_taken = 0
+    degrees_rotated = 0.0
+    duration_s = math.radians(_SEARCH_STEP_DEG) / max(_SEARCH_ANGULAR_SPEED, 0.01)
+
+    for _ in range(max_steps_i + 1):
+        detected = await tbot_vision_find_object(
+            object_name=object_name,
+            attributes=attributes,
+            anchor_object=anchor_object,
+            relation=relation,
+        )
+        visible = bool(detected.get("visible", False))
+        confidence = _normalize_confidence(detected.get("confidence")) or 0.0
+        if visible and confidence >= confidence_threshold:
+            return {
+                "found": True,
+                "steps_taken": steps_taken,
+                "degrees_rotated": degrees_rotated,
+                "confidence": confidence,
+                "position": detected.get("position"),
+                "bbox": detected.get("bbox"),
+                "model_info": detected.get("model_info"),
+            }
+
+        if steps_taken >= max_steps_i:
+            break
+
+        async with Client(MOTION_MCP_URL_V3) as motion:
+            await motion.call_tool(
+                "tbot_motion_turn",
+                {
+                    "direction": direction_clean,
+                    "speed": _SEARCH_ANGULAR_SPEED,
+                    "duration_seconds": duration_s,
+                },
+            )
+            await motion.call_tool("tbot_motion_stop", {})
+
+        await asyncio.sleep(0.05)
+        steps_taken += 1
+        degrees_rotated += _SEARCH_STEP_DEG
+
+    return {
+        "found": False,
+        "steps_taken": steps_taken,
+        "degrees_rotated": degrees_rotated,
+        "confidence": None,
+        "position": None,
+        "bbox": None,
+        "model_info": None,
+    }
+
+
+async def _vision_reposition_for_object(
+    object_name: str,
+    min_confidence: float = 0.5,
+    max_steps: int = 3,
+    attributes: list[str] | None = None,
+    anchor_object: str | None = None,
+    relation: str | None = None,
+) -> dict[str, Any]:
+    initial = await tbot_vision_find_object(
+        object_name=object_name,
+        attributes=attributes,
+        anchor_object=anchor_object,
+        relation=relation,
+    )
+    confidence_threshold = _normalize_confidence(min_confidence) or 0.5
+    if bool(initial.get("visible", False)) and (initial.get("confidence") or 0.0) >= confidence_threshold:
+        return {
+            "status": "already_visible",
+            "found": True,
+            "steps_taken": 0,
+            "degrees_rotated": 0.0,
+            "confidence": initial.get("confidence"),
+            "position": initial.get("position"),
+            "bbox": initial.get("bbox"),
+            "model_info": initial.get("model_info"),
+        }
+
+    if max_steps <= 0:
+        return {
+            "status": "not_found",
+            "found": False,
+            "steps_taken": 0,
+            "degrees_rotated": 0.0,
+            "confidence": initial.get("confidence"),
+            "position": initial.get("position"),
+            "bbox": initial.get("bbox"),
+            "model_info": initial.get("model_info"),
+        }
+
+    search = await _vision_search_object(
+        object_name=object_name,
+        min_confidence=confidence_threshold,
+        max_steps=max_steps,
+        attributes=attributes,
+        anchor_object=anchor_object,
+        relation=relation,
+    )
+    if search.get("found"):
+        return {
+            "status": "reacquired",
+            "found": True,
+            "steps_taken": search.get("steps_taken", 0),
+            "degrees_rotated": search.get("degrees_rotated", 0.0),
+            "confidence": search.get("confidence"),
+            "position": search.get("position"),
+            "bbox": search.get("bbox"),
+            "model_info": search.get("model_info"),
+        }
+
+    return {
+        "status": "not_found",
+        "found": False,
+        "steps_taken": search.get("steps_taken", 0),
+        "degrees_rotated": search.get("degrees_rotated", 0.0),
+        "confidence": search.get("confidence"),
+        "position": search.get("position"),
+        "bbox": search.get("bbox"),
+        "model_info": search.get("model_info"),
+    }
+
+
+async def _center_object_in_frame(
+    object_name: str,
+    bbox: dict[str, Any] | None,
+    max_iterations: int = 2,
+    attributes: list[str] | None = None,
+    anchor_object: str | None = None,
+    relation: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(bbox, dict):
+        return {"status": "centered", "iterations": 0, "final_cx": None}
+
+    iterations = 0
+    current_bbox = bbox
+    while iterations < max_iterations:
+        cx = _normalize_unit_float(current_bbox.get("cx"))
+        if cx is None:
+            return {"status": "unknown_bbox", "iterations": iterations, "final_cx": None}
+        if 0.40 <= cx <= 0.60:
+            return {"status": "centered", "iterations": iterations, "final_cx": cx}
+
+        direction = "left" if cx < 0.40 else "right"
+        async with Client(MOTION_MCP_URL_V3) as motion:
+            await motion.call_tool(
+                "tbot_motion_turn",
+                {
+                    "direction": direction,
+                    "speed": _CENTER_TURN_SPEED,
+                    "duration_seconds": math.radians(_CENTER_TURN_DEG) / max(_CENTER_TURN_SPEED, 0.01),
+                },
+            )
+            await motion.call_tool("tbot_motion_stop", {})
+
+        detected = await tbot_vision_find_object(
+            object_name=object_name,
+            attributes=attributes,
+            anchor_object=anchor_object,
+            relation=relation,
+        )
+        current_bbox = detected.get("bbox") if isinstance(detected.get("bbox"), dict) else {}
+        iterations += 1
+
+    final_cx = _normalize_unit_float(current_bbox.get("cx")) if isinstance(current_bbox, dict) else None
+    return {"status": "partial", "iterations": iterations, "final_cx": final_cx}
+
+
+@mcp_vision_v3.tool()
+async def tbot_vision_search_and_approach_object(
+    object_name: str,
+    target_distance_m: float = _SEARCH_APPROACH_DEFAULT_TARGET_M,
+    timeout_s: float = 30.0,
+    initial_search_max_steps: int = 24,
+    attributes: list[str] | None = None,
+    anchor_object: str | None = None,
+    relation: str | None = None,
+) -> dict[str, Any]:
+    """
+    Locate an object, center it, and move toward it with LiDAR-guarded approach.
+    """
+    object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
+    if not object_name_clean:
+        raise ValueError("object_name must be a non-empty string")
+
+    requested_target = (
+        float(target_distance_m)
+        if isinstance(target_distance_m, (int, float)) and math.isfinite(float(target_distance_m))
+        else _SEARCH_APPROACH_DEFAULT_TARGET_M
+    )
+    target_f = requested_target if requested_target > 0 else _SEARCH_APPROACH_DEFAULT_TARGET_M
+    timeout_f = (
+        float(timeout_s)
+        if isinstance(timeout_s, (int, float)) and math.isfinite(float(timeout_s)) and float(timeout_s) > 0
+        else 30.0
+    )
+
+    phases = {
+        "search_steps": 0,
+        "verification_scans": 0,
+        "reposition_turns": 0,
+        "forward_segments": 0,
+    }
+
+    search = await _vision_search_object(
+        object_name=object_name_clean,
+        min_confidence=0.5,
+        max_steps=initial_search_max_steps,
+        attributes=attributes,
+        anchor_object=anchor_object,
+        relation=relation,
+    )
+    phases["search_steps"] = int(search.get("steps_taken", 0))
+    if not bool(search.get("found", False)):
+        return {
+            "status": "not_found",
+            "object_name": object_name_clean,
+            "requested_target_distance_m": requested_target,
+            "target_distance_m": target_f,
+            "phases": phases,
+        }
+
+    reposition = await _vision_reposition_for_object(
+        object_name=object_name_clean,
+        min_confidence=0.5,
+        max_steps=3,
+        attributes=attributes,
+        anchor_object=anchor_object,
+        relation=relation,
+    )
+    if not bool(reposition.get("found", False)):
+        return {
+            "status": "not_found",
+            "object_name": object_name_clean,
+            "requested_target_distance_m": requested_target,
+            "target_distance_m": target_f,
+            "phases": phases,
+        }
+
+    phases["reposition_turns"] += int(reposition.get("steps_taken", 0))
+    center = await _center_object_in_frame(
+        object_name=object_name_clean,
+        bbox=reposition.get("bbox") if isinstance(reposition.get("bbox"), dict) else search.get("bbox"),
+        max_iterations=2,
+        attributes=attributes,
+        anchor_object=anchor_object,
+        relation=relation,
+    )
+    phases["reposition_turns"] += int(center.get("iterations", 0))
+
+    async with Client(MOTION_MCP_URL_V3) as motion:
+        async with Client(LIDAR_MCP_URL_V3) as lidar:
+            collision_raw = await lidar.call_tool("tbot_lidar_check_collision", {})
+            collision = _extract_tool_result_dict(collision_raw)
+            front = collision.get("min_forward_distance_m")
+            if not isinstance(front, (int, float)):
+                front = (collision.get("distances") or {}).get("front")
+            front_f = float(front) if isinstance(front, (int, float)) and math.isfinite(float(front)) else None
+            phases["verification_scans"] = 1
+
+            if collision.get("risk_level") == "stop" and (front_f is None or front_f > target_f):
+                await motion.call_tool("tbot_motion_stop", {})
+                return {
+                    "status": "collision_blocked",
+                    "object_name": object_name_clean,
+                    "requested_target_distance_m": requested_target,
+                    "target_distance_m": target_f,
+                    "final_front_distance_m": front_f,
+                    "phases": phases,
+                    "collision": collision,
+                }
+
+            if front_f is not None and front_f <= target_f:
+                await motion.call_tool("tbot_motion_stop", {})
+                return {
+                    "status": "reached",
+                    "object_name": object_name_clean,
+                    "requested_target_distance_m": requested_target,
+                    "target_distance_m": target_f,
+                    "final_front_distance_m": front_f,
+                    "phases": phases,
+                }
+
+            phases["forward_segments"] += 1
+            approach_raw = await motion.call_tool(
+                "tbot_motion_approach_until_close",
+                {
+                    "target_distance_m": target_f,
+                    "stop_distance_m": 0.1,
+                    "speed": 0.1,
+                    "timeout_s": timeout_f,
+                },
+            )
+            approach = _extract_tool_result_dict(approach_raw)
+            await motion.call_tool("tbot_motion_stop", {})
+
+    approach_status = approach.get("status")
+    final_front = approach.get("front_distance")
+    if not isinstance(final_front, (int, float)):
+        final_front = front_f
+    final_front_f = float(final_front) if isinstance(final_front, (int, float)) and math.isfinite(float(final_front)) else None
+
+    if approach_status == "collision_risk":
+        status = "collision_blocked"
+    elif approach_status == "timeout":
+        status = "timeout"
+    elif approach_status == "completed":
+        status = "approached"
+    elif approach_status == "reached":
+        status = "reached"
+    else:
+        status = "reached" if final_front_f is not None and final_front_f <= target_f else "approached"
+
+    return {
+        "status": status,
+        "object_name": object_name_clean,
+        "requested_target_distance_m": requested_target,
+        "target_distance_m": target_f,
+        "final_front_distance_m": final_front_f,
+        "phases": phases,
+        "approach": approach,
+    }
+
+
+@mcp_vision_v3.tool()
+async def tbot_vision_inspect_floor(
+    targets: list[str] | None = None,
+    region: str = "lower_half",
+    near_object: str | None = None,
+) -> dict[str, Any]:
+    """
+    Structured floor inspection for hazards and misplaced objects.
+    """
+    requested_targets = targets if isinstance(targets, list) and targets else [
+        "cables",
+        "spill",
+        "feet_legs",
+        "fallen_objects",
+        "power_strip",
+        "floor_tape",
+    ]
+    query = (
+        "Inspect the floor region of the scene and return hazards/objects for: "
+        f"{', '.join(str(t) for t in requested_targets)}. "
+        f"Region focus: {region}. "
+        f"Reference object: {near_object if near_object else 'none'}."
+    )
+    description = await tbot_vision_describe_scene(prompt=query)
+    text = (description.get("description") or "").lower()
+    detected = [t for t in requested_targets if isinstance(t, str) and t.lower().replace("_", " ") in text]
+    return {
+        "status": "ok",
+        "region": region,
+        "near_object": near_object,
+        "targets": requested_targets,
+        "detected": detected,
+        "raw_description": description.get("description"),
+        "model_info": description.get("model_info"),
     }
 
 

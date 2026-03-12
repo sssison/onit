@@ -174,6 +174,17 @@ def _percentiles(values: list[float]) -> dict[str, Optional[float]]:
     return {"p10": _pick(10.0), "p50": _pick(50.0), "p90": _pick(90.0)}
 
 
+def _ensure_non_negative(name: str, value: Any) -> float:
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    if parsed < 0:
+        raise ValueError(f"{name} must be >= 0")
+    return parsed
+
+
 def _compute_sector_stats(scan: dict[str, Any], center_deg: float, half_width_deg: float) -> dict[str, Any]:
     extracted = _sector_valid_ranges(scan, center_deg=center_deg, half_width_deg=half_width_deg)
 
@@ -222,6 +233,91 @@ def _compute_sector_stats(scan: dict[str, Any], center_deg: float, half_width_de
         "p90_m": percentile_values["p90"],
         "closest_angle_deg": valid_angles_deg[min_index],
         "closest_range_m": min_value,
+    }
+
+
+def _collision_from_scan(
+    scan: dict[str, Any],
+    front_threshold_m: float,
+    side_threshold_m: float,
+    back_threshold_m: float,
+    sector_half_width_deg: float,
+    max_scan_age_s: float,
+) -> dict[str, Any]:
+    age_s = scan.get("age_s")
+    frame_id = scan.get("frame_id")
+    topic = scan.get("topic")
+
+    sectors = {
+        "front": (0.0, front_threshold_m),
+        "left": (90.0, side_threshold_m),
+        "right": (-90.0, side_threshold_m),
+        "rear": (180.0, back_threshold_m),
+    }
+
+    directions: dict[str, Any] = {}
+    distances: dict[str, float | None] = {}
+    has_unknown = False
+    has_collision = False
+    has_caution = False
+
+    for name, (center_deg, threshold) in sectors.items():
+        stats = _compute_sector_stats(scan, center_deg=center_deg, half_width_deg=sector_half_width_deg)
+        min_m: float | None = float(stats["min_m"]) if stats["status"] == "ok" and stats["min_m"] is not None else None
+        distances[name] = min_m
+        is_front = name == "front"
+
+        collision_state: bool | str
+        if age_s is None or (max_scan_age_s > 0 and float(age_s) > max_scan_age_s):
+            collision_state = "unknown"
+            if is_front:
+                has_unknown = True
+        elif min_m is None:
+            collision_state = "unknown"
+            if is_front:
+                has_unknown = True
+        elif min_m <= threshold:
+            collision_state = True
+            has_collision = True
+        else:
+            collision_state = False
+            if min_m <= (threshold * 2.0):
+                has_caution = True
+
+        directions[name] = {
+            "min_m": min_m,
+            "threshold_m": threshold,
+            "collision": collision_state,
+            "closest_angle_deg": stats["closest_angle_deg"],
+            "status": stats["status"],
+        }
+
+    # Front distance is mandatory for forward motion safety.
+    if distances.get("front") is None:
+        has_collision = True
+
+    if has_collision:
+        risk_level = "stop"
+        recommended_action = "stop"
+    elif has_unknown:
+        risk_level = "unknown"
+        recommended_action = "recheck"
+    elif has_caution:
+        risk_level = "caution"
+        recommended_action = "slow_down"
+    else:
+        risk_level = "clear"
+        recommended_action = "proceed"
+
+    return {
+        "risk_level": risk_level,
+        "recommended_action": recommended_action,
+        "distances": distances,
+        "directions": directions,
+        "scan_age_s": age_s,
+        "frame_id": frame_id,
+        "topic": topic,
+        "min_forward_distance_m": distances.get("front"),
     }
 
 
@@ -385,7 +481,36 @@ async def _get_next_scan(current_version: int, timeout_s: float = SCAN_TIMEOUT_S
     return await loop.run_in_executor(None, _get_next_scan_sync, current_version, timeout_s)
 
 
+async def _get_one_scan(timeout_s: float = SCAN_TIMEOUT_S) -> dict[str, Any]:
+    """Compatibility helper used by tests and higher-level tools."""
+    return await _get_cached_scan(timeout_s)
+
+
 # --- Tools ---
+
+
+@mcp_lidar_v3.tool()
+async def tbot_lidar_health(timeout_s: float = SCAN_TIMEOUT_S) -> dict[str, Any]:
+    """Check LiDAR availability and report basic scan metadata."""
+    try:
+        scan = await _get_one_scan(timeout_s=timeout_s)
+    except Exception as e:
+        return {
+            "status": "offline",
+            "scan_present": False,
+            "num_points": 0,
+            "topic": LIDAR_TOPIC,
+            "error": str(e),
+        }
+
+    return {
+        "status": "online",
+        "scan_present": True,
+        "num_points": len(scan.get("ranges", [])),
+        "topic": scan.get("topic", LIDAR_TOPIC),
+        "frame_id": scan.get("frame_id"),
+        "scan_age_s": scan.get("age_s"),
+    }
 
 
 @mcp_lidar_v3.tool()
@@ -405,7 +530,7 @@ async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, An
         raise ValueError(f"sector must be one of: front, left, right, rear, all. Got: {sector!r}")
 
     try:
-        scan = await _get_cached_scan()
+        scan = await _get_one_scan()
     except Exception as e:
         return {
             "status": "no_scan",
@@ -443,6 +568,77 @@ async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, An
 
 
 @mcp_lidar_v3.tool()
+async def tbot_lidar_is_path_clear(
+    threshold_m: float = 0.3,
+) -> dict[str, Any]:
+    """Return whether the forward sector has at least threshold_m clearance."""
+    threshold_f = _ensure_non_negative("threshold_m", threshold_m)
+    try:
+        scan = await _get_one_scan()
+    except Exception as e:
+        return {
+            "clear": False,
+            "min_forward_distance": None,
+            "threshold_m": threshold_f,
+            "status": "no_scan",
+            "error": str(e),
+        }
+
+    stats = _compute_sector_stats(scan, center_deg=0.0, half_width_deg=20.0)
+    front_min = float(stats["min_m"]) if stats["status"] == "ok" and stats["min_m"] is not None else None
+    clear = front_min is not None and front_min >= threshold_f
+    return {
+        "clear": clear,
+        "min_forward_distance": front_min,
+        "threshold_m": threshold_f,
+        "status": "ok" if front_min is not None else "no_data",
+    }
+
+
+@mcp_lidar_v3.tool()
+async def tbot_lidar_check_collision(
+    front_threshold_m: float = 0.25,
+    side_threshold_m: float = 0.20,
+    back_threshold_m: float = 0.25,
+    sector_half_width_deg: float = 20.0,
+    max_scan_age_s: float = 0.5,
+) -> dict[str, Any]:
+    """
+    Check directional collision risk for short motion planning.
+    Returns risk_level in: clear|caution|stop|unknown.
+    """
+    front_threshold = _ensure_non_negative("front_threshold_m", front_threshold_m)
+    side_threshold = _ensure_non_negative("side_threshold_m", side_threshold_m)
+    back_threshold = _ensure_non_negative("back_threshold_m", back_threshold_m)
+    sector_half_width = _ensure_non_negative("sector_half_width_deg", sector_half_width_deg)
+    max_scan_age = _ensure_non_negative("max_scan_age_s", max_scan_age_s)
+
+    try:
+        scan = await _get_one_scan()
+    except Exception as e:
+        return {
+            "risk_level": "stop",
+            "recommended_action": "stop",
+            "distances": {"front": None, "left": None, "right": None, "rear": None},
+            "directions": {},
+            "scan_age_s": None,
+            "frame_id": None,
+            "topic": LIDAR_TOPIC,
+            "min_forward_distance_m": None,
+            "error": str(e),
+        }
+
+    return _collision_from_scan(
+        scan=scan,
+        front_threshold_m=front_threshold,
+        side_threshold_m=side_threshold,
+        back_threshold_m=back_threshold,
+        sector_half_width_deg=sector_half_width,
+        max_scan_age_s=max_scan_age,
+    )
+
+
+@mcp_lidar_v3.tool()
 async def tbot_lidar_get_distance_at_angle(
     angle_deg: float,
     half_width_deg: float = 2.0,
@@ -468,7 +664,7 @@ async def tbot_lidar_get_distance_at_angle(
         raise ValueError("statistic must be 'min' or 'mean'")
 
     try:
-        scan = await _get_cached_scan()
+        scan = await _get_one_scan()
     except Exception as e:
         return {
             "status": "no_scan",
@@ -529,7 +725,7 @@ async def tbot_lidar_get_wall_profile(
         raise ValueError("step_deg must be in (0, 180]")
 
     try:
-        scan = await _get_cached_scan()
+        scan = await _get_one_scan()
     except Exception as e:
         return {"status": "no_scan", "error": str(e), "readings": []}
 
@@ -590,7 +786,7 @@ async def tbot_lidar_export_free_space_map(
     scans: list[dict[str, Any]] = []
     errors: list[str] = []
     try:
-        first = await _get_cached_scan()
+        first = await _get_one_scan()
         scans.append(first)
     except Exception as e:
         return {
