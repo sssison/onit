@@ -217,33 +217,10 @@ def test_vision_find_object_scan360_rotates_and_recenters():
     mock_client = MagicMock()
     mock_client.chat = MagicMock(completions=MagicMock(create=mock_create))
     motion_calls: list[tuple[str, dict]] = []
-    lidar_calls: list[tuple[str, dict]] = []
-    nav_calls: list[tuple[str, dict]] = []
 
-    class _FakeClient:
-        def __init__(self, url: str):
-            self._url = url
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def call_tool(self, name: str, payload: dict):
-            if self._url == vision_v3.MOTION_MCP_URL_V3:
-                motion_calls.append((name, payload))
-                return {"status": "ok"}
-            if self._url == vision_v3.LIDAR_MCP_URL_V3:
-                lidar_calls.append((name, payload))
-                return {"status": "ok", "distance_m": 1.2, "valid_count": 4}
-            if self._url == vision_v3.NAV_MCP_URL_V3:
-                nav_calls.append((name, payload))
-                return {"success": True, "objects": [{"label": "chair"}]}
-            raise AssertionError(f"Unexpected MCP URL in test: {self._url}")
-
-    def fake_client(url: str):
-        return _FakeClient(url)
+    def fake_motion_client(url: str):
+        assert url == vision_v3.MOTION_MCP_URL_V3
+        return _FakeMotionClient(motion_calls)
 
     with patch(
         "builtins.open",
@@ -255,7 +232,7 @@ def test_vision_find_object_scan360_rotates_and_recenters():
             )
         ),
     ), patch.object(vision_v3, "AsyncOpenAI", return_value=mock_client), patch.object(
-        vision_v3, "Client", side_effect=fake_client
+        vision_v3, "Client", side_effect=fake_motion_client
     ):
         result = asyncio.run(vision_v3.tbot_vision_find_object("chair"))
 
@@ -263,12 +240,9 @@ def test_vision_find_object_scan360_rotates_and_recenters():
     assert result["visible"] is True
     assert result["scan_steps"] == 1
     assert result["recenter_applied"] is True
-    assert result["spatial_map_updated"] is True
     assert len(motion_calls) == 2
     assert motion_calls[0][0] == "tbot_motion_turn"
     assert motion_calls[1][0] == "tbot_motion_turn"
-    assert any(name == "tbot_lidar_get_distance_at_angle" for name, _ in lidar_calls)
-    assert any(name == "tbot_spatial_map_record_observation" for name, _ in nav_calls)
 
 
 def test_vision_find_object_scan360_fails_when_bbox_unavailable():

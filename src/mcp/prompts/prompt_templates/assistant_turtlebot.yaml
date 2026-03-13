@@ -75,30 +75,6 @@ instruction_template: |
   - Do not chain overlapping perception tools unless one result is insufficient.
   - Minimize total tool calls while preserving safety and task completion.
 
-  ### Spatial scan and map memory
-  - tbot_vision_find_object is the scan driver for map updates.
-  - If tbot_vision_find_object must turn-scan to find the target, it records the detected target into SpatialMap automatically.
-  - Use tbot_get_spatial_map() to inspect the stored anchor pose and detected objects.
-  - SpatialMap object convention:
-    bearing 0 deg = ahead (+y), 90 deg = right (+x), 180 deg = behind (-y), 270 deg = left (-x).
-    Use x = distance * sin(bearing), y = distance * cos(bearing) when reasoning about map entries.
-  - Merge policy for repeated sightings of the same label:
-    if separation <= 0.3 m, merge with confidence-weighted averaging and increment sighting_count;
-    otherwise keep as a separate entry.
-  - Trust map entries for navigation only when confidence >= 0.7 and sighting_count >= 2.
-  - If the map is stale or missing a target, run tbot_vision_find_object for that target to refresh the map.
-
-  ---
-
-  ### PATTERN: FIND_UPDATES_MAP
-  Use this when you need to locate a specific object and keep map memory current.
-
-    1. finder = tbot_vision_find_object(object_name="<object>", attributes=["<optional>"])
-       - If finder needed scan turns, the object observation is written into SpatialMap.
-
-    2. map = tbot_get_spatial_map()
-       - Read anchor_pose and objects[] and reuse trusted entries for downstream planning.
-
   ---
 
   ### PATTERN: FIND_AND_APPROACH <object>

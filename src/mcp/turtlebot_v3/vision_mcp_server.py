@@ -37,8 +37,6 @@ DEFAULT_VISION_API_KEY = os.getenv("TBOT_VISION_API_KEY", "EMPTY")
 VISION_TIMEOUT_S = _env_float("TBOT_VISION_TIMEOUT_S", 60.0)
 VISION_THINKING_ENABLED = os.getenv("TBOT_VISION_THINKING", "false").strip().lower() == "true"
 MOTION_MCP_URL_V3 = os.getenv("TBOT_MOTION_MCP_URL_V3", "http://127.0.0.1:18210/turtlebot-motion-v3")
-LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
-NAV_MCP_URL_V3 = os.getenv("TBOT_NAV_MCP_URL_V3", "http://127.0.0.1:18213/turtlebot-nav-v3")
 TBOT_CAMERA_FOV_DEG = _env_float("TBOT_CAMERA_FOV_DEG", 62.0)
 VISION_SCAN_STEP_DEG = 10.0
 VISION_SCAN_MAX_STEPS = max(1, int(round(360.0 / VISION_SCAN_STEP_DEG)))
@@ -186,46 +184,6 @@ def _normalize_bbox(value: Any) -> dict[str, float] | None:
     return parsed
 
 
-def _extract_tool_result_dict(tool_result: Any) -> dict[str, Any]:
-    if isinstance(tool_result, dict):
-        return tool_result
-    structured = getattr(tool_result, "structured_content", None)
-    if isinstance(structured, dict):
-        return structured
-    structured_camel = getattr(tool_result, "structuredContent", None)
-    if isinstance(structured_camel, dict):
-        return structured_camel
-    content = getattr(tool_result, "content", None)
-    if isinstance(content, list):
-        for part in content:
-            text = getattr(part, "text", None)
-            if isinstance(text, str):
-                try:
-                    parsed = json.loads(text)
-                    if isinstance(parsed, dict):
-                        return parsed
-                except Exception:
-                    pass
-    return {}
-
-
-def _extract_valid_distance(value: Any) -> float | None:
-    if isinstance(value, (int, float)) and math.isfinite(float(value)):
-        return float(value)
-    return None
-
-
-def _heuristic_distance_from_bbox_m(bbox: Any) -> float | None:
-    if not isinstance(bbox, dict):
-        return None
-    h = bbox.get("h")
-    if not isinstance(h, (int, float)) or not math.isfinite(float(h)):
-        return None
-    h_f = max(0.01, min(1.0, float(h)))
-    # Coarse fallback when LiDAR is unavailable: larger bbox height implies a nearer object.
-    return max(0.2, min(3.0, 0.9 / h_f))
-
-
 def _heading_offset_from_bbox_deg(bbox: Any, camera_fov_deg: float = TBOT_CAMERA_FOV_DEG) -> float | None:
     if not isinstance(bbox, dict):
         return None
@@ -234,90 +192,6 @@ def _heading_offset_from_bbox_deg(bbox: Any, camera_fov_deg: float = TBOT_CAMERA
         return None
     cx_f = max(0.0, min(1.0, float(cx)))
     return (cx_f - 0.5) * float(camera_fov_deg)
-
-
-def _heading_offset_from_detection_deg(detection: dict[str, Any]) -> float:
-    heading = _heading_offset_from_bbox_deg(detection.get("bbox"))
-    if heading is not None:
-        return heading
-    position = str(detection.get("position", "")).strip().lower()
-    if position == "left":
-        return -TBOT_CAMERA_FOV_DEG / 4.0
-    if position == "right":
-        return TBOT_CAMERA_FOV_DEG / 4.0
-    return 0.0
-
-
-async def _record_scan_detection_to_spatial_map(
-    label: str,
-    detection: dict[str, Any],
-) -> dict[str, Any]:
-    heading_offset_deg = _heading_offset_from_detection_deg(detection)
-    distance_m = _heuristic_distance_from_bbox_m(detection.get("bbox"))
-    distance_source = "bbox_heuristic"
-
-    lidar_result: dict[str, Any] = {}
-    try:
-        async with Client(LIDAR_MCP_URL_V3) as lidar:
-            lidar_raw = await lidar.call_tool(
-                "tbot_lidar_get_distance_at_angle",
-                {
-                    "angle_deg": heading_offset_deg,
-                    "half_width_deg": 5.0,
-                    "statistic": "min",
-                },
-            )
-            lidar_result = _extract_tool_result_dict(lidar_raw)
-            lidar_distance_m = _extract_valid_distance(lidar_result.get("distance_m"))
-            if lidar_distance_m is not None:
-                distance_m = lidar_distance_m
-                distance_source = "lidar"
-    except Exception as e:
-        lidar_result = {"error": str(e)}
-
-    if distance_m is None:
-        return {
-            "success": False,
-            "error": "distance_unavailable",
-            "label": label,
-            "bearing_deg": heading_offset_deg,
-            "distance_source": distance_source,
-            "lidar": lidar_result,
-        }
-
-    confidence = _normalize_confidence(detection.get("confidence"))
-    try:
-        async with Client(NAV_MCP_URL_V3) as nav:
-            nav_raw = await nav.call_tool(
-                "tbot_spatial_map_record_observation",
-                {
-                    "label": label,
-                    "bearing_deg": heading_offset_deg,
-                    "distance_m": distance_m,
-                    "confidence": confidence if confidence is not None else 1.0,
-                },
-            )
-            nav_result = _extract_tool_result_dict(nav_raw)
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"spatial_map_update_failed: {e}",
-            "label": label,
-            "bearing_deg": heading_offset_deg,
-            "distance_m": distance_m,
-            "distance_source": distance_source,
-            "lidar": lidar_result,
-        }
-
-    return {
-        "success": bool(nav_result.get("success")),
-        "label": label,
-        "bearing_deg": heading_offset_deg,
-        "distance_m": distance_m,
-        "distance_source": distance_source,
-        "lidar": lidar_result,
-        "map_result": nav_result,
-    }
 
 
 async def _turn_by_degrees(motion: Client, turn_deg: float, speed_rps: float = VISION_TURN_SPEED_RPS) -> None:
@@ -506,10 +380,6 @@ async def tbot_vision_find_object(
 
     scan_steps = 0
     recenter_applied = False
-    spatial_map_update: dict[str, Any] = {
-        "success": False,
-        "reason": "scan_not_performed",
-    }
     async with Client(MOTION_MCP_URL_V3) as motion:
         while not bool(result.get("visible")) and scan_steps < VISION_SCAN_MAX_STEPS:
             await _turn_by_degrees(motion, VISION_SCAN_STEP_DEG, VISION_TURN_SPEED_RPS)
@@ -522,11 +392,6 @@ async def tbot_vision_find_object(
             )
 
         if not bool(result.get("visible")):
-            spatial_map_update = {
-                "success": False,
-                "reason": "target_not_found_after_scan",
-                "scan_steps": scan_steps,
-            }
             return {
                 **result,
                 "success": False,
@@ -535,8 +400,6 @@ async def tbot_vision_find_object(
                 "recenter_applied": False,
                 "stopped_reason": "max_retries",
                 "model_info": model_info,
-                "spatial_map_updated": False,
-                "spatial_map_update": spatial_map_update,
             }
 
         bbox_retries = 0
@@ -554,11 +417,6 @@ async def tbot_vision_find_object(
                 bbox = result.get("bbox")
 
         if not isinstance(bbox, dict):
-            spatial_map_update = {
-                "success": False,
-                "reason": "bbox_unavailable",
-                "scan_steps": scan_steps,
-            }
             return {
                 **result,
                 "success": False,
@@ -568,8 +426,6 @@ async def tbot_vision_find_object(
                 "recenter_applied": False,
                 "stopped_reason": "bbox_unavailable",
                 "model_info": model_info,
-                "spatial_map_updated": False,
-                "spatial_map_update": spatial_map_update,
             }
 
         heading_offset = _heading_offset_from_bbox_deg(bbox)
@@ -590,14 +446,6 @@ async def tbot_vision_find_object(
                     result = recentered
                     bbox = result.get("bbox")
 
-    if scan_steps > 0 and bool(result.get("visible")):
-        spatial_map_update = await _record_scan_detection_to_spatial_map(
-            label=object_name_clean,
-            detection=result,
-        )
-
-    spatial_map_updated = bool(spatial_map_update.get("success"))
-
     stopped_reason = "found" if isinstance(result.get("bbox"), dict) else "found_bbox_unavailable"
 
     return {
@@ -609,8 +457,6 @@ async def tbot_vision_find_object(
         "recenter_applied": recenter_applied,
         "stopped_reason": stopped_reason,
         "model_info": model_info,
-        "spatial_map_updated": spatial_map_updated,
-        "spatial_map_update": spatial_map_update,
     }
 
 

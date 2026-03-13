@@ -53,13 +53,6 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "Call tools only when the result changes the next action." in instruction
     assert "Avoid repeated identical calls without movement or state change between calls." in instruction
     assert "Never simulate or guess sensor readings. Always call LiDAR/vision/nav tools for measurements." in instruction
-    assert "PATTERN: FIND_UPDATES_MAP" in instruction
-    assert "tbot_vision_find_object is the scan driver for map updates." in instruction
-    assert "If tbot_vision_find_object must turn-scan to find the target, it records the detected target into SpatialMap automatically." in instruction
-    assert "tbot_get_spatial_map()" in instruction
-    assert "bearing 0 deg = ahead (+y), 90 deg = right (+x), 180 deg = behind (-y), 270 deg = left (-x)." in instruction
-    assert "if separation <= 0.3 m, merge with confidence-weighted averaging and increment sighting_count;" in instruction
-    assert "Trust map entries for navigation only when confidence >= 0.7 and sighting_count >= 2." in instruction
     assert "If the task asks to confirm \"no spills\" on the floor:" in instruction
     assert "Perform a full 360 deg spill sweep before concluding clear." in instruction
     assert "Use fixed 15 deg turn steps for 24 steps total:" in instruction
@@ -72,3 +65,5 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "tbot_lidar_is_path_clear" not in instruction
     assert "tbot_vision_scan_for_object" not in instruction
     assert "tbot_vision_search_and_approach_object" not in instruction
+    assert "tbot_get_spatial_map" not in instruction
+    assert "PATTERN: FIND_UPDATES_MAP" not in instruction
