@@ -38,6 +38,10 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "Move toward the wall until near it" in instruction
     assert "Approach destination while verifying wall proximity with LiDAR" in instruction
     assert "Do not execute forward motion while the target object is not yet confirmed in frame." in instruction
+    assert "If a task includes directional language like \"on the left\" or \"on the right\" for the target:" in instruction
+    assert "First do one in-place turn toward that side (left/right) before any forward motion." in instruction
+    assert "Then run visual QA with tbot_vision_describe_scene to confirm the side context." in instruction
+    assert "Then run FIND_AND_APPROACH for the target (find first, then navigate)." in instruction
     assert "If tbot_vision_find_object reports the target is visible, lock the target." in instruction
     assert "Do not run another search sweep after lock." in instruction
     assert "Rescan ONLY IF the object is not present in frame." in instruction

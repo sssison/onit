@@ -314,6 +314,51 @@ async def tbot_motion_move_forward_distance(
 
 
 @mcp_motion_v3.tool()
+async def tbot_motion_move_forward_continuous(
+    duration_seconds: float,
+    speed: float = 0.1,
+) -> dict[str, Any]:
+    """
+    Move forward continuously for duration_seconds, then stop.
+
+    This tool does not perform LiDAR checks while moving.
+    """
+    duration_f = _validate_finite("duration_seconds", duration_seconds)
+    if duration_f <= 0:
+        raise ValueError("duration_seconds must be > 0")
+
+    speed_f = _validate_finite("speed", speed)
+    clamped_speed = _clamp(abs(speed_f), MAX_LINEAR)
+    if clamped_speed == 0.0:
+        raise ValueError(
+            f"Effective speed is 0 (speed={speed_f!r}, MAX_LINEAR={MAX_LINEAR!r}). "
+            "Pass a non-zero speed within the allowed range."
+        )
+
+    preempted_stream = await _set_continuous_motion(clamped_speed, 0.0)
+    started = time.monotonic()
+    try:
+        await asyncio.sleep(duration_f)
+    finally:
+        had_stream_on_stop = await _set_continuous_motion(None)
+        stop_result = await _post_json(STOP_PATH)
+    executed_duration = time.monotonic() - started
+
+    return {
+        **stop_result,
+        "status": "completed",
+        "duration_seconds": duration_f,
+        "executed_duration_seconds": executed_duration,
+        "speed": clamped_speed,
+        "requested_speed": speed_f,
+        "was_clamped": abs(speed_f) != clamped_speed,
+        "preempted_continuous_stream": preempted_stream,
+        "had_continuous_stream_on_stop": had_stream_on_stop,
+        "command_refresh_s": MOTION_COMMAND_REFRESH_S,
+    }
+
+
+@mcp_motion_v3.tool()
 async def tbot_motion_turn(
     direction: str,
     speed: float,
