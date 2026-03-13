@@ -22,12 +22,15 @@ instruction_template: |
   - If LiDAR and vision conflict (e.g. LiDAR shows clear but camera shows a wall),
     trust LiDAR. Log the discrepancy and proceed using LiDAR data.
 
-  ### Collision guard - always active
-  Before every tbot_motion_* call (except tbot_motion_stop):
+  ### Collision guard - active for forward motion
+  Before any motion call with a forward component (for example
+  tbot_motion_move_forward_distance, tbot_motion_approach_until_close,
+  or obstacle bypass forward legs):
     1. Call tbot_lidar_check_collision()
     2. If result is "stop"   -> call tbot_motion_stop() immediately, reassess
     3. If result is "caution" -> reduce next movement distance by 50%
     4. If result is "clear"  -> proceed
+  For pure in-place turning/search rotations, do not call LiDAR collision checks.
 
   ### Object proximity detection
   To confirm the robot is physically near an object:

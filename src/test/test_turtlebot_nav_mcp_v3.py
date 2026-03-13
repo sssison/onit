@@ -26,6 +26,7 @@ class _FakeNavClient:
         return False
 
     async def call_tool(self, name: str, payload: dict[str, Any]):
+        self._state["call_order"].append((self._url, name))
         if self._url == nav_v3.MOTION_MCP_URL_V3:
             self._state["motion_calls"].append((name, payload))
             if name == "tbot_motion_bypass_obstacle":
@@ -72,6 +73,7 @@ class _FakeNavClient:
 
 def _make_state() -> dict[str, Any]:
     return {
+        "call_order": [],
         "motion_calls": [],
         "lidar_calls": [],
         "vision_calls": [],
@@ -147,6 +149,39 @@ def test_nav_go_to_pose_reaches_target_without_timed_motion():
     assert result["distance_remaining_m"] <= 0.1
     assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
     assert all(name != "tbot_motion_move_timed" for name, _ in state["motion_calls"])
+
+
+def test_nav_go_to_pose_turn_phase_does_not_query_lidar_until_forward_motion():
+    state = _make_state()
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    odom_sequence = [
+        _odom(0.0, 0.0, 0.0),
+        _odom(0.0, 0.0, math.pi / 2.0),
+        _odom(0.0, 0.95, math.pi / 2.0),
+        _odom(0.0, 1.0, math.pi / 2.0),
+    ]
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "_get_one_odom",
+        new=AsyncMock(side_effect=odom_sequence),
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_pose(
+                target_x_m=0.0,
+                target_y_m=1.0,
+                pos_tolerance_m=0.1,
+                timeout_s=5.0,
+            )
+        )
+
+    assert result["status"] == "reached"
+    first_turn_idx = next(i for i, (_, name) in enumerate(state["call_order"]) if name == "tbot_motion_turn")
+    first_lidar_idx = next(i for i, (_, name) in enumerate(state["call_order"]) if name == "tbot_lidar_check_collision")
+    assert first_turn_idx < first_lidar_idx
 
 
 def test_nav_go_to_pose_collision_blocked():
@@ -316,6 +351,9 @@ def test_navigate_to_object_search_uses_fixed_15_degree_turn_steps():
     assert len(turn_calls) >= 1
     expected_duration = math.radians(15.0) / nav_v3.NAV_OBJECT_TURN_SPEED_RPS
     assert turn_calls[0]["duration_seconds"] == pytest.approx(expected_duration)
+    first_turn_idx = next(i for i, (_, name) in enumerate(state["call_order"]) if name == "tbot_motion_turn")
+    first_lidar_idx = next(i for i, (_, name) in enumerate(state["call_order"]) if name == "tbot_lidar_check_collision")
+    assert first_turn_idx < first_lidar_idx
 
 
 def test_navigate_to_object_reacquire_failures_return_max_retries():

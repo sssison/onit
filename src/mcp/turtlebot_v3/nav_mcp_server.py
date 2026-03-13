@@ -325,13 +325,9 @@ async def _vision_find_target(
 async def _attempt_reacquire_target(
     vision: Client,
     motion: Client,
-    lidar: Client,
     target: str,
     qualifier: str | None,
 ) -> dict[str, Any] | None:
-    risk_level, _, _ = await _guard_motion_and_get_scale(lidar, motion)
-    if risk_level == "stop":
-        return None
     step_deg = NAV_OBJECT_SWEEP_STEP_DEG
 
     # Scan left (+step), then right (-2*step), then return to center (+step) if still not found.
@@ -500,34 +496,6 @@ async def tbot_nav_go_to_pose(
                     }
 
                 try:
-                    collision_raw = await lidar.call_tool(
-                        "tbot_lidar_check_collision",
-                        {"front_threshold_m": NAV_FRONT_THRESHOLD_M},
-                    )
-                    collision = _extract_tool_result_dict(collision_raw)
-                    risk_level = collision.get("risk_level", "unknown")
-                    front_distance = _extract_front_distance(collision)
-                except Exception as e:
-                    risk_level = "stop"
-                    front_distance = None
-                    collision = {"error": str(e)}
-
-                if risk_level in ("stop", "unknown") and not reached_pos:
-                    await _safe_motion_stop(motion)
-                    return {
-                        "status": "collision_blocked",
-                        "target": {"x_m": x_target, "y_m": y_target, "yaw_rad": yaw_target},
-                        "distance_remaining_m": distance,
-                        "yaw_error_rad": yaw_error,
-                        "elapsed_s": time.monotonic() - started,
-                        "steps": steps,
-                        "last_pose": last_pose,
-                        "front_distance_m": front_distance,
-                        "collision": collision,
-                    }
-
-                caution_scale = 0.5 if risk_level == "caution" else 1.0
-                try:
                     if reached_pos and yaw_target is not None:
                         turn_error = yaw_error
                     else:
@@ -538,7 +506,7 @@ async def tbot_nav_go_to_pose(
                             NAV_TURN_STEP_DEG,
                             math.degrees(abs(turn_error)),
                         )
-                        turn_step_deg = max(1.0, base_turn_step_deg * caution_scale)
+                        turn_step_deg = max(1.0, base_turn_step_deg)
                         if reached_pos and yaw_target is not None:
                             turn_speed = abs(_clamp(NAV_FINAL_YAW_KP * turn_error, max_angular))
                         else:
@@ -549,6 +517,34 @@ async def tbot_nav_go_to_pose(
                             speed_rps=max(0.2, turn_speed),
                         )
                     else:
+                        try:
+                            collision_raw = await lidar.call_tool(
+                                "tbot_lidar_check_collision",
+                                {"front_threshold_m": NAV_FRONT_THRESHOLD_M},
+                            )
+                            collision = _extract_tool_result_dict(collision_raw)
+                            risk_level = collision.get("risk_level", "unknown")
+                            front_distance = _extract_front_distance(collision)
+                        except Exception as e:
+                            risk_level = "stop"
+                            front_distance = None
+                            collision = {"error": str(e)}
+
+                        if risk_level in ("stop", "unknown") and not reached_pos:
+                            await _safe_motion_stop(motion)
+                            return {
+                                "status": "collision_blocked",
+                                "target": {"x_m": x_target, "y_m": y_target, "yaw_rad": yaw_target},
+                                "distance_remaining_m": distance,
+                                "yaw_error_rad": yaw_error,
+                                "elapsed_s": time.monotonic() - started,
+                                "steps": steps,
+                                "last_pose": last_pose,
+                                "front_distance_m": front_distance,
+                                "collision": collision,
+                            }
+
+                        caution_scale = 0.5 if risk_level == "caution" else 1.0
                         step_distance = min(distance, NAV_FORWARD_STEP_M, max_linear)
                         step_distance = max(0.0, step_distance * caution_scale)
                         if step_distance <= 0.0:
@@ -721,42 +717,14 @@ async def tbot_navigate_to_object(
                             "stopped_reason": "max_retries",
                         }
 
-                    risk_level, _, _ = await _guard_motion_and_get_scale(lidar, motion)
-                    if risk_level == "stop":
-                        bypass_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
-                        bypass = _extract_tool_result_dict(bypass_raw)
-                        if bypass.get("status") != "completed":
-                            final_pose = await tbot_nav_get_pose()
-                            return {
-                                "success": False,
-                                "final_pose": final_pose,
-                                "object_in_frame": False,
-                                "scene_description": "",
-                                "stopped_reason": "collision_stop",
-                                "bypass": bypass,
-                            }
                     sweep_turn_deg = NAV_OBJECT_SWEEP_STEP_DEG
                     await _turn_by_degrees(motion, sweep_turn_deg, NAV_OBJECT_TURN_SPEED_RPS)
 
                 heading_offset_deg = _heading_offset_from_bbox_deg(found.get("bbox"), TBOT_CAMERA_FOV_DEG) if found else None
                 if heading_offset_deg is not None and abs(heading_offset_deg) >= 2.0:
-                    risk_level, scale, _ = await _guard_motion_and_get_scale(lidar, motion)
-                    if risk_level == "stop":
-                        bypass_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
-                        bypass = _extract_tool_result_dict(bypass_raw)
-                        if bypass.get("status") != "completed":
-                            final_pose = await tbot_nav_get_pose()
-                            return {
-                                "success": False,
-                                "final_pose": final_pose,
-                                "object_in_frame": False,
-                                "scene_description": "",
-                                "stopped_reason": "collision_stop",
-                                "bypass": bypass,
-                            }
                     await _turn_by_degrees(
                         motion,
-                        heading_offset_deg * (0.5 if risk_level == "caution" else 1.0),
+                        heading_offset_deg,
                         NAV_OBJECT_TURN_SPEED_RPS,
                     )
 
@@ -770,7 +738,6 @@ async def tbot_navigate_to_object(
                             candidate = await _attempt_reacquire_target(
                                 vision=vision,
                                 motion=motion,
-                                lidar=lidar,
                                 target=target_clean,
                                 qualifier=qualifier,
                             )

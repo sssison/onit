@@ -16,8 +16,9 @@ def test_turtlebot_prompt_includes_sensor_priority_and_collision_guard():
 
     assert "## Sensor priority rules" in instruction
     assert "Wall navigation - LiDAR is primary, vision is secondary" in instruction
-    assert "### Collision guard - always active" in instruction
-    assert "Before every tbot_motion_* call" in instruction
+    assert "### Collision guard - active for forward motion" in instruction
+    assert "Before any motion call with a forward component" in instruction
+    assert "For pure in-place turning/search rotations, do not call LiDAR collision checks." in instruction
 
 
 def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools():
