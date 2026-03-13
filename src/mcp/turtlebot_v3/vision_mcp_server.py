@@ -43,6 +43,14 @@ def _vision_extra_body() -> dict:
         return {}
     return {"chat_template_kwargs": {"enable_thinking": False}}
 
+
+def _with_no_think(text: str) -> str:
+    stripped = text.lstrip()
+    if stripped.startswith("/no_think"):
+        return text
+    return f"/no_think\n{text}"
+
+
 def _resolve_api_key(host: str) -> str:
     explicit_key = os.getenv("TBOT_VISION_API_KEY", DEFAULT_VISION_API_KEY)
     if "openrouter.ai" in host:
@@ -205,7 +213,7 @@ async def tbot_vision_describe_scene(
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": prompt},
+                {"type": "text", "text": _with_no_think(prompt)},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
             ],
         },
@@ -258,7 +266,7 @@ async def _find_object_in_frame(
         anchor_object=anchor_object,
         relation=relation,
     )
-    user_prompt = f"Is the target object visible in this image? Target description: {query}"
+    user_prompt = _with_no_think(f"Is the target object visible in this image? Target description: {query}")
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [

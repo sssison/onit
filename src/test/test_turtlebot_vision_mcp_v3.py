@@ -73,6 +73,10 @@ def test_vision_describe_scene_returns_description():
 
     assert result["description"] == description_text
     assert "model_info" in result
+    create_kwargs = mock_client.chat.completions.create.await_args.kwargs
+    assert create_kwargs["extra_body"] == vision_v3._vision_extra_body()
+    user_text = create_kwargs["messages"][1]["content"][0]["text"]
+    assert user_text.startswith("/no_think\n")
 
 
 def test_vision_describe_scene_propagates_frame_error():
@@ -107,6 +111,10 @@ def test_vision_find_object_visible_with_position():
     assert result["visible"] is True
     assert result["position"] == "right"
     assert result["confidence"] == pytest.approx(0.85)
+    create_kwargs = mock_client.chat.completions.create.await_args.kwargs
+    assert create_kwargs["extra_body"] == vision_v3._vision_extra_body()
+    user_text = create_kwargs["messages"][1]["content"][0]["text"]
+    assert user_text.startswith("/no_think\n")
 
 
 def test_vision_find_object_not_visible():

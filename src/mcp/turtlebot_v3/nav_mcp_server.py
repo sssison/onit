@@ -67,6 +67,9 @@ TBOT_CAMERA_FOV_DEG = _env_float("TBOT_CAMERA_FOV_DEG", 62.0)
 NAV_OBJECT_SWEEP_STEP_DEG = 15.0
 NAV_OBJECT_SWEEP_MAX_STEPS = max(1, int(_env_float("NAV_OBJECT_SWEEP_MAX_STEPS", 24.0)))
 NAV_OBJECT_REACQUIRE_ATTEMPTS = max(1, int(_env_float("NAV_OBJECT_REACQUIRE_ATTEMPTS", 3.0)))
+NAV_OBJECT_REACQUIRE_ARC_DEG = max(NAV_OBJECT_SWEEP_STEP_DEG, _env_float("NAV_OBJECT_REACQUIRE_ARC_DEG", 90.0))
+NAV_OBJECT_REACQUIRE_STEPS = max(1, int(round(NAV_OBJECT_REACQUIRE_ARC_DEG / NAV_OBJECT_SWEEP_STEP_DEG)))
+NAV_OBJECT_CENTER_EPS_DEG = max(0.1, _env_float("NAV_OBJECT_CENTER_EPS_DEG", 1.0))
 NAV_OBJECT_APPROACH_STEP_M = max(0.05, _env_float("NAV_OBJECT_APPROACH_STEP_M", 0.25))
 NAV_OBJECT_MOVE_SPEED_MPS = max(0.03, _env_float("NAV_OBJECT_MOVE_SPEED_MPS", 0.10))
 NAV_OBJECT_TURN_SPEED_RPS = max(0.05, _env_float("NAV_OBJECT_TURN_SPEED_RPS", 0.30))
@@ -327,21 +330,28 @@ async def _attempt_reacquire_target(
     motion: Client,
     target: str,
     qualifier: str | None,
+    preferred_side: str = "right",
 ) -> dict[str, Any] | None:
     step_deg = NAV_OBJECT_SWEEP_STEP_DEG
+    arc_deg = NAV_OBJECT_REACQUIRE_STEPS * step_deg
+    first_sign = 1.0 if str(preferred_side).lower() == "left" else -1.0
+    second_sign = -first_sign
 
-    # Scan left (+step), then right (-2*step), then return to center (+step) if still not found.
-    await _turn_by_degrees(motion, step_deg, NAV_OBJECT_TURN_SPEED_RPS)
-    left_view = await _vision_find_target(vision, target, qualifier)
-    if bool(left_view.get("visible")):
-        return left_view
+    for _ in range(NAV_OBJECT_REACQUIRE_STEPS):
+        await _turn_by_degrees(motion, first_sign * step_deg, NAV_OBJECT_TURN_SPEED_RPS)
+        view = await _vision_find_target(vision, target, qualifier)
+        if bool(view.get("visible")):
+            return view
 
-    await _turn_by_degrees(motion, -(2.0 * step_deg), NAV_OBJECT_TURN_SPEED_RPS)
-    right_view = await _vision_find_target(vision, target, qualifier)
-    if bool(right_view.get("visible")):
-        return right_view
+    await _turn_by_degrees(motion, -(first_sign * arc_deg), NAV_OBJECT_TURN_SPEED_RPS)
 
-    await _turn_by_degrees(motion, step_deg, NAV_OBJECT_TURN_SPEED_RPS)
+    for _ in range(NAV_OBJECT_REACQUIRE_STEPS):
+        await _turn_by_degrees(motion, second_sign * step_deg, NAV_OBJECT_TURN_SPEED_RPS)
+        view = await _vision_find_target(vision, target, qualifier)
+        if bool(view.get("visible")):
+            return view
+
+    await _turn_by_degrees(motion, -(second_sign * arc_deg), NAV_OBJECT_TURN_SPEED_RPS)
     return None
 
 
@@ -701,11 +711,20 @@ async def tbot_navigate_to_object(
             async with Client(LIDAR_MCP_URL_V3) as lidar:
                 found: dict[str, Any] | None = None
                 object_locked = False
+                last_heading_offset_deg: float | None = None
+                last_drift_sign = 0
                 for sweep_attempt in range(NAV_OBJECT_SWEEP_MAX_STEPS + 1):
                     candidate = await _vision_find_target(vision, target_clean, qualifier)
                     if bool(candidate.get("visible")):
                         found = candidate
                         object_locked = True
+                        candidate_offset = _heading_offset_from_bbox_deg(candidate.get("bbox"), TBOT_CAMERA_FOV_DEG)
+                        if candidate_offset is not None:
+                            last_heading_offset_deg = candidate_offset
+                            if candidate_offset < -NAV_OBJECT_CENTER_EPS_DEG:
+                                last_drift_sign = -1
+                            elif candidate_offset > NAV_OBJECT_CENTER_EPS_DEG:
+                                last_drift_sign = 1
                         break
 
                     if sweep_attempt >= NAV_OBJECT_SWEEP_MAX_STEPS:
@@ -742,6 +761,14 @@ async def tbot_navigate_to_object(
                     )
                     post_center = await _vision_find_target(vision, target_clean, qualifier)
                     object_locked = bool(post_center.get("visible"))
+                    if object_locked:
+                        post_center_offset = _heading_offset_from_bbox_deg(post_center.get("bbox"), TBOT_CAMERA_FOV_DEG)
+                        if post_center_offset is not None:
+                            last_heading_offset_deg = post_center_offset
+                            if post_center_offset < -NAV_OBJECT_CENTER_EPS_DEG:
+                                last_drift_sign = -1
+                            elif post_center_offset > NAV_OBJECT_CENTER_EPS_DEG:
+                                last_drift_sign = 1
 
                 approach_steps = 0
                 while approach_steps < NAV_OBJECT_MAX_APPROACH_STEPS:
@@ -758,7 +785,24 @@ async def tbot_navigate_to_object(
 
                     current_view = await _vision_find_target(vision, target_clean, qualifier)
                     object_locked = bool(current_view.get("visible"))
+                    if object_locked:
+                        current_offset = _heading_offset_from_bbox_deg(current_view.get("bbox"), TBOT_CAMERA_FOV_DEG)
+                        if current_offset is not None:
+                            last_heading_offset_deg = current_offset
+                            if current_offset < -NAV_OBJECT_CENTER_EPS_DEG:
+                                last_drift_sign = -1
+                            elif current_offset > NAV_OBJECT_CENTER_EPS_DEG:
+                                last_drift_sign = 1
                     if not object_locked:
+                        if last_heading_offset_deg is not None:
+                            if last_heading_offset_deg < -NAV_OBJECT_CENTER_EPS_DEG:
+                                preferred_side = "left"
+                            elif last_heading_offset_deg > NAV_OBJECT_CENTER_EPS_DEG:
+                                preferred_side = "right"
+                            else:
+                                preferred_side = "left" if last_drift_sign < 0 else "right"
+                        else:
+                            preferred_side = "left" if last_drift_sign < 0 else "right"
                         reacquired: dict[str, Any] | None = None
                         for _ in range(NAV_OBJECT_REACQUIRE_ATTEMPTS):
                             candidate = await _attempt_reacquire_target(
@@ -766,10 +810,18 @@ async def tbot_navigate_to_object(
                                 motion=motion,
                                 target=target_clean,
                                 qualifier=qualifier,
+                                preferred_side=preferred_side,
                             )
                             if candidate and bool(candidate.get("visible")):
                                 reacquired = candidate
                                 object_locked = True
+                                candidate_offset = _heading_offset_from_bbox_deg(candidate.get("bbox"), TBOT_CAMERA_FOV_DEG)
+                                if candidate_offset is not None:
+                                    last_heading_offset_deg = candidate_offset
+                                    if candidate_offset < -NAV_OBJECT_CENTER_EPS_DEG:
+                                        last_drift_sign = -1
+                                    elif candidate_offset > NAV_OBJECT_CENTER_EPS_DEG:
+                                        last_drift_sign = 1
                                 break
                         if reacquired is None:
                             await _safe_motion_stop(motion)

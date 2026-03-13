@@ -406,6 +406,69 @@ def test_navigate_to_object_reacquire_failures_return_max_retries():
     assert result["stopped_reason"] == "max_retries"
 
 
+def test_attempt_reacquire_target_scans_preferred_90_then_opposite_90():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": False, "confidence": 0.1, "bbox": None} for _ in range(nav_v3.NAV_OBJECT_REACQUIRE_STEPS)
+    ] + [
+        {"visible": True, "confidence": 0.8, "bbox": {"cx": 0.7, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    vision = _FakeNavClient(nav_v3.VISION_MCP_URL_V3, state)
+    motion = _FakeNavClient(nav_v3.MOTION_MCP_URL_V3, state)
+
+    result = asyncio.run(
+        nav_v3._attempt_reacquire_target(
+            vision=vision,
+            motion=motion,
+            target="cabinet",
+            qualifier=None,
+            preferred_side="left",
+        )
+    )
+
+    assert result is not None
+    turn_calls = [payload for name, payload in state["motion_calls"] if name == "tbot_motion_turn"]
+    assert len(turn_calls) == nav_v3.NAV_OBJECT_REACQUIRE_STEPS + 2
+    for payload in turn_calls[: nav_v3.NAV_OBJECT_REACQUIRE_STEPS]:
+        assert payload["direction"] == "left"
+        assert payload["duration_seconds"] == pytest.approx(math.radians(15.0) / nav_v3.NAV_OBJECT_TURN_SPEED_RPS)
+    assert turn_calls[nav_v3.NAV_OBJECT_REACQUIRE_STEPS]["direction"] == "right"
+    assert turn_calls[nav_v3.NAV_OBJECT_REACQUIRE_STEPS]["duration_seconds"] == pytest.approx(
+        math.radians(90.0) / nav_v3.NAV_OBJECT_TURN_SPEED_RPS
+    )
+    assert turn_calls[-1]["direction"] == "right"
+    assert turn_calls[-1]["duration_seconds"] == pytest.approx(math.radians(15.0) / nav_v3.NAV_OBJECT_TURN_SPEED_RPS)
+    assert len(state["lidar_calls"]) == 0
+
+
+def test_navigate_to_object_reacquire_prefers_last_seen_side():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.2, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.2, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": False, "confidence": 0.1, "bbox": None},
+    ]
+    helper_mock = AsyncMock(return_value=None)
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "_attempt_reacquire_target",
+        new=helper_mock,
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_navigate_to_object(target="stool", stop_distance=0.6))
+
+    assert result["success"] is False
+    assert helper_mock.await_count >= 1
+    assert helper_mock.await_args_list[0].kwargs["preferred_side"] == "left"
+
+
 def test_navigate_to_object_collision_stop_when_bypass_fails():
     state = _make_state()
     state["vision_find_results"] = [
