@@ -30,8 +30,11 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "tbot_estimate_object_pose(" in instruction
     assert "Find the destination landmark first" in instruction
     assert "fixed 15 deg steps" in instruction
+    assert "Repeat up to 24 steps (full 360 deg sweep)" in instruction
+    assert "If still not found after full sweep: stop and abort (no forward motion)" in instruction
     assert "Move toward the wall until near it" in instruction
     assert "Approach destination while verifying wall proximity with LiDAR" in instruction
+    assert "Do not execute forward motion while the target object is not yet confirmed in frame." in instruction
 
     assert "tbot_vision_health" not in instruction
     assert "tbot_lidar_health" not in instruction

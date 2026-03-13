@@ -65,7 +65,7 @@ NAV_TURN_STEP_DEG = max(1.0, _env_float("NAV_TURN_STEP_DEG", 12.0))
 NAV_HEADING_ALIGN_DEG = max(5.0, _env_float("NAV_HEADING_ALIGN_DEG", 15.0))
 TBOT_CAMERA_FOV_DEG = _env_float("TBOT_CAMERA_FOV_DEG", 62.0)
 NAV_OBJECT_SWEEP_STEP_DEG = 15.0
-NAV_OBJECT_SWEEP_MAX_STEPS = max(1, int(_env_float("NAV_OBJECT_SWEEP_MAX_STEPS", 8.0)))
+NAV_OBJECT_SWEEP_MAX_STEPS = max(1, int(_env_float("NAV_OBJECT_SWEEP_MAX_STEPS", 24.0)))
 NAV_OBJECT_REACQUIRE_ATTEMPTS = max(1, int(_env_float("NAV_OBJECT_REACQUIRE_ATTEMPTS", 3.0)))
 NAV_OBJECT_APPROACH_STEP_M = max(0.05, _env_float("NAV_OBJECT_APPROACH_STEP_M", 0.25))
 NAV_OBJECT_MOVE_SPEED_MPS = max(0.03, _env_float("NAV_OBJECT_MOVE_SPEED_MPS", 0.10))
@@ -700,10 +700,12 @@ async def tbot_navigate_to_object(
         async with Client(MOTION_MCP_URL_V3) as motion:
             async with Client(LIDAR_MCP_URL_V3) as lidar:
                 found: dict[str, Any] | None = None
+                object_locked = False
                 for sweep_attempt in range(NAV_OBJECT_SWEEP_MAX_STEPS + 1):
                     candidate = await _vision_find_target(vision, target_clean, qualifier)
                     if bool(candidate.get("visible")):
                         found = candidate
+                        object_locked = True
                         break
 
                     if sweep_attempt >= NAV_OBJECT_SWEEP_MAX_STEPS:
@@ -720,6 +722,17 @@ async def tbot_navigate_to_object(
                     sweep_turn_deg = NAV_OBJECT_SWEEP_STEP_DEG
                     await _turn_by_degrees(motion, sweep_turn_deg, NAV_OBJECT_TURN_SPEED_RPS)
 
+                if not object_locked or found is None:
+                    await _safe_motion_stop(motion)
+                    final_pose = await tbot_nav_get_pose()
+                    return {
+                        "success": False,
+                        "final_pose": final_pose,
+                        "object_in_frame": False,
+                        "scene_description": "",
+                        "stopped_reason": "max_retries",
+                    }
+
                 heading_offset_deg = _heading_offset_from_bbox_deg(found.get("bbox"), TBOT_CAMERA_FOV_DEG) if found else None
                 if heading_offset_deg is not None and abs(heading_offset_deg) >= 2.0:
                     await _turn_by_degrees(
@@ -727,12 +740,25 @@ async def tbot_navigate_to_object(
                         heading_offset_deg,
                         NAV_OBJECT_TURN_SPEED_RPS,
                     )
+                    post_center = await _vision_find_target(vision, target_clean, qualifier)
+                    object_locked = bool(post_center.get("visible"))
 
-                reacquire_failures = 0
                 approach_steps = 0
                 while approach_steps < NAV_OBJECT_MAX_APPROACH_STEPS:
+                    if not object_locked:
+                        await _safe_motion_stop(motion)
+                        final_pose = await tbot_nav_get_pose()
+                        return {
+                            "success": False,
+                            "final_pose": final_pose,
+                            "object_in_frame": False,
+                            "scene_description": "",
+                            "stopped_reason": "max_retries",
+                        }
+
                     current_view = await _vision_find_target(vision, target_clean, qualifier)
-                    if not bool(current_view.get("visible")):
+                    object_locked = bool(current_view.get("visible"))
+                    if not object_locked:
                         reacquired: dict[str, Any] | None = None
                         for _ in range(NAV_OBJECT_REACQUIRE_ATTEMPTS):
                             candidate = await _attempt_reacquire_target(
@@ -743,9 +769,8 @@ async def tbot_navigate_to_object(
                             )
                             if candidate and bool(candidate.get("visible")):
                                 reacquired = candidate
-                                reacquire_failures = 0
+                                object_locked = True
                                 break
-                            reacquire_failures += 1
                         if reacquired is None:
                             await _safe_motion_stop(motion)
                             final_pose = await tbot_nav_get_pose()
@@ -760,6 +785,17 @@ async def tbot_navigate_to_object(
 
                     risk_level, scale, collision = await _guard_motion_and_get_scale(lidar, motion)
                     if risk_level == "stop":
+                        if not object_locked:
+                            await _safe_motion_stop(motion)
+                            final_pose = await tbot_nav_get_pose()
+                            return {
+                                "success": False,
+                                "final_pose": final_pose,
+                                "object_in_frame": False,
+                                "scene_description": "",
+                                "stopped_reason": "max_retries",
+                                "collision": collision,
+                            }
                         bypass_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
                         bypass = _extract_tool_result_dict(bypass_raw)
                         if bypass.get("status") != "completed":

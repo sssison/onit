@@ -45,12 +45,15 @@ instruction_template: |
   from scratch - use the composite tools or call the primitive tools in the
   exact order described.
   When a pattern requires turn-based object searching, use 15 deg step turns only.
+  Do not execute forward motion while the target object is not yet confirmed in frame.
 
   ---
 
   ### PATTERN: FIND_AND_APPROACH <object>
   Use tbot_navigate_to_object. This is the preferred pattern for any task
   that says "find X", "go to X", "stop in front of X", "position near X".
+  This pattern performs a full 360 deg search using 15 deg steps and checks
+  object visibility at every step before any forward movement.
 
     tbot_navigate_to_object(
         target="<object>",
@@ -111,6 +114,7 @@ instruction_template: |
           - tbot_motion_turn(...15 deg...)
           - tbot_vision_find_object(object_name="<destination>")
           - Repeat up to 24 steps (full 360 deg sweep)
+       c. If still not found after full sweep: stop and abort (no forward motion)
 
     2. Find and confirm wall geometry with LiDAR
        a. tbot_lidar_get_wall_profile()
@@ -124,6 +128,7 @@ instruction_template: |
     4. Reorient to destination landmark again
        a. tbot_vision_find_object(object_name="<destination>")
        b. If not found, repeat fixed 15 deg turn-search steps until found
+       c. If still not found after full sweep: stop and abort (no forward motion)
 
     5. Approach destination while verifying wall proximity with LiDAR
        Loop:
@@ -132,6 +137,7 @@ instruction_template: |
           -> If distance deviates > 0.08 m from initial_wall_distance:
              micro-correct with tbot_motion_turn(+/-3 deg)
        c. tbot_vision_find_object(object_name="<destination>")
+          -> If destination is not visible, return to Step 4 search loop (no forward motion)
        d. tbot_motion_move_forward_distance(0.2)
        e. Continue until near destination
 
