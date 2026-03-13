@@ -64,6 +64,9 @@ NAV_FORWARD_STEP_M = max(0.03, _env_float("NAV_FORWARD_STEP_M", 0.12))
 NAV_TURN_STEP_DEG = max(1.0, _env_float("NAV_TURN_STEP_DEG", 12.0))
 NAV_HEADING_ALIGN_DEG = max(5.0, _env_float("NAV_HEADING_ALIGN_DEG", 15.0))
 TBOT_CAMERA_FOV_DEG = _env_float("TBOT_CAMERA_FOV_DEG", 62.0)
+NAV_SCAN_STEP_DEG = 10.0
+NAV_SCAN_MAX_STEPS = max(1, int(round(360.0 / NAV_SCAN_STEP_DEG)))
+NAV_SCAN_RECENTER_THRESHOLD_DEG = max(0.1, _env_float("NAV_SCAN_RECENTER_THRESHOLD_DEG", 2.0))
 NAV_OBJECT_SWEEP_STEP_DEG = 15.0
 NAV_OBJECT_SWEEP_MAX_STEPS = max(1, int(_env_float("NAV_OBJECT_SWEEP_MAX_STEPS", 24.0)))
 NAV_OBJECT_REACQUIRE_ATTEMPTS = max(1, int(_env_float("NAV_OBJECT_REACQUIRE_ATTEMPTS", 3.0)))
@@ -325,6 +328,78 @@ async def _vision_find_target(
     return _extract_tool_result_dict(raw)
 
 
+async def _scan_for_object_360(
+    vision: Client,
+    motion: Client,
+    target: str,
+    qualifier: str | None,
+) -> dict[str, Any]:
+    turn_steps = 0
+    candidate = await _vision_find_target(vision, target, qualifier)
+
+    if not bool(candidate.get("visible")):
+        for _ in range(NAV_SCAN_MAX_STEPS):
+            await _turn_by_degrees(motion, NAV_SCAN_STEP_DEG, NAV_OBJECT_TURN_SPEED_RPS)
+            turn_steps += 1
+            candidate = await _vision_find_target(vision, target, qualifier)
+            if bool(candidate.get("visible")):
+                break
+
+    if not bool(candidate.get("visible")):
+        return {
+            "success": False,
+            "visible": False,
+            "confidence": float(candidate.get("confidence", 0.0) or 0.0),
+            "bbox": None,
+            "position": None,
+            "heading_offset_deg": None,
+            "recenter_applied": False,
+            "turn_steps": turn_steps,
+            "degrees_swept": turn_steps * NAV_SCAN_STEP_DEG,
+            "stopped_reason": "max_retries",
+        }
+
+    recenter_applied = False
+    heading_offset_deg = _heading_offset_from_bbox_deg(candidate.get("bbox"), TBOT_CAMERA_FOV_DEG)
+    if heading_offset_deg is not None and abs(heading_offset_deg) >= NAV_SCAN_RECENTER_THRESHOLD_DEG:
+        await _turn_by_degrees(
+            motion,
+            heading_offset_deg,
+            NAV_OBJECT_TURN_SPEED_RPS,
+        )
+        recenter_applied = True
+        recentered = await _vision_find_target(vision, target, qualifier)
+        if bool(recentered.get("visible")):
+            candidate = recentered
+        else:
+            return {
+                "success": False,
+                "visible": False,
+                "confidence": float(recentered.get("confidence", 0.0) or 0.0),
+                "bbox": None,
+                "position": None,
+                "heading_offset_deg": None,
+                "recenter_applied": True,
+                "turn_steps": turn_steps,
+                "degrees_swept": turn_steps * NAV_SCAN_STEP_DEG,
+                "stopped_reason": "max_retries",
+            }
+        heading_offset_deg = _heading_offset_from_bbox_deg(candidate.get("bbox"), TBOT_CAMERA_FOV_DEG)
+
+    return {
+        "success": True,
+        "visible": True,
+        "confidence": float(candidate.get("confidence", 0.0) or 0.0),
+        "bbox": candidate.get("bbox"),
+        "position": candidate.get("position"),
+        "heading_offset_deg": heading_offset_deg,
+        "recenter_applied": recenter_applied,
+        "turn_steps": turn_steps,
+        "degrees_swept": turn_steps * NAV_SCAN_STEP_DEG,
+        "stopped_reason": "found",
+    }
+
+
 async def _attempt_reacquire_target(
     vision: Client,
     motion: Client,
@@ -381,6 +456,29 @@ async def tbot_nav_get_pose(timeout_s: float = ODOM_TIMEOUT_S) -> dict[str, Any]
         "stamp_sec": odom.get("stamp_sec"),
         "age_mono_s": odom.get("age_mono_s"),
     }
+
+
+@mcp_nav_v3.tool()
+async def tbot_scan_for_object_360(
+    target: str,
+    qualifier: str | None = None,
+) -> dict[str, Any]:
+    """
+    Scan 360 degrees in fixed 10 deg steps to find an object.
+    Stops immediately when found and recenters from bbox heading offset.
+    """
+    target_clean = target.strip() if isinstance(target, str) else ""
+    if not target_clean:
+        raise ValueError("target must be a non-empty string")
+
+    async with Client(VISION_MCP_URL_V3) as vision:
+        async with Client(MOTION_MCP_URL_V3) as motion:
+            return await _scan_for_object_360(
+                vision=vision,
+                motion=motion,
+                target=target_clean,
+                qualifier=qualifier,
+            )
 
 
 @mcp_nav_v3.tool()
@@ -704,35 +802,13 @@ async def tbot_navigate_to_object(
                 object_locked = False
                 last_heading_offset_deg: float | None = None
                 last_drift_sign = 0
-                for sweep_attempt in range(NAV_OBJECT_SWEEP_MAX_STEPS + 1):
-                    candidate = await _vision_find_target(vision, target_clean, qualifier)
-                    if bool(candidate.get("visible")):
-                        found = candidate
-                        object_locked = True
-                        candidate_offset = _heading_offset_from_bbox_deg(candidate.get("bbox"), TBOT_CAMERA_FOV_DEG)
-                        if candidate_offset is not None:
-                            last_heading_offset_deg = candidate_offset
-                            if candidate_offset < -NAV_OBJECT_CENTER_EPS_DEG:
-                                last_drift_sign = -1
-                            elif candidate_offset > NAV_OBJECT_CENTER_EPS_DEG:
-                                last_drift_sign = 1
-                        break
-
-                    if sweep_attempt >= NAV_OBJECT_SWEEP_MAX_STEPS:
-                        await _safe_motion_stop(motion)
-                        final_pose = await tbot_nav_get_pose()
-                        return {
-                            "success": False,
-                            "final_pose": final_pose,
-                            "object_in_frame": False,
-                            "scene_description": "",
-                            "stopped_reason": "max_retries",
-                        }
-
-                    sweep_turn_deg = NAV_OBJECT_SWEEP_STEP_DEG
-                    await _turn_by_degrees(motion, sweep_turn_deg, NAV_OBJECT_TURN_SPEED_RPS)
-
-                if not object_locked or found is None:
+                scan = await _scan_for_object_360(
+                    vision=vision,
+                    motion=motion,
+                    target=target_clean,
+                    qualifier=qualifier,
+                )
+                if not bool(scan.get("success")) or not bool(scan.get("visible")):
                     await _safe_motion_stop(motion)
                     final_pose = await tbot_nav_get_pose()
                     return {
@@ -743,23 +819,20 @@ async def tbot_navigate_to_object(
                         "stopped_reason": "max_retries",
                     }
 
-                heading_offset_deg = _heading_offset_from_bbox_deg(found.get("bbox"), TBOT_CAMERA_FOV_DEG) if found else None
-                if heading_offset_deg is not None and abs(heading_offset_deg) >= 2.0:
-                    await _turn_by_degrees(
-                        motion,
-                        heading_offset_deg,
-                        NAV_OBJECT_TURN_SPEED_RPS,
-                    )
-                    post_center = await _vision_find_target(vision, target_clean, qualifier)
-                    object_locked = bool(post_center.get("visible"))
-                    if object_locked:
-                        post_center_offset = _heading_offset_from_bbox_deg(post_center.get("bbox"), TBOT_CAMERA_FOV_DEG)
-                        if post_center_offset is not None:
-                            last_heading_offset_deg = post_center_offset
-                            if post_center_offset < -NAV_OBJECT_CENTER_EPS_DEG:
-                                last_drift_sign = -1
-                            elif post_center_offset > NAV_OBJECT_CENTER_EPS_DEG:
-                                last_drift_sign = 1
+                found = {
+                    "visible": True,
+                    "confidence": scan.get("confidence"),
+                    "bbox": scan.get("bbox"),
+                    "position": scan.get("position"),
+                }
+                object_locked = True
+                heading_offset_deg = scan.get("heading_offset_deg")
+                if isinstance(heading_offset_deg, (int, float)) and math.isfinite(float(heading_offset_deg)):
+                    last_heading_offset_deg = float(heading_offset_deg)
+                    if last_heading_offset_deg < -NAV_OBJECT_CENTER_EPS_DEG:
+                        last_drift_sign = -1
+                    elif last_heading_offset_deg > NAV_OBJECT_CENTER_EPS_DEG:
+                        last_drift_sign = 1
 
                 approach_steps = 0
                 while approach_steps < NAV_OBJECT_MAX_APPROACH_STEPS:

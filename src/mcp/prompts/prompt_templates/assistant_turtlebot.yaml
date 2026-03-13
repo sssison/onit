@@ -44,7 +44,8 @@ instruction_template: |
   Reference these patterns by name in your plans. Do not reconstruct them
   from scratch - use the composite tools or call the primitive tools in the
   exact order described.
-  When a pattern requires turn-based object searching, use 15 deg step turns only.
+  For full 360 object scans, use tbot_scan_for_object_360 (fixed 10 deg steps).
+  For guided reacquire after loss, use 15 deg steps only.
   Do not execute forward motion while the target object is not yet confirmed in frame.
 
   ### Object lock discipline
@@ -65,7 +66,8 @@ instruction_template: |
   ### PATTERN: FIND_AND_APPROACH <object>
   Use tbot_navigate_to_object. This is the preferred pattern for any task
   that says "find X", "go to X", "stop in front of X", "position near X".
-  This pattern performs a full 360 deg search using 15 deg steps and checks
+  This pattern performs initial acquisition via tbot_scan_for_object_360
+  (full 360 deg search using 10 deg steps) and checks
   object visibility at every step before any forward movement.
   If the object is already visible, recenter only if needed and proceed to approach.
   Do not re-search after lock unless the object goes missing after movement starts.
