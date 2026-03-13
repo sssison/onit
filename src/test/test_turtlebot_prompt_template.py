@@ -24,8 +24,13 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     instruction = _load_instruction()
 
     assert "PATTERN: FIND_AND_APPROACH <object>" in instruction
+    assert "PATTERN: WALL_FOLLOW to <destination>" in instruction
     assert "tbot_navigate_to_object(" in instruction
     assert "tbot_estimate_object_pose(" in instruction
+    assert "Find the destination landmark first" in instruction
+    assert "fixed 15 deg steps" in instruction
+    assert "Move toward the wall until near it" in instruction
+    assert "Approach destination while verifying wall proximity with LiDAR" in instruction
 
     assert "tbot_vision_health" not in instruction
     assert "tbot_lidar_health" not in instruction

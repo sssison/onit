@@ -41,6 +41,7 @@ instruction_template: |
   Reference these patterns by name in your plans. Do not reconstruct them
   from scratch - use the composite tools or call the primitive tools in the
   exact order described.
+  When a pattern requires turn-based object searching, use 15 deg step turns only.
 
   ---
 
@@ -98,32 +99,41 @@ instruction_template: |
 
   ### PATTERN: WALL_FOLLOW to <destination>
   Use when the task requires moving along a wall to reach a goal.
-  LiDAR is the primary sensor throughout. Vision is used only to detect
-  the destination landmark.
+  LiDAR is the primary sensor for wall confirmation. Vision is used to locate
+  the wall landmark destination.
 
-    1. tbot_lidar_get_wall_profile()
-       -> Identify the nearest wall sector (usually "left" or "right")
-       -> Record wall_sector and initial_wall_distance
+    1. Find the destination landmark first
+       a. tbot_vision_find_object(object_name="<destination>")
+       b. If not found, run a turn-search loop with fixed 15 deg steps:
+          - tbot_motion_turn(...15 deg...)
+          - tbot_vision_find_object(object_name="<destination>")
+          - Repeat up to 24 steps (full 360 deg sweep)
 
-    2. tbot_motion_approach_until_close(target_distance_m=0.4)
-       -> Move toward the wall until LiDAR confirms distance < 0.5 m
+    2. Find and confirm wall geometry with LiDAR
+       a. tbot_lidar_get_wall_profile()
+       b. Select wall_sector ("left" or "right") and record initial_wall_distance
+
+    3. Move toward the wall until near it
+       a. tbot_motion_approach_until_close(target_distance_m=0.4)
+       b. Confirm near-wall state using tbot_lidar_get_obstacle_distances(sector=wall_sector)
        <- LiDAR PRIMARY: do not use vision to confirm wall presence
 
-    3. tbot_motion_turn(align_to_wall_heading)
-       -> Compute heading so robot is parallel to wall
-       -> Verify alignment: tbot_lidar_get_distance_at_angle(angle_deg=90.0)
-         should match tbot_lidar_get_distance_at_angle(angle_deg=270.0) +/- 0.05 m
+    4. Reorient to destination landmark again
+       a. tbot_vision_find_object(object_name="<destination>")
+       b. If not found, repeat fixed 15 deg turn-search steps until found
 
-    4. Loop: move + check wall drift + check destination
+    5. Approach destination while verifying wall proximity with LiDAR
+       Loop:
        a. tbot_lidar_check_collision()                     <- collision guard
-       b. tbot_motion_move_forward_distance(0.3)
-       c. tbot_lidar_get_obstacle_distances(sector=wall_sector)
+       b. tbot_lidar_get_obstacle_distances(sector=wall_sector)
           -> If distance deviates > 0.08 m from initial_wall_distance:
-            micro-correct with tbot_motion_turn(+/-3 deg)
-       d. tbot_vision_find_object(object_name="<destination>")  <- vision secondary
-          -> If found AND confidence > 0.7: break loop
+             micro-correct with tbot_motion_turn(+/-3 deg)
+       c. tbot_vision_find_object(object_name="<destination>")
+       d. tbot_motion_move_forward_distance(0.2)
+       e. Continue until near destination
 
-    5. tbot_navigate_to_object(target="<destination>", stop_distance=0.5)
+    6. Final docking and visual confirmation
+       tbot_navigate_to_object(target="<destination>", stop_distance=0.5, confirm_in_frame=True)
 
   ---
 

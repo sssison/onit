@@ -64,7 +64,7 @@ NAV_FORWARD_STEP_M = max(0.03, _env_float("NAV_FORWARD_STEP_M", 0.12))
 NAV_TURN_STEP_DEG = max(1.0, _env_float("NAV_TURN_STEP_DEG", 12.0))
 NAV_HEADING_ALIGN_DEG = max(5.0, _env_float("NAV_HEADING_ALIGN_DEG", 15.0))
 TBOT_CAMERA_FOV_DEG = _env_float("TBOT_CAMERA_FOV_DEG", 62.0)
-NAV_OBJECT_SWEEP_STEP_DEG = max(5.0, _env_float("NAV_OBJECT_SWEEP_STEP_DEG", 45.0))
+NAV_OBJECT_SWEEP_STEP_DEG = 15.0
 NAV_OBJECT_SWEEP_MAX_STEPS = max(1, int(_env_float("NAV_OBJECT_SWEEP_MAX_STEPS", 8.0)))
 NAV_OBJECT_REACQUIRE_ATTEMPTS = max(1, int(_env_float("NAV_OBJECT_REACQUIRE_ATTEMPTS", 3.0)))
 NAV_OBJECT_APPROACH_STEP_M = max(0.05, _env_float("NAV_OBJECT_APPROACH_STEP_M", 0.25))
@@ -329,11 +329,10 @@ async def _attempt_reacquire_target(
     target: str,
     qualifier: str | None,
 ) -> dict[str, Any] | None:
-    risk_level, scale, _ = await _guard_motion_and_get_scale(lidar, motion)
+    risk_level, _, _ = await _guard_motion_and_get_scale(lidar, motion)
     if risk_level == "stop":
         return None
-    step_deg = NAV_OBJECT_SWEEP_STEP_DEG * scale
-    step_deg = max(10.0, step_deg)
+    step_deg = NAV_OBJECT_SWEEP_STEP_DEG
 
     # Scan left (+step), then right (-2*step), then return to center (+step) if still not found.
     await _turn_by_degrees(motion, step_deg, NAV_OBJECT_TURN_SPEED_RPS)
@@ -722,7 +721,7 @@ async def tbot_navigate_to_object(
                             "stopped_reason": "max_retries",
                         }
 
-                    risk_level, scale, _ = await _guard_motion_and_get_scale(lidar, motion)
+                    risk_level, _, _ = await _guard_motion_and_get_scale(lidar, motion)
                     if risk_level == "stop":
                         bypass_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
                         bypass = _extract_tool_result_dict(bypass_raw)
@@ -736,7 +735,7 @@ async def tbot_navigate_to_object(
                                 "stopped_reason": "collision_stop",
                                 "bypass": bypass,
                             }
-                    sweep_turn_deg = max(10.0, NAV_OBJECT_SWEEP_STEP_DEG * scale)
+                    sweep_turn_deg = NAV_OBJECT_SWEEP_STEP_DEG
                     await _turn_by_degrees(motion, sweep_turn_deg, NAV_OBJECT_TURN_SPEED_RPS)
 
                 heading_offset_deg = _heading_offset_from_bbox_deg(found.get("bbox"), TBOT_CAMERA_FOV_DEG) if found else None
