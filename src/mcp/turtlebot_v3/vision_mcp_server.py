@@ -12,7 +12,7 @@ import os
 import re
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp import Client, FastMCP
 from openai import APITimeoutError, AsyncOpenAI, OpenAIError
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,12 @@ DEFAULT_VISION_MODEL = os.getenv("TBOT_VISION_MODEL", "Qwen/Qwen3.5-9B")
 DEFAULT_VISION_API_KEY = os.getenv("TBOT_VISION_API_KEY", "EMPTY")
 VISION_TIMEOUT_S = _env_float("TBOT_VISION_TIMEOUT_S", 60.0)
 VISION_THINKING_ENABLED = os.getenv("TBOT_VISION_THINKING", "false").strip().lower() == "true"
+MOTION_MCP_URL_V3 = os.getenv("TBOT_MOTION_MCP_URL_V3", "http://127.0.0.1:18210/turtlebot-motion-v3")
+TBOT_CAMERA_FOV_DEG = _env_float("TBOT_CAMERA_FOV_DEG", 62.0)
+VISION_SCAN_STEP_DEG = 10.0
+VISION_SCAN_MAX_STEPS = max(1, int(round(360.0 / VISION_SCAN_STEP_DEG)))
+VISION_TURN_SPEED_RPS = max(0.05, _env_float("VISION_TURN_SPEED_RPS", 0.30))
+VISION_SCAN_BBOX_RETRY_COUNT = max(1, int(_env_float("VISION_SCAN_BBOX_RETRY_COUNT", 2.0)))
 
 
 def _vision_extra_body() -> dict:
@@ -157,6 +163,29 @@ def _normalize_bbox(value: Any) -> dict[str, float] | None:
             return None
         parsed[key] = normalized
     return parsed
+
+
+def _heading_offset_from_bbox_deg(bbox: Any, camera_fov_deg: float = TBOT_CAMERA_FOV_DEG) -> float | None:
+    if not isinstance(bbox, dict):
+        return None
+    cx = bbox.get("cx")
+    if not isinstance(cx, (int, float)) or not math.isfinite(float(cx)):
+        return None
+    cx_f = max(0.0, min(1.0, float(cx)))
+    return (cx_f - 0.5) * float(camera_fov_deg)
+
+
+async def _turn_by_degrees(motion: Client, turn_deg: float, speed_rps: float = VISION_TURN_SPEED_RPS) -> None:
+    direction = "left" if turn_deg >= 0 else "right"
+    duration_s = math.radians(abs(turn_deg)) / max(abs(speed_rps), 0.01)
+    await motion.call_tool(
+        "tbot_motion_turn",
+        {
+            "direction": direction,
+            "speed": max(abs(speed_rps), 0.05),
+            "duration_seconds": duration_s,
+        },
+    )
 
 
 def _load_frame_as_base64(path: str) -> str:
@@ -305,20 +334,30 @@ async def tbot_vision_find_object(
     attributes: list[str] | None = None,
     anchor_object: str | None = None,
     relation: str | None = None,
+    search_mode: str = "scan360",
 ) -> dict[str, Any]:
     """
-    Check if a named object is visible in the latest camera frame.
+    Find a named object in camera frames.
 
-    Returns {"visible": bool, "position": "left"|"center"|"right"|null, "confidence": float}.
-    Position is derived from the detected bounding box center (cx < 0.33 → left, 0.33-0.66 → center, > 0.66 → right).
+    search_mode:
+      - "scan360": perform 360 scan in 10 deg steps and recenter once from bbox.
+      - "frame_only": single-frame detection without robot movement.
     """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
         raise ValueError("object_name must be a non-empty string")
+    search_mode_clean = str(search_mode).strip().lower()
+    if search_mode_clean not in {"scan360", "frame_only"}:
+        raise ValueError("search_mode must be 'scan360' or 'frame_only'")
 
     host = os.getenv("TBOT_VISION_HOST", DEFAULT_VISION_HOST)
     model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
-    model_info = {"host": host, "model": model, "timeout_s": VISION_TIMEOUT_S}
+    model_info = {
+        "host": host,
+        "model": model,
+        "timeout_s": VISION_TIMEOUT_S,
+        "search_mode": search_mode_clean,
+    }
 
     result = await _find_object_in_frame(
         object_name_clean,
@@ -326,7 +365,118 @@ async def tbot_vision_find_object(
         anchor_object=anchor_object,
         relation=relation,
     )
-    return {**result, "model_info": model_info}
+    if search_mode_clean == "frame_only":
+        return {
+            **result,
+            "success": bool(result.get("visible")),
+            "scan_steps": 0,
+            "degrees_swept": 0.0,
+            "recenter_applied": False,
+            "stopped_reason": "found" if bool(result.get("visible")) else "not_found",
+            "model_info": model_info,
+        }
+
+    scan_steps = 0
+    recenter_applied = False
+    async with Client(MOTION_MCP_URL_V3) as motion:
+        while not bool(result.get("visible")) and scan_steps < VISION_SCAN_MAX_STEPS:
+            await _turn_by_degrees(motion, VISION_SCAN_STEP_DEG, VISION_TURN_SPEED_RPS)
+            scan_steps += 1
+            result = await _find_object_in_frame(
+                object_name_clean,
+                attributes=attributes,
+                anchor_object=anchor_object,
+                relation=relation,
+            )
+
+        if not bool(result.get("visible")):
+            return {
+                **result,
+                "success": False,
+                "scan_steps": scan_steps,
+                "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
+                "recenter_applied": False,
+                "stopped_reason": "max_retries",
+                "model_info": model_info,
+            }
+
+        bbox_retries = 0
+        while result.get("bbox") is None and bbox_retries < VISION_SCAN_BBOX_RETRY_COUNT:
+            bbox_retries += 1
+            refreshed = await _find_object_in_frame(
+                object_name_clean,
+                attributes=attributes,
+                anchor_object=anchor_object,
+                relation=relation,
+            )
+            if not bool(refreshed.get("visible")):
+                return {
+                    **refreshed,
+                    "success": False,
+                    "scan_steps": scan_steps,
+                    "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
+                    "recenter_applied": False,
+                    "stopped_reason": "target_lost",
+                    "model_info": model_info,
+                }
+            result = refreshed
+
+        bbox = result.get("bbox")
+        if bbox is None:
+            return {
+                **result,
+                "success": False,
+                "scan_steps": scan_steps,
+                "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
+                "recenter_applied": False,
+                "stopped_reason": "bbox_unavailable",
+                "model_info": model_info,
+            }
+
+        heading_offset = _heading_offset_from_bbox_deg(bbox)
+        if heading_offset is None:
+            return {
+                **result,
+                "success": False,
+                "scan_steps": scan_steps,
+                "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
+                "recenter_applied": False,
+                "stopped_reason": "bbox_unavailable",
+                "model_info": model_info,
+            }
+
+        if abs(heading_offset) > 0.0:
+            await _turn_by_degrees(motion, heading_offset, VISION_TURN_SPEED_RPS)
+            recenter_applied = True
+
+        recentered = await _find_object_in_frame(
+            object_name_clean,
+            attributes=attributes,
+            anchor_object=anchor_object,
+            relation=relation,
+        )
+        if bool(recentered.get("visible")):
+            result = recentered
+        else:
+            return {
+                **recentered,
+                "success": False,
+                "scan_steps": scan_steps,
+                "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
+                "recenter_applied": recenter_applied,
+                "stopped_reason": "target_lost",
+                "model_info": model_info,
+            }
+
+    return {
+        **result,
+        "success": True,
+        "scan_steps": scan_steps,
+        "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
+        "recenter_applied": recenter_applied,
+        "stopped_reason": "found",
+        "model_info": model_info,
+    }
 
 
 @mcp_vision_v3.tool()

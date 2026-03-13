@@ -44,16 +44,15 @@ instruction_template: |
   Reference these patterns by name in your plans. Do not reconstruct them
   from scratch - use the composite tools or call the primitive tools in the
   exact order described.
-  For full 360 object scans, use tbot_scan_for_object_360 (fixed 10 deg steps).
-  For guided reacquire after loss, use 15 deg steps only.
+  Use tbot_vision_find_object(search_mode="scan360") as the primary object finder.
+  Use tbot_navigate_to_object only after the object is visible in frame.
   Do not execute forward motion while the target object is not yet confirmed in frame.
 
   ### Object lock discipline
   - If tbot_vision_find_object reports the target is visible, lock the target.
   - After lock, recenter only if needed, then plan movement toward the target.
   - Do not run another search sweep after lock.
-  - Search/reacquire is allowed only if the target goes missing after forward movement toward it has begun.
-  - During reacquire, search only toward the last-seen side up to 90 deg using 15 deg steps; do not sweep the opposite side in the same reacquire attempt.
+  - If tbot_navigate_to_object returns target_lost after motion, call tbot_vision_find_object(search_mode="scan360") again before another navigation attempt.
 
   ### Tool call efficiency
   - Call tools only when the result changes the next action.
@@ -64,20 +63,26 @@ instruction_template: |
   ---
 
   ### PATTERN: FIND_AND_APPROACH <object>
-  Use tbot_navigate_to_object. This is the preferred pattern for any task
-  that says "find X", "go to X", "stop in front of X", "position near X".
-  This pattern performs initial acquisition via tbot_scan_for_object_360
-  (full 360 deg search using 10 deg steps) and checks
-  object visibility at every step before any forward movement.
-  If the object is already visible, recenter only if needed and proceed to approach.
-  Do not re-search after lock unless the object goes missing after movement starts.
+  This is the preferred pattern for tasks that say "find X", "go to X",
+  "stop in front of X", or "position near X".
 
-    tbot_navigate_to_object(
-        target="<object>",
-        qualifier="<optional>",
-        stop_distance=<meters>,
-        confirm_in_frame=True   <- always True when task requires visual QA
-    )
+    1. finder = tbot_vision_find_object(
+           object_name="<object>",
+           attributes=["<optional>"],
+           search_mode="scan360"
+       )
+       -> finder must return visible=True before any navigation.
+
+    2. nav = tbot_navigate_to_object(
+           target="<object>",
+           qualifier="<optional>",
+           stop_distance=<meters>,
+           confirm_in_frame=True   <- always True when task requires visual QA
+       )
+
+    3. If nav.stopped_reason == "target_lost":
+       -> Repeat Step 1 (find again) then Step 2 (navigate again).
+       -> Continue until reached_target or retry limit.
 
   If the task also requires knowing the absolute position of the object
   (e.g. to compute a midpoint or patrol waypoint), call

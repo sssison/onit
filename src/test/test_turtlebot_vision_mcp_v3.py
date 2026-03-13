@@ -26,6 +26,21 @@ def _make_mock_llm_client(response_text: str):
     return mock_client
 
 
+class _FakeMotionClient:
+    def __init__(self, calls):
+        self._calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def call_tool(self, name: str, payload: dict):
+        self._calls.append((name, payload))
+        return {"status": "ok"}
+
+
 def test_load_frame_as_base64_returns_ascii():
     raw = b"\xff\xd8\xff" + b"\x00" * 10
     with patch(
@@ -106,7 +121,7 @@ def test_vision_find_object_visible_with_position():
             )
         ),
     ), patch.object(vision_v3, "AsyncOpenAI", return_value=mock_client):
-        result = asyncio.run(vision_v3.tbot_vision_find_object("chair"))
+        result = asyncio.run(vision_v3.tbot_vision_find_object("chair", search_mode="frame_only"))
 
     assert result["visible"] is True
     assert result["position"] == "right"
@@ -132,7 +147,7 @@ def test_vision_find_object_not_visible():
             )
         ),
     ), patch.object(vision_v3, "AsyncOpenAI", return_value=mock_client):
-        result = asyncio.run(vision_v3.tbot_vision_find_object("elephant"))
+        result = asyncio.run(vision_v3.tbot_vision_find_object("elephant", search_mode="frame_only"))
 
     assert result["visible"] is False
     assert result["position"] is None
@@ -142,6 +157,80 @@ def test_vision_find_object_not_visible():
 def test_vision_find_object_rejects_empty_name():
     with pytest.raises(ValueError, match="object_name must be a non-empty string"):
         asyncio.run(vision_v3.tbot_vision_find_object(""))
+
+
+def test_vision_find_object_scan360_rotates_and_recenters():
+    raw = b"\xff\xd8\xff"
+    responses = [
+        json.dumps({"matched": False, "confidence": 0.1, "bbox": None}),
+        json.dumps({"matched": True, "confidence": 0.8, "bbox": {"cx": 0.8, "cy": 0.5, "w": 0.2, "h": 0.2}}),
+        json.dumps({"matched": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}}),
+    ]
+    mock_create = AsyncMock(side_effect=[_completion_with_text(text) for text in responses])
+    mock_client = MagicMock()
+    mock_client.chat = MagicMock(completions=MagicMock(create=mock_create))
+    motion_calls: list[tuple[str, dict]] = []
+
+    def fake_motion_client(url: str):
+        assert url == vision_v3.MOTION_MCP_URL_V3
+        return _FakeMotionClient(motion_calls)
+
+    with patch(
+        "builtins.open",
+        MagicMock(
+            return_value=MagicMock(
+                __enter__=lambda s: s,
+                __exit__=MagicMock(return_value=False),
+                read=MagicMock(return_value=raw),
+            )
+        ),
+    ), patch.object(vision_v3, "AsyncOpenAI", return_value=mock_client), patch.object(
+        vision_v3, "Client", side_effect=fake_motion_client
+    ):
+        result = asyncio.run(vision_v3.tbot_vision_find_object("chair"))
+
+    assert result["success"] is True
+    assert result["visible"] is True
+    assert result["scan_steps"] == 1
+    assert result["recenter_applied"] is True
+    assert len(motion_calls) == 2
+    assert motion_calls[0][0] == "tbot_motion_turn"
+    assert motion_calls[1][0] == "tbot_motion_turn"
+
+
+def test_vision_find_object_scan360_fails_when_bbox_unavailable():
+    raw = b"\xff\xd8\xff"
+    responses = [
+        json.dumps({"matched": True, "confidence": 0.8, "bbox": None}),
+        json.dumps({"matched": True, "confidence": 0.8, "bbox": None}),
+        json.dumps({"matched": True, "confidence": 0.8, "bbox": None}),
+    ]
+    mock_create = AsyncMock(side_effect=[_completion_with_text(text) for text in responses])
+    mock_client = MagicMock()
+    mock_client.chat = MagicMock(completions=MagicMock(create=mock_create))
+    motion_calls: list[tuple[str, dict]] = []
+
+    def fake_motion_client(url: str):
+        assert url == vision_v3.MOTION_MCP_URL_V3
+        return _FakeMotionClient(motion_calls)
+
+    with patch(
+        "builtins.open",
+        MagicMock(
+            return_value=MagicMock(
+                __enter__=lambda s: s,
+                __exit__=MagicMock(return_value=False),
+                read=MagicMock(return_value=raw),
+            )
+        ),
+    ), patch.object(vision_v3, "AsyncOpenAI", return_value=mock_client), patch.object(
+        vision_v3, "Client", side_effect=fake_motion_client
+    ):
+        result = asyncio.run(vision_v3.tbot_vision_find_object("chair"))
+
+    assert result["success"] is False
+    assert result["stopped_reason"] == "bbox_unavailable"
+    assert len(motion_calls) == 0
 
 
 def test_normalize_confidence_clamps():
