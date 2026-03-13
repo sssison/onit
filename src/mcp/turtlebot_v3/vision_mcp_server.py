@@ -42,6 +42,7 @@ VISION_SCAN_STEP_DEG = 10.0
 VISION_SCAN_MAX_STEPS = max(1, int(round(360.0 / VISION_SCAN_STEP_DEG)))
 VISION_TURN_SPEED_RPS = max(0.05, _env_float("VISION_TURN_SPEED_RPS", 0.30))
 VISION_SCAN_BBOX_RETRY_COUNT = max(1, int(_env_float("VISION_SCAN_BBOX_RETRY_COUNT", 2.0)))
+VISION_RECENTER_EPS_DEG = max(0.25, _env_float("VISION_RECENTER_EPS_DEG", 1.0))
 
 
 def _vision_extra_body() -> dict:
@@ -135,6 +136,24 @@ def _normalize_confidence(value: Any) -> float | None:
     if not math.isfinite(parsed):
         return None
     return max(0.0, min(1.0, parsed))
+
+
+def _normalize_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+        return None
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "y", "1"}:
+            return True
+        if lowered in {"false", "no", "n", "0"}:
+            return False
+    return None
 
 
 def _normalize_unit_float(value: Any) -> float | None:
@@ -286,8 +305,8 @@ async def _find_object_in_frame(
 
     image_b64 = _load_frame_as_base64(frame_path)
     system_prompt = (
-        "Return only JSON with keys: matched (boolean), confidence (0..1), "
-        "bbox (object with normalized cx, cy, w, h or null)."
+        "Return only JSON with keys: matched (boolean), bbox (object with normalized cx, cy, w, h or null). "
+        "confidence (0..1) is optional."
     )
     query = _build_object_query(
         object_name=object_name,
@@ -316,15 +335,17 @@ async def _find_object_in_frame(
     except Exception:
         pass
 
-    matched = bool(parsed.get("matched", False))
+    bbox = _normalize_bbox(parsed.get("bbox"))
+    matched = _normalize_bool(parsed.get("matched"))
+    if matched is None:
+        matched = _normalize_bool(parsed.get("visible"))
+    if matched is None:
+        matched = bbox is not None
     confidence = _normalize_confidence(parsed.get("confidence")) or 0.0
-    bbox: dict[str, float] | None = None
     position: str | None = None
-    if matched:
-        bbox = _normalize_bbox(parsed.get("bbox"))
-        if bbox is not None:
-            cx = bbox["cx"]
-            position = "left" if cx < 0.33 else ("right" if cx > 0.66 else "center")
+    if matched and bbox is not None:
+        cx = bbox["cx"]
+        position = "left" if cx < 0.33 else ("right" if cx > 0.66 else "center")
     return {"visible": matched, "confidence": confidence, "bbox": bbox, "position": position}
 
 
@@ -382,7 +403,8 @@ async def tbot_vision_find_object(
             }
 
         bbox_retries = 0
-        while result.get("bbox") is None and bbox_retries < VISION_SCAN_BBOX_RETRY_COUNT:
+        bbox = result.get("bbox")
+        while bbox is None and bbox_retries < VISION_SCAN_BBOX_RETRY_COUNT:
             bbox_retries += 1
             refreshed = await _find_object_in_frame(
                 object_name_clean,
@@ -390,72 +412,39 @@ async def tbot_vision_find_object(
                 anchor_object=anchor_object,
                 relation=relation,
             )
-            if not bool(refreshed.get("visible")):
-                return {
-                    **refreshed,
-                    "success": False,
-                    "scan_steps": scan_steps,
-                    "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
-                    "recenter_applied": False,
-                    "stopped_reason": "target_lost",
-                    "model_info": model_info,
-                }
-            result = refreshed
+            if bool(refreshed.get("visible")):
+                result = refreshed
+                bbox = result.get("bbox")
 
-        bbox = result.get("bbox")
-        if bbox is None:
-            return {
-                **result,
-                "success": False,
-                "scan_steps": scan_steps,
-                "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
-                "recenter_applied": False,
-                "stopped_reason": "bbox_unavailable",
-                "model_info": model_info,
-            }
+        if isinstance(bbox, dict):
+            heading_offset = _heading_offset_from_bbox_deg(bbox)
+            if heading_offset is not None:
+                # _heading_offset_from_bbox_deg is image x-offset; negate to get turn-to-center command.
+                turn_to_center_deg = -heading_offset
+                if abs(turn_to_center_deg) >= VISION_RECENTER_EPS_DEG:
+                    await _turn_by_degrees(motion, turn_to_center_deg, VISION_TURN_SPEED_RPS)
+                    recenter_applied = True
 
-        heading_offset = _heading_offset_from_bbox_deg(bbox)
-        if heading_offset is None:
-            return {
-                **result,
-                "success": False,
-                "scan_steps": scan_steps,
-                "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
-                "recenter_applied": False,
-                "stopped_reason": "bbox_unavailable",
-                "model_info": model_info,
-            }
+                    recentered = await _find_object_in_frame(
+                        object_name_clean,
+                        attributes=attributes,
+                        anchor_object=anchor_object,
+                        relation=relation,
+                    )
+                    if bool(recentered.get("visible")):
+                        result = recentered
+                        bbox = result.get("bbox")
 
-        if abs(heading_offset) > 0.0:
-            await _turn_by_degrees(motion, heading_offset, VISION_TURN_SPEED_RPS)
-            recenter_applied = True
-
-        recentered = await _find_object_in_frame(
-            object_name_clean,
-            attributes=attributes,
-            anchor_object=anchor_object,
-            relation=relation,
-        )
-        if bool(recentered.get("visible")):
-            result = recentered
-        else:
-            return {
-                **recentered,
-                "success": False,
-                "scan_steps": scan_steps,
-                "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
-                "recenter_applied": recenter_applied,
-                "stopped_reason": "target_lost",
-                "model_info": model_info,
-            }
+    stopped_reason = "found" if isinstance(result.get("bbox"), dict) else "found_bbox_unavailable"
 
     return {
         **result,
         "success": True,
         "scan_steps": scan_steps,
         "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
+        "bbox_retries": bbox_retries,
         "recenter_applied": recenter_applied,
-        "stopped_reason": "found",
+        "stopped_reason": stopped_reason,
         "model_info": model_info,
     }
 
