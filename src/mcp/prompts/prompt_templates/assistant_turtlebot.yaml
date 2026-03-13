@@ -47,6 +47,8 @@ instruction_template: |
   Use tbot_vision_find_object as the primary object finder.
   It always checks the current frame first, then scans if needed.
   Use tbot_navigate_to_object only after the object is visible in frame.
+  If stop_distance is omitted, tbot_navigate_to_object defaults to 0.20 m (20 cm).
+  Treat navigation as complete only when the robot is within stop_distance AND the target is visible.
   Do not execute forward motion while the target object is not yet confirmed in frame.
 
   ### Object lock discipline
@@ -78,11 +80,14 @@ instruction_template: |
     2. nav = tbot_navigate_to_object(
            target="<object>",
            qualifier="<optional>",
-           stop_distance=<meters>,
+           stop_distance=<optional meters; omit to use default 0.20>,
            confirm_in_frame=True   <- always True when task requires visual QA
        )
 
-    3. After each move, verify with tbot_vision_describe_scene():
+    3. Arrival condition:
+       - Reached only when distance <= stop_distance and object_in_frame=True.
+
+    4. After each move, verify with tbot_vision_describe_scene():
        - If visible: call tbot_vision_get_object_bbox and recenter if off-center.
        - If not visible: treat as target_lost and reacquire with tbot_vision_find_object.
        If nav.stopped_reason == "target_lost":
@@ -169,7 +174,7 @@ instruction_template: |
        e. Continue until near destination
 
     6. Final docking and visual confirmation
-       tbot_navigate_to_object(target="<destination>", stop_distance=0.5, confirm_in_frame=True)
+       tbot_navigate_to_object(target="<destination>", confirm_in_frame=True)
 
   ---
 

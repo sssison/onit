@@ -70,6 +70,7 @@ NAV_OBJECT_TURN_SPEED_RPS = max(0.05, _env_float("NAV_OBJECT_TURN_SPEED_RPS", 0.
 NAV_OBJECT_MAX_APPROACH_STEPS = max(1, int(_env_float("NAV_OBJECT_MAX_APPROACH_STEPS", 80.0)))
 NAV_OBJECT_RECENTER_EPS_DEG = max(0.5, _env_float("NAV_OBJECT_RECENTER_EPS_DEG", 1.0))
 NAV_OBJECT_LOSS_CONFIRM_FRAMES = max(1, int(_env_float("NAV_OBJECT_LOSS_CONFIRM_FRAMES", 2.0)))
+NAV_OBJECT_DEFAULT_STOP_DISTANCE_M = max(0.05, _env_float("NAV_OBJECT_DEFAULT_STOP_DISTANCE_M", 0.20))
 
 _rclpy_init_lock = threading.Lock()
 
@@ -744,12 +745,13 @@ async def tbot_estimate_object_pose(
 async def tbot_navigate_to_object(
     target: str,
     qualifier: str | None = None,
-    stop_distance: float = 0.6,
+    stop_distance: float = NAV_OBJECT_DEFAULT_STOP_DISTANCE_M,
     confirm_in_frame: bool = True,
 ) -> dict[str, Any]:
     """
     Approach a visible object with collision checks and optional visual confirmation.
     If the object is visible but off-center, recenter in-place via bbox instead of rescanning.
+    Stops when the robot is within stop_distance and the object is still visible.
     """
     target_clean = target.strip() if isinstance(target, str) else ""
     if not target_clean:
@@ -812,18 +814,60 @@ async def tbot_navigate_to_object(
                         continue
 
                     front_distance_m = _extract_front_distance(collision)
-                    if front_distance_m is not None and front_distance_m <= stop_distance_f:
-                        await _safe_motion_stop(motion)
-                        stopped_reason = "reached_target"
-                        break
+                    target_distance_m: float | None = None
+                    bbox_for_range: dict[str, Any] | None = None
+                    if front_distance_m is None:
+                        bbox_for_range = await _vision_get_target_bbox(
+                            vision=vision,
+                            target=target_clean,
+                            qualifier=qualifier,
+                        )
+                        if bool(bbox_for_range.get("visible")):
+                            heading_offset_deg = _heading_offset_from_bbox_deg(
+                                bbox_for_range.get("bbox"),
+                                TBOT_CAMERA_FOV_DEG,
+                            )
+                            if heading_offset_deg is not None:
+                                distance_raw = await lidar.call_tool(
+                                    "tbot_lidar_get_distance_at_angle",
+                                    {"angle_deg": heading_offset_deg},
+                                )
+                                distance_result = _extract_tool_result_dict(distance_raw)
+                                measured = distance_result.get("distance_m")
+                                if isinstance(measured, (int, float)) and math.isfinite(float(measured)):
+                                    target_distance_m = float(measured)
 
+                    distance_for_limit = target_distance_m if target_distance_m is not None else front_distance_m
                     allowed_step = NAV_OBJECT_APPROACH_STEP_M * scale
-                    if front_distance_m is not None:
-                        allowed_step = min(allowed_step, max(0.0, front_distance_m - stop_distance_f))
-                    if allowed_step <= 0.0:
-                        await _safe_motion_stop(motion)
-                        stopped_reason = "reached_target"
-                        break
+                    if distance_for_limit is not None:
+                        allowed_step = min(allowed_step, max(0.0, distance_for_limit - stop_distance_f))
+
+                    near_target = distance_for_limit is not None and distance_for_limit <= stop_distance_f
+                    blocked = allowed_step <= 0.0
+                    if near_target or blocked:
+                        visible_for_stop = await _scene_confirms_target_visible(
+                            vision=vision,
+                            target=target_clean,
+                            qualifier=qualifier,
+                        )
+                        object_in_frame = bool(visible_for_stop) or bool(bbox_for_range and bbox_for_range.get("visible"))
+                        if object_in_frame:
+                            await _safe_motion_stop(motion)
+                            stopped_reason = "reached_target"
+                            break
+                        if blocked:
+                            await _safe_motion_stop(motion)
+                            final_pose = await tbot_nav_get_pose()
+                            return {
+                                "success": False,
+                                "final_pose": final_pose,
+                                "object_in_frame": False,
+                                "scene_description": "",
+                                "stopped_reason": "target_not_visible_near_obstacle",
+                                "collision": collision,
+                                "front_distance_m": front_distance_m,
+                                "target_distance_m": target_distance_m,
+                            }
 
                     move_speed = max(0.03, NAV_OBJECT_MOVE_SPEED_MPS * scale)
                     await motion.call_tool(
