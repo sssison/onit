@@ -22,6 +22,9 @@ def test_turtlebot_prompt_includes_sensor_priority_and_collision_guard():
     assert "### Arrival lock and hard stop" in instruction
     assert "If the target was visible before motion and front LiDAR is now within stop_distance," in instruction
     assert "Do not re-run search/scan after arrival unless the user explicitly asks to continue exploring." in instruction
+    assert "### Under-object containment - LiDAR only" in instruction
+    assert "Confirm containment only with tbot_lidar_get_obstacle_distances(sector=\"all\")" in instruction
+    assert "Never use tbot_vision_describe_scene, tbot_vision_find_object," in instruction
 
 
 def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools():
@@ -31,10 +34,14 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "PATTERN: WALL_FOLLOW to <destination>" in instruction
     assert "tbot_navigate_to_object(" in instruction
     assert "tbot_nav_go_to_midpoint_between_objects(" in instruction
-    assert "Use tbot_vision_find_object as the primary object finder." in instruction
-    assert "It always checks the current frame first, then scans if needed." in instruction
+    assert "Before calling tbot_vision_find_object, first call tbot_vision_get_object_bbox" in instruction
+    assert "If bbox reports visible=True, lock target immediately and skip find-object scan." in instruction
+    assert "Use tbot_vision_find_object only when the object is not already present in frame." in instruction
     assert "Use explicit stop_distance when requested by the task (example: soccer ball at 0.50 m)." in instruction
     assert "tbot_estimate_object_pose(" in instruction
+    assert "bbox = tbot_vision_get_object_bbox(" in instruction
+    assert "If bbox.visible=True, lock target and skip active scan." in instruction
+    assert "If bbox.visible is not True:" in instruction
     assert "Find the destination landmark first" in instruction
     assert "fixed 15 deg steps" in instruction
     assert "Repeat up to 24 steps (full 360 deg sweep)" in instruction
@@ -64,17 +71,25 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "PATTERN: QUALIFIED_FIND_AND_APPROACH <object>" in instruction
     assert "PATTERN: OBSTACLE_AROUND_TARGET <object>" in instruction
     assert "PATTERN: STOP_ON_PERSON_FEET" in instruction
+    assert "PATTERN: POSITION_UNDER_OBJECT <object>" in instruction
     assert "PATTERN: UNDER_OBJECT_CHECK <object>" in instruction
     assert "PATTERN: VISUAL_QA_ONLY" in instruction
     assert "### Task Routing Guide" in instruction
     assert "Door open check: OBJECT_STATE_CHECK + FIND_AND_APPROACH" in instruction
     assert "Trashcan or cable bypass: OBSTACLE_AROUND_TARGET" in instruction
     assert "Two-object midpoint tasks (chairs, trashcan + soccer ball): MIDPOINT_NAVIGATE" in instruction
-    assert "If the task asks to confirm \"no spills\" on the floor:" in instruction
-    assert "Perform a full 360 deg spill sweep before concluding clear." in instruction
+    assert "Under-chair positioning: POSITION_UNDER_OBJECT" in instruction
+    assert "Under-desk / under-chair fallen-object checks: UNDER_OBJECT_CHECK" in instruction
+    assert "If the task asks to confirm a specific floor hazard is absent or present:" in instruction
+    assert "Extract the hazard label from the task" in instruction
     assert "Use fixed 15 deg turn steps for 24 steps total:" in instruction
-    assert "tbot_vision_inspect_floor(targets=[\"spill\"], region=\"lower_half\")" in instruction
-    assert "Report \"no spills detected\" only if all 24 checks report no spill." in instruction
+    assert "tbot_vision_inspect_floor(targets=[\"<hazard_from_task>\"], region=\"lower_half\")" in instruction
+    assert "Report hazard-clear only if all 24 checks report no matching hazard." in instruction
+    assert "First execute POSITION_UNDER_OBJECT for \"<object>\"." in instruction
+    assert "tbot_motion_bypass_obstacle(preferred_side=\"auto\")" in instruction
+    assert "tbot_lidar_export_free_space_map(radius_m=0.5, resolution_m=0.1, samples=1)" in instruction
+    assert "Return {{\"status\": \"failed\", \"reason\": \"containment_check_failed\", \"attempts\": 3}}" in instruction
+    assert "{{\"status\": \"confirmed\" | \"failed\", \"reason\": str, \"attempts\": int}}" in instruction
 
     assert "tbot_vision_health" not in instruction
     assert "tbot_lidar_health" not in instruction

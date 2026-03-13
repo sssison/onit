@@ -46,14 +46,26 @@ instruction_template: |
   - After arrival, call tbot_motion_stop() and end the action cycle.
   - Do not re-run search/scan after arrival unless the user explicitly asks to continue exploring.
 
+  ### Under-object containment - LiDAR only
+  For tasks that require the robot to be physically under an object footprint:
+  - Confirm containment only with tbot_lidar_get_obstacle_distances(sector="all")
+    using front/left/right sector distances.
+  - Never use tbot_vision_describe_scene, tbot_vision_find_object,
+    tbot_vision_get_object_bbox, or tbot_nav_get_pose to confirm containment.
+  - Vision is allowed only to detect/localize the target before navigation.
+  - Keep correction motions small: <= 0.05 m forward and <= 0.4 s turns at low speed.
+  - Always call tbot_motion_stop() before returning confirmed/failed.
+
 
   ## Planning patterns
 
   Reference these patterns by name in your plans. Do not reconstruct them
   from scratch - use the composite tools or call the primitive tools in the
   exact order described.
-  Use tbot_vision_find_object as the primary object finder.
-  It always checks the current frame first, then scans if needed.
+  Before calling tbot_vision_find_object, first call tbot_vision_get_object_bbox
+  for the same target in the current frame.
+  If bbox reports visible=True, lock target immediately and skip find-object scan.
+  Use tbot_vision_find_object only when the object is not already present in frame.
   Use tbot_navigate_to_object only after the object is visible in frame.
   If stop_distance is omitted, tbot_navigate_to_object defaults to 0.20 m (20 cm).
   Use explicit stop_distance when requested by the task (example: soccer ball at 0.50 m).
@@ -63,12 +75,13 @@ instruction_template: |
   execute tbot_navigate_to_object once, then call tbot_motion_stop and end that action cycle.
 
   ### Object lock discipline
+  - If tbot_vision_get_object_bbox reports target visible, lock target and skip find-object scan.
   - If tbot_vision_find_object reports the target is visible, lock the target.
   - After lock, recenter only if needed, then plan movement toward the target.
   - Do not run another search sweep after lock.
   - Rescan ONLY IF the object is not present in frame.
   - If the object is present but off-center, recenter using the bounding box and continue approach.
-  - If tbot_navigate_to_object returns target_lost after motion, call tbot_vision_find_object again before another navigation attempt.
+  - If tbot_navigate_to_object returns target_lost after motion, call tbot_vision_get_object_bbox first; call tbot_vision_find_object only if bbox still reports not visible.
 
   ### Directional cue bootstrap
   - If a task includes directional language like "on the left" or "on the right" for the target:
@@ -88,28 +101,36 @@ instruction_template: |
   This is the preferred pattern for tasks that say "find X", "go to X",
   "stop in front of X", or "position near X".
 
-    1. finder = tbot_vision_find_object(
+    1. bbox = tbot_vision_get_object_bbox(
+           object_name="<object>",
+           attributes=["<optional>"]
+       )
+       -> If bbox.visible=True, lock target and skip active scan.
+
+    2. If bbox.visible is not True:
+       finder = tbot_vision_find_object(
            object_name="<object>",
            attributes=["<optional>"]
        )
        -> finder must return visible=True before any navigation.
 
-    2. nav = tbot_navigate_to_object(
+    3. nav = tbot_navigate_to_object(
            target="<object>",
            qualifier="<optional>",
            stop_distance=<optional meters; omit to use default 0.20>,
            confirm_in_frame=True   <- always True when task requires visual QA
        )
 
-    3. Arrival condition:
+    4. Arrival condition:
        - Primary: reached when distance <= stop_distance and object_in_frame=True.
        - Close-range fallback: if object was recently locked and front LiDAR <= stop_distance,
          treat as reached even if the object drops out of frame because it is too close.
        - Immediately call tbot_motion_stop() when reached.
 
-    4. After each move, verify with tbot_vision_describe_scene():
-       - If visible: call tbot_vision_get_object_bbox and recenter if off-center.
-       - If not visible: treat as target_lost and reacquire with tbot_vision_find_object.
+    5. After each move, verify with tbot_vision_describe_scene():
+       - Call tbot_vision_get_object_bbox for the target.
+       - If bbox.visible=True: recenter if off-center.
+       - If bbox.visible is not True: treat as target_lost and reacquire with tbot_vision_find_object.
        If nav.stopped_reason == "target_lost":
        -> Repeat Step 1 (find again) then Step 2 (navigate again).
        -> Continue until reached_target or retry limit.
@@ -126,10 +147,11 @@ instruction_template: |
   ### PATTERN: OBJECT_STATE_CHECK <object>
   Use for tasks like "Go to the door and check if it is fully open."
 
-    1. tbot_vision_find_object(object_name="<object>")
+    1. tbot_vision_get_object_bbox(object_name="<object>")
+       - If not visible, call tbot_vision_find_object(object_name="<object>")
     2. tbot_navigate_to_object(target="<object>", confirm_in_frame=True)
        - If blocked, run OBSTACLE_BYPASS and then retry navigation.
-       - If object goes out of frame mid-task, reacquire with tbot_vision_find_object and retry.
+       - If object goes out of frame mid-task, check bbox first; if still not visible, reacquire with tbot_vision_find_object and retry.
     3. End with tbot_vision_describe_scene() and classify final state.
        - For door: fully open / partially open / closed.
 
@@ -216,12 +238,14 @@ instruction_template: |
   the wall landmark destination.
 
     1. Find the destination landmark first
-       a. tbot_vision_find_object(object_name="<destination>")
-       b. If not found, run a turn-search loop with fixed 15 deg steps:
+       a. tbot_vision_get_object_bbox(object_name="<destination>")
+       b. If not visible, call tbot_vision_find_object(object_name="<destination>")
+       c. If still not found, run a turn-search loop with fixed 15 deg steps:
           - tbot_motion_turn(...15 deg...)
-          - tbot_vision_find_object(object_name="<destination>")
+          - tbot_vision_get_object_bbox(object_name="<destination>")
+          - If not visible, tbot_vision_find_object(object_name="<destination>")
           - Repeat up to 24 steps (full 360 deg sweep)
-       c. If still not found after full sweep: stop and abort (no forward motion)
+       d. If still not found after full sweep: stop and abort (no forward motion)
 
     2. Find and confirm wall geometry with LiDAR
        a. tbot_lidar_get_wall_profile()
@@ -233,9 +257,10 @@ instruction_template: |
        <- LiDAR PRIMARY: do not use vision to confirm wall presence
 
     4. Reorient to destination landmark again
-       a. tbot_vision_find_object(object_name="<destination>")
-       b. If not found, repeat fixed 15 deg turn-search steps until found
-       c. If still not found after full sweep: stop and abort (no forward motion)
+       a. tbot_vision_get_object_bbox(object_name="<destination>")
+       b. If not visible, call tbot_vision_find_object(object_name="<destination>")
+       c. If still not found, repeat fixed 15 deg turn-search steps until found
+       d. If still not found after full sweep: stop and abort (no forward motion)
 
     5. Approach destination while verifying wall proximity with LiDAR
        Loop:
@@ -243,8 +268,9 @@ instruction_template: |
        b. tbot_lidar_get_obstacle_distances(sector=wall_sector)
           -> If distance deviates > 0.08 m from initial_wall_distance:
              micro-correct with tbot_motion_turn(+/-3 deg)
-       c. tbot_vision_find_object(object_name="<destination>")
-          -> If destination is not visible, return to Step 4 search loop (no forward motion)
+       c. tbot_vision_get_object_bbox(object_name="<destination>")
+          -> If destination is not visible, call tbot_vision_find_object(object_name="<destination>")
+          -> If still not visible, return to Step 4 search loop (no forward motion)
        d. tbot_motion_move_forward_distance(0.2)
        e. Continue until near destination
 
@@ -257,14 +283,15 @@ instruction_template: |
   Use for "avoid cables", "scan floor for objects", "check under desk".
 
     1. tbot_vision_inspect_floor()
-       -> Categorize findings: cables / spills / objects / clear
-    2. If the task asks to confirm "no spills" on the floor:
-       - Perform a full 360 deg spill sweep before concluding clear.
+       -> Categorize findings: hazards / objects / clear
+    2. If the task asks to confirm a specific floor hazard is absent or present:
+       - Extract the hazard label from the task (for example: "cable", "liquid", "debris", "feet_legs").
+       - Perform a full 360 deg hazard sweep before concluding clear/present.
        - Use fixed 15 deg turn steps for 24 steps total:
          a. tbot_motion_turn(...15 deg...)
-         b. tbot_vision_inspect_floor(targets=["spill"], region="lower_half")
-       - Report "no spills detected" only if all 24 checks report no spill.
-       - If any step reports a spill, report spill detected and include relative direction.
+         b. tbot_vision_inspect_floor(targets=["<hazard_from_task>"], region="lower_half")
+       - Report hazard-clear only if all 24 checks report no matching hazard.
+       - If any step reports the hazard, include relative direction.
     3. If hazard found:
        -> Apply OBSTACLE_BYPASS using hazard bounding box as obstacle width
     4. tbot_vision_describe_scene() at end for visual QA
@@ -297,15 +324,70 @@ instruction_template: |
 
   ---
 
-  ### PATTERN: UNDER_OBJECT_CHECK <object>
+  ### PATTERN: POSITION_UNDER_OBJECT <object>
   Use for:
   - "Position yourself under the chair."
-  - "Check under the desk for any fallen objects."
+  - "Move under the desk."
 
-    1. Verify current state via tbot_vision_describe_scene().
-    2. If not under target object, find target object and approach using FIND_AND_APPROACH.
-    3. Run tbot_vision_inspect_floor(targets=["fallen_objects"], region="lower_half", near_object="<object>").
-    4. End with VISUAL_QA confirmation.
+    1. Detection and target pose lock
+       a. tbot_vision_get_object_bbox(object_name="<object>")
+       b. If not visible, call tbot_vision_find_object(object_name="<object>")
+       c. If still not visible after scan:
+          - tbot_motion_stop()
+          - Return {{"status": "failed", "reason": "object_not_found", "attempts": 0}}
+       d. pose = tbot_estimate_object_pose(target="<object>")
+       e. If pose.success is not True:
+          - tbot_motion_stop()
+          - Return {{"status": "failed", "reason": "object_not_found" if pose.error == "target_not_found" else "pose_estimation_failed", "attempts": 0}}
+       f. Store pose.x/pose.y as the under-object target coordinate. Do not re-derive it from vision later.
+
+    2. Navigate to target coordinate (odom-driven)
+       a. nav = tbot_nav_go_to_pose(target_x_m=pose.x, target_y_m=pose.y)
+       b. If nav.status == "collision_blocked":
+          - tbot_motion_bypass_obstacle(preferred_side="auto")
+          - Retry tbot_nav_go_to_pose once
+       c. If final nav.status != "reached":
+          - tbot_motion_stop()
+          - Return {{"status": "failed", "reason": nav.status, "attempts": 0}}
+
+    3. LiDAR containment verification loop (max 3 corrections)
+       a. lidar = tbot_lidar_get_obstacle_distances(sector="all")
+          -> d_front = lidar.distances.front, d_left = lidar.distances.left, d_right = lidar.distances.right
+       b. Select containment threshold:
+          - "<object>" contains "chair" -> threshold = 0.30
+          - "<object>" contains "desk"/"table"/"bench" -> threshold = 0.55
+          - otherwise threshold = 0.45
+       c. contained = (d_front < threshold and d_left < threshold and d_right < threshold)
+       d. If contained:
+          - Optional: tbot_lidar_export_free_space_map(radius_m=0.5, resolution_m=0.1, samples=1)
+          - tbot_motion_stop()
+          - Return {{"status": "confirmed", "reason": "lidar_containment" or "lidar_containment + map", "attempts": <correction_attempts_used>}}
+       e. If not contained:
+          - Determine open side = argmax(d_front, d_left, d_right)
+          - Small correction only:
+            * open side == front: call tbot_lidar_check_collision(); move forward 0.05 m if clear, 0.03 m if caution
+            * open side == left:  tbot_motion_turn(direction="left", speed=0.05, duration_seconds=0.4)
+            * open side == right: tbot_motion_turn(direction="right", speed=0.05, duration_seconds=0.4)
+          - If only 2 of 3 sectors are below threshold, nudge toward the blocked pair with a small forward correction.
+       f. Retry Step 3 up to 3 total corrections.
+       g. If still not contained after 3 corrections:
+          - tbot_motion_stop()
+          - Return {{"status": "failed", "reason": "containment_check_failed", "attempts": 3}}
+
+    4. Return contract for this pattern:
+       {{"status": "confirmed" | "failed", "reason": str, "attempts": int}}
+
+  ---
+
+  ### PATTERN: UNDER_OBJECT_CHECK <object>
+  Use for:
+  - "Check under the desk for any fallen objects."
+  - "Check under the chair for any fallen objects."
+
+    1. First execute POSITION_UNDER_OBJECT for "<object>".
+    2. If POSITION_UNDER_OBJECT failed, return that failure result directly.
+    3. If confirmed, run tbot_vision_inspect_floor(targets=["fallen_objects"], region="lower_half", near_object="<object>").
+    4. Return combined result including under-object status + floor findings.
 
   ---
 
@@ -328,7 +410,8 @@ instruction_template: |
   - Two-object midpoint tasks (chairs, trashcan + soccer ball): MIDPOINT_NAVIGATE
   - Free-space mapping: FREE_SPACE_MAP
   - Glass-door-path obstacle ID and misplaced floor object scan: VISUAL_QA_ONLY
-  - Under-chair / under-desk checks: UNDER_OBJECT_CHECK
+  - Under-chair positioning: POSITION_UNDER_OBJECT
+  - Under-desk / under-chair fallen-object checks: UNDER_OBJECT_CHECK
 
   ---
 
@@ -340,7 +423,7 @@ instruction_template: |
   Assert the expected condition in your reasoning:
     - Door task     -> confirm "door is fully open / partially open / closed"
     - Object task   -> confirm object identity and any qualifiers
-    - Under-desk    -> confirm "robot is beneath the desk surface"
+    - Under-object  -> report LiDAR containment result (front/left/right vs threshold)
     - Floor scan    -> list any objects that should not be present
 
   ## File Operations Policy

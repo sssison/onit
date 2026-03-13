@@ -107,14 +107,17 @@ class TestAssistantInstruction:
         assert "You are a TurtleBot robot agent. Complete the following task:" in result
         assert "## Sensor priority rules" in result
         assert "PATTERN: FIND_AND_APPROACH <object>" in result
-        assert "Use tbot_vision_find_object as the primary object finder." in result
-        assert "It always checks the current frame first, then scans if needed." in result
+        assert "Before calling tbot_vision_find_object, first call tbot_vision_get_object_bbox" in result
+        assert "Use tbot_vision_find_object only when the object is not already present in frame." in result
         assert "If tbot_vision_find_object reports the target is visible, lock the target." in result
         assert "Do not run another search sweep after lock." in result
         assert "Rescan ONLY IF the object is not present in frame." in result
         assert "If the object is present but off-center, recenter using the bounding box and continue approach." in result
         assert "tbot_vision_get_object_bbox" in result
         assert "If nav.stopped_reason == \"target_lost\":" in result
+        assert "### Under-object containment - LiDAR only" in result
+        assert "PATTERN: POSITION_UNDER_OBJECT <object>" in result
+        assert "Under-chair positioning: POSITION_UNDER_OBJECT" in result
         assert "Call tools only when the result changes the next action." in result
         assert "v3_instruction_template" not in result
         assert "(V3)" not in result
