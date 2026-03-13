@@ -105,6 +105,7 @@ class TestAssistantInstruction:
         )
 
         assert "You are a TurtleBot robot agent. Complete the following task:" in result
-        assert "standoff_m = 0.20" in result
+        assert "## Sensor priority rules" in result
+        assert "PATTERN: FIND_AND_APPROACH <object>" in result
         assert "v3_instruction_template" not in result
         assert "(V3)" not in result

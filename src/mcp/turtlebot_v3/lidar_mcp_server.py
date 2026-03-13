@@ -490,30 +490,6 @@ async def _get_one_scan(timeout_s: float = SCAN_TIMEOUT_S) -> dict[str, Any]:
 
 
 @mcp_lidar_v3.tool()
-async def tbot_lidar_health(timeout_s: float = SCAN_TIMEOUT_S) -> dict[str, Any]:
-    """Check LiDAR availability and report basic scan metadata."""
-    try:
-        scan = await _get_one_scan(timeout_s=timeout_s)
-    except Exception as e:
-        return {
-            "status": "offline",
-            "scan_present": False,
-            "num_points": 0,
-            "topic": LIDAR_TOPIC,
-            "error": str(e),
-        }
-
-    return {
-        "status": "online",
-        "scan_present": True,
-        "num_points": len(scan.get("ranges", [])),
-        "topic": scan.get("topic", LIDAR_TOPIC),
-        "frame_id": scan.get("frame_id"),
-        "scan_age_s": scan.get("age_s"),
-    }
-
-
-@mcp_lidar_v3.tool()
 async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, Any]:
     """
     Return the distance to the nearest obstacle in a named sector.
@@ -564,34 +540,6 @@ async def tbot_lidar_get_obstacle_distances(sector: str = "all") -> dict[str, An
         "sector": sector_clean,
         "distance_m": distances.get(sector_clean),
         "distances": distances,
-    }
-
-
-@mcp_lidar_v3.tool()
-async def tbot_lidar_is_path_clear(
-    threshold_m: float = 0.3,
-) -> dict[str, Any]:
-    """Return whether the forward sector has at least threshold_m clearance."""
-    threshold_f = _ensure_non_negative("threshold_m", threshold_m)
-    try:
-        scan = await _get_one_scan()
-    except Exception as e:
-        return {
-            "clear": False,
-            "min_forward_distance": None,
-            "threshold_m": threshold_f,
-            "status": "no_scan",
-            "error": str(e),
-        }
-
-    stats = _compute_sector_stats(scan, center_deg=0.0, half_width_deg=20.0)
-    front_min = float(stats["min_m"]) if stats["status"] == "ok" and stats["min_m"] is not None else None
-    clear = front_min is not None and front_min >= threshold_f
-    return {
-        "clear": clear,
-        "min_forward_distance": front_min,
-        "threshold_m": threshold_f,
-        "status": "ok" if front_min is not None else "no_data",
     }
 
 

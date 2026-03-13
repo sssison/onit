@@ -5,23 +5,31 @@ from pathlib import Path
 import yaml
 
 
-def test_turtlebot_prompt_includes_bbox_reorient_and_cautious_branch():
+def _load_instruction() -> str:
     template_path = Path(__file__).resolve().parents[1] / "mcp" / "prompts" / "prompt_templates" / "assistant_turtlebot.yaml"
     payload = yaml.safe_load(template_path.read_text())
-    instruction = payload["instruction_template"]
-
-    assert "tbot_vision_scan_for_object" in instruction
-    assert "bbox" in instruction
-    assert "Approach with Standoff" in instruction
-    assert "standoff_m = 0.20" in instruction
+    return payload["instruction_template"]
 
 
-def test_turtlebot_prompt_uses_single_instruction_template_with_default_standoff():
-    template_path = Path(__file__).resolve().parents[1] / "mcp" / "prompts" / "prompt_templates" / "assistant_turtlebot.yaml"
-    payload = yaml.safe_load(template_path.read_text())
-    instruction = payload["instruction_template"]
+def test_turtlebot_prompt_includes_sensor_priority_and_collision_guard():
+    instruction = _load_instruction()
 
-    assert "v3_instruction_template" not in payload
-    assert "You are a TurtleBot robot agent. Complete the following task:" in instruction
-    assert "standoff_m = 0.20" in instruction
-    assert "(V3)" not in instruction
+    assert "## Sensor priority rules" in instruction
+    assert "Wall navigation - LiDAR is primary, vision is secondary" in instruction
+    assert "### Collision guard - always active" in instruction
+    assert "Before every tbot_motion_* call" in instruction
+
+
+def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools():
+    instruction = _load_instruction()
+
+    assert "PATTERN: FIND_AND_APPROACH <object>" in instruction
+    assert "tbot_navigate_to_object(" in instruction
+    assert "tbot_estimate_object_pose(" in instruction
+
+    assert "tbot_vision_health" not in instruction
+    assert "tbot_lidar_health" not in instruction
+    assert "tbot_motion_move_timed" not in instruction
+    assert "tbot_lidar_is_path_clear" not in instruction
+    assert "tbot_vision_scan_for_object" not in instruction
+    assert "tbot_vision_search_and_approach_object" not in instruction

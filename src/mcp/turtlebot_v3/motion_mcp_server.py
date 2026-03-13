@@ -314,44 +314,6 @@ async def tbot_motion_move_forward_distance(
 
 
 @mcp_motion_v3.tool()
-async def tbot_motion_move_timed(
-    linear: float,
-    angular: float,
-    duration_s: float,
-) -> dict[str, Any]:
-    """
-    Send a linear+angular velocity command for a fixed duration, then stop.
-    No LiDAR collision guarding. Intended for pure rotation, lateral correction,
-    and short combined ticks (e.g., 0.2 s line-following steps where the caller
-    already checks LiDAR before each tick).
-    For planned forward travel use tbot_motion_move_forward_distance.
-    """
-    linear_f = _validate_finite("linear", linear)
-    angular_f = _validate_finite("angular", angular)
-    duration_f = _validate_finite("duration_s", duration_s)
-    if duration_f <= 0:
-        raise ValueError("duration_s must be > 0")
-
-    linear_cmd = _clamp(linear_f, MAX_LINEAR)
-    angular_cmd = _clamp(angular_f, MAX_ANGULAR)
-
-    preempted_stream = await _set_continuous_motion(None)
-    move_result, posts = await _post_move_for_duration(linear_cmd, angular_cmd, duration_f)
-    stop_result = await _post_json(STOP_PATH)
-    return {
-        **stop_result,
-        "status": "completed",
-        "linear_cmd": linear_cmd,
-        "angular_cmd": angular_cmd,
-        "duration_s": duration_f,
-        "move_posts": posts,
-        "command_refresh_s": MOTION_COMMAND_REFRESH_S,
-        "move_result": move_result,
-        "preempted_continuous_stream": preempted_stream,
-    }
-
-
-@mcp_motion_v3.tool()
 async def tbot_motion_turn(
     direction: str,
     speed: float,
@@ -379,8 +341,8 @@ async def tbot_motion_turn(
             "Pass a non-zero speed within the allowed range."
         )
 
-    # Keep turn(direction=...) aligned with signed angular convention used by
-    # tbot_motion_move_timed on this robot (+angular = left/CCW, -angular = right/CW).
+    # Keep turn(direction=...) aligned with the robot angular convention
+    # (+angular = left/CCW, -angular = right/CW).
     # MOTION_ANGULAR_SIGN remains the hardware/frame adapter.
     input_frame_sign = 1.0 if direction_clean == "right" else -1.0
     angular_cmd = input_frame_sign * clamped_speed * ANGULAR_SIGN

@@ -94,33 +94,6 @@ def test_percentiles_single_value():
 # --- Tool unit tests (mocking _get_one_scan) ---
 
 
-def test_lidar_health_online():
-    scan = _make_scan()
-    scan["ranges"][_index_from_deg(scan, 0.0)] = 1.5
-
-    async def fake_get_scan(timeout_s=3.0):
-        return scan
-
-    with patch.object(lidar_v3, "_get_one_scan", side_effect=fake_get_scan):
-        result = asyncio.run(lidar_v3.tbot_lidar_health())
-
-    assert result["status"] == "online"
-    assert result["scan_present"] is True
-    assert result["num_points"] == 181
-
-
-def test_lidar_health_offline_on_error():
-    async def fake_get_scan(timeout_s=3.0):
-        raise RuntimeError("No scan received within 3s")
-
-    with patch.object(lidar_v3, "_get_one_scan", side_effect=fake_get_scan):
-        result = asyncio.run(lidar_v3.tbot_lidar_health())
-
-    assert result["status"] == "offline"
-    assert result["scan_present"] is False
-    assert "error" in result
-
-
 def test_lidar_get_obstacle_distances_front():
     scan = _make_scan()
     scan["ranges"][_index_from_deg(scan, 0.0)] = 1.2
@@ -157,34 +130,6 @@ def test_lidar_get_obstacle_distances_all_returns_minimum():
 def test_lidar_get_obstacle_distances_invalid_sector():
     with pytest.raises(ValueError, match="sector must be one of"):
         asyncio.run(lidar_v3.tbot_lidar_get_obstacle_distances(sector="diagonal"))
-
-
-def test_lidar_is_path_clear_true():
-    scan = _make_scan()
-    scan["ranges"][_index_from_deg(scan, 0.0)] = 2.0
-
-    async def fake_get_scan(timeout_s=3.0):
-        return scan
-
-    with patch.object(lidar_v3, "_get_one_scan", side_effect=fake_get_scan):
-        result = asyncio.run(lidar_v3.tbot_lidar_is_path_clear(threshold_m=0.5))
-
-    assert result["clear"] is True
-    assert result["min_forward_distance"] == pytest.approx(2.0)
-
-
-def test_lidar_is_path_clear_false_when_obstacle_close():
-    scan = _make_scan()
-    scan["ranges"][_index_from_deg(scan, 0.0)] = 0.2
-
-    async def fake_get_scan(timeout_s=3.0):
-        return scan
-
-    with patch.object(lidar_v3, "_get_one_scan", side_effect=fake_get_scan):
-        result = asyncio.run(lidar_v3.tbot_lidar_is_path_clear(threshold_m=0.5))
-
-    assert result["clear"] is False
-    assert result["min_forward_distance"] == pytest.approx(0.2)
 
 
 def test_lidar_check_collision_stop():

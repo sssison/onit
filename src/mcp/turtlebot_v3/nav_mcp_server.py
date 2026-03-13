@@ -54,12 +54,23 @@ ODOM_NODE_NAME_PREFIX = os.getenv("ODOM_NODE_NAME_PREFIX", "tbot_nav_v3_odom")
 
 MOTION_MCP_URL_V3 = os.getenv("TBOT_MOTION_MCP_URL_V3", "http://127.0.0.1:18210/turtlebot-motion-v3")
 LIDAR_MCP_URL_V3 = os.getenv("TBOT_LIDAR_MCP_URL_V3", "http://127.0.0.1:18212/turtlebot-lidar-v3")
+VISION_MCP_URL_V3 = os.getenv("TBOT_VISION_MCP_URL_V3", "http://127.0.0.1:18211/turtlebot-vision-v3")
 
-NAV_CONTROL_TICK_S = max(0.05, _env_float("NAV_CONTROL_TICK_S", 0.2))
 NAV_HEADING_KP = _env_float("NAV_HEADING_KP", 1.8)
 NAV_FINAL_YAW_KP = _env_float("NAV_FINAL_YAW_KP", 2.0)
 NAV_FRONT_THRESHOLD_M = max(0.05, _env_float("NAV_FRONT_THRESHOLD_M", 0.1))
 NAV_MAX_CONSECUTIVE_ODOM_FAILURES = max(1, int(_env_float("NAV_MAX_CONSECUTIVE_ODOM_FAILURES", 2.0)))
+NAV_FORWARD_STEP_M = max(0.03, _env_float("NAV_FORWARD_STEP_M", 0.12))
+NAV_TURN_STEP_DEG = max(1.0, _env_float("NAV_TURN_STEP_DEG", 12.0))
+NAV_HEADING_ALIGN_DEG = max(5.0, _env_float("NAV_HEADING_ALIGN_DEG", 15.0))
+TBOT_CAMERA_FOV_DEG = _env_float("TBOT_CAMERA_FOV_DEG", 62.0)
+NAV_OBJECT_SWEEP_STEP_DEG = max(5.0, _env_float("NAV_OBJECT_SWEEP_STEP_DEG", 45.0))
+NAV_OBJECT_SWEEP_MAX_STEPS = max(1, int(_env_float("NAV_OBJECT_SWEEP_MAX_STEPS", 8.0)))
+NAV_OBJECT_REACQUIRE_ATTEMPTS = max(1, int(_env_float("NAV_OBJECT_REACQUIRE_ATTEMPTS", 3.0)))
+NAV_OBJECT_APPROACH_STEP_M = max(0.05, _env_float("NAV_OBJECT_APPROACH_STEP_M", 0.25))
+NAV_OBJECT_MOVE_SPEED_MPS = max(0.03, _env_float("NAV_OBJECT_MOVE_SPEED_MPS", 0.10))
+NAV_OBJECT_TURN_SPEED_RPS = max(0.05, _env_float("NAV_OBJECT_TURN_SPEED_RPS", 0.30))
+NAV_OBJECT_MAX_APPROACH_STEPS = max(1, int(_env_float("NAV_OBJECT_MAX_APPROACH_STEPS", 80.0)))
 
 _rclpy_init_lock = threading.Lock()
 
@@ -214,6 +225,129 @@ async def _safe_motion_stop(motion: Client) -> None:
         await motion.call_tool("tbot_motion_stop", {})
     except Exception:
         pass
+
+
+def _extract_front_distance(collision: dict[str, Any]) -> float | None:
+    front_distance = collision.get("min_forward_distance_m")
+    if isinstance(front_distance, (int, float)) and math.isfinite(float(front_distance)):
+        return float(front_distance)
+    distances = collision.get("distances")
+    if isinstance(distances, dict):
+        front = distances.get("front")
+        if isinstance(front, (int, float)) and math.isfinite(float(front)):
+            return float(front)
+    return None
+
+
+def _qualifier_to_attributes(qualifier: str | None) -> list[str] | None:
+    if isinstance(qualifier, str):
+        cleaned = qualifier.strip()
+        if cleaned:
+            return [cleaned]
+    return None
+
+
+def _heading_offset_from_bbox_deg(bbox: Any, camera_fov_deg: float = TBOT_CAMERA_FOV_DEG) -> float | None:
+    if not isinstance(bbox, dict):
+        return None
+    cx = bbox.get("cx")
+    if not isinstance(cx, (int, float)) or not math.isfinite(float(cx)):
+        return None
+    cx_f = max(0.0, min(1.0, float(cx)))
+    return (cx_f - 0.5) * float(camera_fov_deg)
+
+
+def _heuristic_distance_from_bbox_m(bbox: Any) -> float | None:
+    if not isinstance(bbox, dict):
+        return None
+    h = bbox.get("h")
+    if not isinstance(h, (int, float)) or not math.isfinite(float(h)):
+        return None
+    h_f = max(0.01, min(1.0, float(h)))
+    # Coarse fallback when LiDAR is unavailable: larger bbox height implies a nearer object.
+    return max(0.2, min(3.0, 0.9 / h_f))
+
+
+async def _turn_by_degrees(motion: Client, turn_deg: float, speed_rps: float) -> None:
+    if abs(turn_deg) < 0.5:
+        return
+    direction = "left" if turn_deg >= 0 else "right"
+    duration_s = math.radians(abs(turn_deg)) / max(abs(speed_rps), 0.01)
+    await motion.call_tool(
+        "tbot_motion_turn",
+        {
+            "direction": direction,
+            "speed": max(abs(speed_rps), 0.05),
+            "duration_seconds": duration_s,
+        },
+    )
+
+
+async def _call_lidar_collision(lidar: Client) -> dict[str, Any]:
+    raw = await lidar.call_tool(
+        "tbot_lidar_check_collision",
+        {"front_threshold_m": NAV_FRONT_THRESHOLD_M},
+    )
+    return _extract_tool_result_dict(raw)
+
+
+async def _guard_motion_and_get_scale(
+    lidar: Client,
+    motion: Client,
+) -> tuple[str, float, dict[str, Any]]:
+    try:
+        collision = await _call_lidar_collision(lidar)
+    except Exception as e:
+        collision = {"risk_level": "stop", "error": str(e)}
+
+    risk_level = str(collision.get("risk_level", "unknown"))
+    if risk_level in ("stop", "unknown"):
+        await _safe_motion_stop(motion)
+        return "stop", 0.0, collision
+    if risk_level == "caution":
+        return "caution", 0.5, collision
+    return "clear", 1.0, collision
+
+
+async def _vision_find_target(
+    vision: Client,
+    target: str,
+    qualifier: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"object_name": target}
+    attrs = _qualifier_to_attributes(qualifier)
+    if attrs:
+        payload["attributes"] = attrs
+    raw = await vision.call_tool("tbot_vision_find_object", payload)
+    return _extract_tool_result_dict(raw)
+
+
+async def _attempt_reacquire_target(
+    vision: Client,
+    motion: Client,
+    lidar: Client,
+    target: str,
+    qualifier: str | None,
+) -> dict[str, Any] | None:
+    risk_level, scale, _ = await _guard_motion_and_get_scale(lidar, motion)
+    if risk_level == "stop":
+        return None
+    step_deg = NAV_OBJECT_SWEEP_STEP_DEG * scale
+    step_deg = max(10.0, step_deg)
+
+    # Scan left (+step), then right (-2*step), then return to center (+step) if still not found.
+    await _turn_by_degrees(motion, step_deg, NAV_OBJECT_TURN_SPEED_RPS)
+    left_view = await _vision_find_target(vision, target, qualifier)
+    if bool(left_view.get("visible")):
+        return left_view
+
+    await _turn_by_degrees(motion, -(2.0 * step_deg), NAV_OBJECT_TURN_SPEED_RPS)
+    right_view = await _vision_find_target(vision, target, qualifier)
+    if bool(right_view.get("visible")):
+        return right_view
+
+    await _turn_by_degrees(motion, step_deg, NAV_OBJECT_TURN_SPEED_RPS)
+    return None
 
 
 @mcp_nav_v3.tool()
@@ -373,15 +507,13 @@ async def tbot_nav_go_to_pose(
                     )
                     collision = _extract_tool_result_dict(collision_raw)
                     risk_level = collision.get("risk_level", "unknown")
-                    front_distance = collision.get("min_forward_distance_m")
-                    if not isinstance(front_distance, (int, float)):
-                        front_distance = (collision.get("distances") or {}).get("front")
+                    front_distance = _extract_front_distance(collision)
                 except Exception as e:
                     risk_level = "stop"
                     front_distance = None
                     collision = {"error": str(e)}
 
-                if risk_level == "stop" and not reached_pos:
+                if risk_level in ("stop", "unknown") and not reached_pos:
                     await _safe_motion_stop(motion)
                     return {
                         "status": "collision_blocked",
@@ -395,25 +527,40 @@ async def tbot_nav_go_to_pose(
                         "collision": collision,
                     }
 
-                linear_cmd = min(max_linear, max(0.03, distance))
-                if reached_pos:
-                    linear_cmd = 0.0
-
-                if abs(heading_error) > math.radians(50.0):
-                    linear_cmd = 0.0
-                elif abs(heading_error) > math.radians(25.0):
-                    linear_cmd *= 0.4
-
-                if reached_pos and yaw_target is not None:
-                    angular_cmd = _clamp(NAV_FINAL_YAW_KP * yaw_error, max_angular)
-                else:
-                    angular_cmd = _clamp(NAV_HEADING_KP * heading_error, max_angular)
-
+                caution_scale = 0.5 if risk_level == "caution" else 1.0
                 try:
-                    await motion.call_tool(
-                        "tbot_motion_move_timed",
-                        {"linear": linear_cmd, "angular": angular_cmd, "duration_s": NAV_CONTROL_TICK_S},
-                    )
+                    if reached_pos and yaw_target is not None:
+                        turn_error = yaw_error
+                    else:
+                        turn_error = heading_error
+
+                    if abs(turn_error) > math.radians(NAV_HEADING_ALIGN_DEG):
+                        base_turn_step_deg = min(
+                            NAV_TURN_STEP_DEG,
+                            math.degrees(abs(turn_error)),
+                        )
+                        turn_step_deg = max(1.0, base_turn_step_deg * caution_scale)
+                        if reached_pos and yaw_target is not None:
+                            turn_speed = abs(_clamp(NAV_FINAL_YAW_KP * turn_error, max_angular))
+                        else:
+                            turn_speed = abs(_clamp(NAV_HEADING_KP * turn_error, max_angular))
+                        await _turn_by_degrees(
+                            motion=motion,
+                            turn_deg=math.copysign(turn_step_deg, turn_error),
+                            speed_rps=max(0.2, turn_speed),
+                        )
+                    else:
+                        step_distance = min(distance, NAV_FORWARD_STEP_M, max_linear)
+                        step_distance = max(0.0, step_distance * caution_scale)
+                        if step_distance <= 0.0:
+                            await asyncio.sleep(0.05)
+                            continue
+                        step_speed = min(max_linear, max(0.03, distance))
+                        step_speed = max(0.03, step_speed * caution_scale)
+                        await motion.call_tool(
+                            "tbot_motion_move_forward_distance",
+                            {"distance_m": step_distance, "speed": step_speed},
+                        )
                 except Exception as e:
                     await _safe_motion_stop(motion)
                     return {
@@ -428,6 +575,291 @@ async def tbot_nav_go_to_pose(
                     }
 
                 steps += 1
+
+
+@mcp_nav_v3.tool()
+async def tbot_estimate_object_pose(
+    target: str,
+    qualifier: str | None = None,
+) -> dict[str, Any]:
+    """
+    Estimate an object's position in odometry frame using vision heading + LiDAR distance.
+    """
+    target_clean = target.strip() if isinstance(target, str) else ""
+    if not target_clean:
+        raise ValueError("target must be a non-empty string")
+
+    async with Client(VISION_MCP_URL_V3) as vision:
+        find = await _vision_find_target(vision, target_clean, qualifier)
+
+    if not bool(find.get("visible")):
+        return {
+            "success": False,
+            "x": None,
+            "y": None,
+            "heading_deg": None,
+            "distance_m": None,
+            "confidence": "low",
+            "error": "target_not_found",
+        }
+
+    bbox = find.get("bbox")
+    heading_offset_deg = _heading_offset_from_bbox_deg(bbox, TBOT_CAMERA_FOV_DEG)
+    if heading_offset_deg is None:
+        position = str(find.get("position", "")).lower()
+        if position == "left":
+            heading_offset_deg = -TBOT_CAMERA_FOV_DEG / 4.0
+        elif position == "right":
+            heading_offset_deg = TBOT_CAMERA_FOV_DEG / 4.0
+        else:
+            heading_offset_deg = 0.0
+
+    lidar_distance_m: float | None = None
+    confidence = "low"
+    lidar_raw: dict[str, Any] = {}
+    try:
+        async with Client(LIDAR_MCP_URL_V3) as lidar:
+            lidar_resp = await lidar.call_tool(
+                "tbot_lidar_get_distance_at_angle",
+                {"angle_deg": heading_offset_deg},
+            )
+            lidar_raw = _extract_tool_result_dict(lidar_resp)
+        lidar_value = lidar_raw.get("distance_m")
+        if isinstance(lidar_value, (int, float)) and math.isfinite(float(lidar_value)):
+            lidar_distance_m = float(lidar_value)
+            valid_count = lidar_raw.get("valid_count")
+            confidence = "high" if isinstance(valid_count, int) and valid_count >= 3 else "medium"
+    except Exception as e:
+        lidar_raw = {"error": str(e)}
+
+    if lidar_distance_m is None:
+        lidar_distance_m = _heuristic_distance_from_bbox_m(bbox)
+        confidence = "low"
+
+    if lidar_distance_m is None:
+        return {
+            "success": False,
+            "x": None,
+            "y": None,
+            "heading_deg": None,
+            "distance_m": None,
+            "confidence": "low",
+            "error": "distance_unavailable",
+        }
+
+    pose = await tbot_nav_get_pose()
+    if pose.get("status") != "ok":
+        return {
+            "success": False,
+            "x": None,
+            "y": None,
+            "heading_deg": None,
+            "distance_m": lidar_distance_m,
+            "confidence": confidence,
+            "error": pose.get("error", "no_odom"),
+            "lidar": lidar_raw,
+        }
+
+    robot_x = float(pose["x_m"])
+    robot_y = float(pose["y_m"])
+    robot_heading_deg = math.degrees(float(pose["yaw_rad"]))
+    object_heading_deg = robot_heading_deg + heading_offset_deg
+    object_heading_rad = math.radians(object_heading_deg)
+    object_x = robot_x + (lidar_distance_m * math.cos(object_heading_rad))
+    object_y = robot_y + (lidar_distance_m * math.sin(object_heading_rad))
+
+    return {
+        "success": True,
+        "x": object_x,
+        "y": object_y,
+        "heading_deg": object_heading_deg,
+        "distance_m": lidar_distance_m,
+        "confidence": confidence,
+        "lidar": lidar_raw,
+    }
+
+
+@mcp_nav_v3.tool()
+async def tbot_navigate_to_object(
+    target: str,
+    qualifier: str | None = None,
+    stop_distance: float = 0.6,
+    confirm_in_frame: bool = True,
+) -> dict[str, Any]:
+    """
+    Find an object, approach safely with collision checks, and optionally run visual confirmation.
+    """
+    target_clean = target.strip() if isinstance(target, str) else ""
+    if not target_clean:
+        raise ValueError("target must be a non-empty string")
+    stop_distance_f = _validate_finite("stop_distance", stop_distance)
+    if stop_distance_f <= 0:
+        raise ValueError("stop_distance must be > 0")
+
+    final_pose = await tbot_nav_get_pose()
+    object_in_frame = False
+    scene_description = ""
+    stopped_reason = "max_retries"
+
+    async with Client(VISION_MCP_URL_V3) as vision:
+        async with Client(MOTION_MCP_URL_V3) as motion:
+            async with Client(LIDAR_MCP_URL_V3) as lidar:
+                found: dict[str, Any] | None = None
+                for sweep_attempt in range(NAV_OBJECT_SWEEP_MAX_STEPS + 1):
+                    candidate = await _vision_find_target(vision, target_clean, qualifier)
+                    if bool(candidate.get("visible")):
+                        found = candidate
+                        break
+
+                    if sweep_attempt >= NAV_OBJECT_SWEEP_MAX_STEPS:
+                        await _safe_motion_stop(motion)
+                        final_pose = await tbot_nav_get_pose()
+                        return {
+                            "success": False,
+                            "final_pose": final_pose,
+                            "object_in_frame": False,
+                            "scene_description": "",
+                            "stopped_reason": "max_retries",
+                        }
+
+                    risk_level, scale, _ = await _guard_motion_and_get_scale(lidar, motion)
+                    if risk_level == "stop":
+                        bypass_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
+                        bypass = _extract_tool_result_dict(bypass_raw)
+                        if bypass.get("status") != "completed":
+                            final_pose = await tbot_nav_get_pose()
+                            return {
+                                "success": False,
+                                "final_pose": final_pose,
+                                "object_in_frame": False,
+                                "scene_description": "",
+                                "stopped_reason": "collision_stop",
+                                "bypass": bypass,
+                            }
+                    sweep_turn_deg = max(10.0, NAV_OBJECT_SWEEP_STEP_DEG * scale)
+                    await _turn_by_degrees(motion, sweep_turn_deg, NAV_OBJECT_TURN_SPEED_RPS)
+
+                heading_offset_deg = _heading_offset_from_bbox_deg(found.get("bbox"), TBOT_CAMERA_FOV_DEG) if found else None
+                if heading_offset_deg is not None and abs(heading_offset_deg) >= 2.0:
+                    risk_level, scale, _ = await _guard_motion_and_get_scale(lidar, motion)
+                    if risk_level == "stop":
+                        bypass_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
+                        bypass = _extract_tool_result_dict(bypass_raw)
+                        if bypass.get("status") != "completed":
+                            final_pose = await tbot_nav_get_pose()
+                            return {
+                                "success": False,
+                                "final_pose": final_pose,
+                                "object_in_frame": False,
+                                "scene_description": "",
+                                "stopped_reason": "collision_stop",
+                                "bypass": bypass,
+                            }
+                    await _turn_by_degrees(
+                        motion,
+                        heading_offset_deg * (0.5 if risk_level == "caution" else 1.0),
+                        NAV_OBJECT_TURN_SPEED_RPS,
+                    )
+
+                reacquire_failures = 0
+                approach_steps = 0
+                while approach_steps < NAV_OBJECT_MAX_APPROACH_STEPS:
+                    current_view = await _vision_find_target(vision, target_clean, qualifier)
+                    if not bool(current_view.get("visible")):
+                        reacquired: dict[str, Any] | None = None
+                        for _ in range(NAV_OBJECT_REACQUIRE_ATTEMPTS):
+                            candidate = await _attempt_reacquire_target(
+                                vision=vision,
+                                motion=motion,
+                                lidar=lidar,
+                                target=target_clean,
+                                qualifier=qualifier,
+                            )
+                            if candidate and bool(candidate.get("visible")):
+                                reacquired = candidate
+                                reacquire_failures = 0
+                                break
+                            reacquire_failures += 1
+                        if reacquired is None:
+                            await _safe_motion_stop(motion)
+                            final_pose = await tbot_nav_get_pose()
+                            return {
+                                "success": False,
+                                "final_pose": final_pose,
+                                "object_in_frame": False,
+                                "scene_description": "",
+                                "stopped_reason": "max_retries",
+                            }
+                        current_view = reacquired
+
+                    risk_level, scale, collision = await _guard_motion_and_get_scale(lidar, motion)
+                    if risk_level == "stop":
+                        bypass_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
+                        bypass = _extract_tool_result_dict(bypass_raw)
+                        if bypass.get("status") != "completed":
+                            await _safe_motion_stop(motion)
+                            final_pose = await tbot_nav_get_pose()
+                            return {
+                                "success": False,
+                                "final_pose": final_pose,
+                                "object_in_frame": bool(current_view.get("visible")),
+                                "scene_description": "",
+                                "stopped_reason": "collision_stop",
+                                "collision": collision,
+                                "bypass": bypass,
+                            }
+                        continue
+
+                    front_distance_m = _extract_front_distance(collision)
+                    if front_distance_m is not None and front_distance_m <= stop_distance_f:
+                        await _safe_motion_stop(motion)
+                        stopped_reason = "reached_target"
+                        break
+
+                    allowed_step = NAV_OBJECT_APPROACH_STEP_M * scale
+                    if front_distance_m is not None:
+                        allowed_step = min(allowed_step, max(0.0, front_distance_m - stop_distance_f))
+                    if allowed_step <= 0.0:
+                        await _safe_motion_stop(motion)
+                        stopped_reason = "reached_target"
+                        break
+
+                    move_speed = max(0.03, NAV_OBJECT_MOVE_SPEED_MPS * scale)
+                    await motion.call_tool(
+                        "tbot_motion_move_forward_distance",
+                        {"distance_m": allowed_step, "speed": move_speed},
+                    )
+                    approach_steps += 1
+
+                if stopped_reason != "reached_target":
+                    await _safe_motion_stop(motion)
+                    final_pose = await tbot_nav_get_pose()
+                    return {
+                        "success": False,
+                        "final_pose": final_pose,
+                        "object_in_frame": False,
+                        "scene_description": "",
+                        "stopped_reason": "max_retries",
+                    }
+
+                object_result = await _vision_find_target(vision, target_clean, qualifier)
+                object_in_frame = bool(object_result.get("visible"))
+                if confirm_in_frame:
+                    scene_raw = await vision.call_tool(
+                        "tbot_vision_describe_scene",
+                        {"prompt": f"Confirm the {target_clean} and nearby context."},
+                    )
+                    scene = _extract_tool_result_dict(scene_raw)
+                    scene_description = str(scene.get("description", ""))
+
+    final_pose = await tbot_nav_get_pose()
+    return {
+        "success": (stopped_reason == "reached_target" and (not confirm_in_frame or object_in_frame)),
+        "final_pose": final_pose,
+        "object_in_frame": object_in_frame,
+        "scene_description": scene_description,
+        "stopped_reason": stopped_reason,
+    }
 
 
 @mcp_nav_v3.tool()

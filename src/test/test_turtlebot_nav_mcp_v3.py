@@ -1,6 +1,7 @@
 """Tests for src/mcp/turtlebot_v3/nav_mcp_server.py."""
 
 import asyncio
+import math
 import os
 import sys
 from typing import Any
@@ -27,7 +28,11 @@ class _FakeNavClient:
     async def call_tool(self, name: str, payload: dict[str, Any]):
         if self._url == nav_v3.MOTION_MCP_URL_V3:
             self._state["motion_calls"].append((name, payload))
-            if name in ("tbot_motion_move_timed", "tbot_motion_stop"):
+            if name == "tbot_motion_bypass_obstacle":
+                if self._state["bypass_results"]:
+                    return self._state["bypass_results"].pop(0)
+                return {"status": "completed"}
+            if name in ("tbot_motion_turn", "tbot_motion_stop", "tbot_motion_move_forward_distance"):
                 return {"status": "ok"}
             raise AssertionError(f"Unexpected motion tool call: {name}")
 
@@ -41,7 +46,26 @@ class _FakeNavClient:
                     "min_forward_distance_m": 2.0,
                     "distances": {"front": 2.0, "left": 2.0, "right": 2.0, "rear": 2.0},
                 }
+            if name == "tbot_lidar_get_distance_at_angle":
+                if self._state["angle_distance_results"]:
+                    return self._state["angle_distance_results"].pop(0)
+                return {"status": "ok", "distance_m": 1.0, "valid_count": 3}
             raise AssertionError(f"Unexpected lidar tool call: {name}")
+
+        if self._url == nav_v3.VISION_MCP_URL_V3:
+            self._state["vision_calls"].append((name, payload))
+            if name == "tbot_vision_find_object":
+                if self._state["vision_find_results"]:
+                    return self._state["vision_find_results"].pop(0)
+                return {
+                    "visible": True,
+                    "confidence": 0.9,
+                    "position": "center",
+                    "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2},
+                }
+            if name == "tbot_vision_describe_scene":
+                return {"description": "Target object confirmed in scene."}
+            raise AssertionError(f"Unexpected vision tool call: {name}")
 
         raise AssertionError(f"Unexpected MCP URL in test: {self._url}")
 
@@ -50,7 +74,11 @@ def _make_state() -> dict[str, Any]:
     return {
         "motion_calls": [],
         "lidar_calls": [],
+        "vision_calls": [],
         "collision_results": [],
+        "vision_find_results": [],
+        "angle_distance_results": [],
+        "bypass_results": [],
     }
 
 
@@ -89,7 +117,7 @@ def test_nav_get_pose_returns_pose():
     assert result["yaw_rad"] == pytest.approx(0.3)
 
 
-def test_nav_go_to_pose_reaches_target():
+def test_nav_go_to_pose_reaches_target_without_timed_motion():
     state = _make_state()
 
     def fake_client(url: str):
@@ -97,7 +125,7 @@ def test_nav_go_to_pose_reaches_target():
 
     odom_sequence = [
         _odom(0.0, 0.0, 0.0),
-        _odom(0.95, 0.0, 0.0),
+        _odom(0.5, 0.0, 0.0),
         _odom(1.0, 0.0, 0.0),
     ]
 
@@ -117,7 +145,8 @@ def test_nav_go_to_pose_reaches_target():
 
     assert result["status"] == "reached"
     assert result["distance_remaining_m"] <= 0.1
-    assert any(name == "tbot_motion_move_timed" for name, _ in state["motion_calls"])
+    assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
+    assert all(name != "tbot_motion_move_timed" for name, _ in state["motion_calls"])
 
 
 def test_nav_go_to_pose_collision_blocked():
@@ -144,6 +173,162 @@ def test_nav_go_to_pose_collision_blocked():
 
     assert result["status"] == "collision_blocked"
     assert any(name == "tbot_motion_stop" for name, _ in state["motion_calls"])
+
+
+def test_estimate_object_pose_straight_ahead():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": 2.0, "valid_count": 4}]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 1.0, "y_m": 2.0, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_estimate_object_pose(target="door"))
+
+    assert result["success"] is True
+    assert result["heading_deg"] == pytest.approx(0.0)
+    assert result["x"] == pytest.approx(3.0)
+    assert result["y"] == pytest.approx(2.0)
+    assert result["confidence"] == "high"
+
+
+def test_estimate_object_pose_offset_heading_geometry():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 1.0, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": math.sqrt(2.0), "valid_count": 3}]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "TBOT_CAMERA_FOV_DEG",
+        90.0,
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_estimate_object_pose(target="cone"))
+
+    assert result["success"] is True
+    assert result["heading_deg"] == pytest.approx(45.0)
+    assert result["x"] == pytest.approx(1.0, abs=1e-3)
+    assert result["y"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_estimate_object_pose_lidar_occluded_returns_low_confidence():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": True, "confidence": 0.7, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.3, "h": 0.4}},
+    ]
+    state["angle_distance_results"] = [{"status": "no_data", "distance_m": None}]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_estimate_object_pose(target="chair"))
+
+    assert result["success"] is True
+    assert result["confidence"] == "low"
+    assert isinstance(result["distance_m"], float)
+
+
+def test_navigate_to_object_reaches_target_and_confirms_scene():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    state["collision_results"] = [
+        {"risk_level": "clear", "min_forward_distance_m": 1.0, "distances": {"front": 1.0}},
+        {"risk_level": "clear", "min_forward_distance_m": 0.55, "distances": {"front": 0.55}},
+    ]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.4, "y_m": 0.1, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_navigate_to_object(
+                target="door",
+                stop_distance=0.6,
+                confirm_in_frame=True,
+            )
+        )
+
+    assert result["success"] is True
+    assert result["stopped_reason"] == "reached_target"
+    assert result["object_in_frame"] is True
+    assert "confirmed" in result["scene_description"].lower()
+    assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
+
+
+def test_navigate_to_object_reacquire_failures_return_max_retries():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": False, "confidence": 0.1, "bbox": None},
+    ]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "_attempt_reacquire_target",
+        new=AsyncMock(return_value=None),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_navigate_to_object(target="stool", stop_distance=0.6))
+
+    assert result["success"] is False
+    assert result["stopped_reason"] == "max_retries"
+
+
+def test_navigate_to_object_collision_stop_when_bypass_fails():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    state["collision_results"] = [{"risk_level": "stop", "min_forward_distance_m": 0.1, "distances": {"front": 0.1}}]
+    state["bypass_results"] = [{"status": "timeout"}]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_navigate_to_object(target="cabinet", stop_distance=0.6))
+
+    assert result["success"] is False
+    assert result["stopped_reason"] == "collision_stop"
 
 
 def test_nav_patrol_returns_partial_completed_on_failure():
