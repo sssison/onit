@@ -42,7 +42,7 @@ class _FakeNavClient:
                 if self._state["bypass_results"]:
                     return self._state["bypass_results"].pop(0)
                 return {"status": "completed"}
-            if name in ("tbot_motion_turn", "tbot_motion_stop", "tbot_motion_move_forward_continuous"):
+            if name in ("tbot_motion_turn", "tbot_motion_stop", "tbot_motion_move_forward_distance"):
                 return {"status": "ok"}
             raise AssertionError(f"Unexpected motion tool call: {name}")
 
@@ -166,7 +166,7 @@ def test_navigate_to_object_requires_target_visible_at_start():
 
     assert result["success"] is False
     assert result["stopped_reason"] == "target_not_visible"
-    assert all(name != "tbot_motion_move_forward_continuous" for name, _ in state["motion_calls"])
+    assert all(name != "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
 
 
 def test_navigate_to_object_returns_target_lost_after_move():
@@ -192,7 +192,7 @@ def test_navigate_to_object_returns_target_lost_after_move():
 
     assert result["success"] is False
     assert result["stopped_reason"] == "target_lost"
-    assert any(name == "tbot_motion_move_forward_continuous" for name, _ in state["motion_calls"])
+    assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
 
 
 def test_navigate_to_object_recenters_when_visible_off_center_after_move():
@@ -284,7 +284,7 @@ def test_nav_go_to_pose_reaches_target_without_timed_motion():
 
     assert result["status"] == "reached"
     assert result["distance_remaining_m"] <= 0.1
-    assert any(name == "tbot_motion_move_forward_continuous" for name, _ in state["motion_calls"])
+    assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
     assert all(name != "tbot_motion_move_timed" for name, _ in state["motion_calls"])
 
 
@@ -453,7 +453,7 @@ def test_navigate_to_object_reaches_target_and_confirms_scene():
     assert result["stopped_reason"] == "reached_target"
     assert result["object_in_frame"] is True
     assert "confirmed" in result["scene_description"].lower()
-    assert any(name == "tbot_motion_move_forward_continuous" for name, _ in state["motion_calls"])
+    assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
 
 
 def test_navigate_to_object_uses_describe_scene_and_bbox_checks():
@@ -539,7 +539,7 @@ def test_navigate_to_object_stop_risk_with_visible_target_stops_without_bypass()
     assert result["success"] is True
     assert result["stopped_reason"] == "reached_target"
     assert all(name != "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
-    assert all(name != "tbot_motion_move_forward_continuous" for name, _ in state["motion_calls"])
+    assert all(name != "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
 
 
 def test_navigate_to_object_stop_risk_with_visible_target_not_close_returns_blocked():
@@ -567,11 +567,7 @@ def test_navigate_to_object_stop_risk_with_visible_target_not_close_returns_bloc
 
 def test_go_to_midpoint_between_objects_clear_path_reaches_midpoint():
     state = _make_state()
-    state["angle_distance_results"] = [
-        {"status": "ok", "distance_m": 1.0, "valid_count": 3},
-        {"status": "ok", "distance_m": 1.1, "valid_count": 3},
-        {"status": "ok", "distance_m": 1.2, "valid_count": 3},
-    ]
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": 1.0, "valid_count": 3}]
     pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
     pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
 
@@ -601,7 +597,6 @@ def test_go_to_midpoint_between_objects_clear_path_reaches_midpoint():
 
     assert result["success"] is True
     assert result["used_bypass"] is False
-    assert result["midpoint_safety"]["classification"] == "clear"
     assert result["midpoint"]["x_m"] == pytest.approx(0.6)
     assert result["midpoint"]["y_m"] == pytest.approx(0.0)
     assert nav_go_mock.await_count == 1
@@ -610,11 +605,7 @@ def test_go_to_midpoint_between_objects_clear_path_reaches_midpoint():
 
 def test_go_to_midpoint_between_objects_unsafe_path_bypass_then_reach():
     state = _make_state()
-    state["angle_distance_results"] = [
-        {"status": "ok", "distance_m": 0.2, "valid_count": 3},
-        {"status": "ok", "distance_m": 0.25, "valid_count": 3},
-        {"status": "ok", "distance_m": 0.3, "valid_count": 3},
-    ]
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": 0.2, "valid_count": 3}]
     pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
     pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
 
@@ -644,18 +635,13 @@ def test_go_to_midpoint_between_objects_unsafe_path_bypass_then_reach():
 
     assert result["success"] is True
     assert result["used_bypass"] is True
-    assert result["midpoint_safety"]["classification"] == "blocked"
     assert nav_go_mock.await_count == 1
     assert any(name == "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
 
 
 def test_go_to_midpoint_between_objects_unsafe_path_bypass_fails():
     state = _make_state()
-    state["angle_distance_results"] = [
-        {"status": "ok", "distance_m": 0.2, "valid_count": 3},
-        {"status": "ok", "distance_m": 0.25, "valid_count": 3},
-        {"status": "ok", "distance_m": 0.3, "valid_count": 3},
-    ]
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": 0.2, "valid_count": 3}]
     state["bypass_results"] = [{"status": "timeout"}]
     pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
     pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
@@ -686,18 +672,13 @@ def test_go_to_midpoint_between_objects_unsafe_path_bypass_fails():
 
     assert result["success"] is False
     assert result["error"] == "midpoint_unsafe_bypass_failed"
-    assert result["midpoint_safety"]["classification"] == "blocked"
     assert nav_go_mock.await_count == 0
     assert any(name == "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
 
 
 def test_go_to_midpoint_between_objects_collision_blocked_then_single_bypass_retry():
     state = _make_state()
-    state["angle_distance_results"] = [
-        {"status": "ok", "distance_m": 0.2, "valid_count": 3},
-        {"status": "ok", "distance_m": 1.0, "valid_count": 3},
-        {"status": "ok", "distance_m": 1.2, "valid_count": 3},
-    ]
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": 1.0, "valid_count": 3}]
     pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
     pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
 
@@ -727,7 +708,6 @@ def test_go_to_midpoint_between_objects_collision_blocked_then_single_bypass_ret
 
     assert result["success"] is True
     assert result["used_bypass"] is True
-    assert result["midpoint_safety"]["classification"] == "inconclusive"
     assert nav_go_mock.await_count == 2
     assert any(name == "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
 

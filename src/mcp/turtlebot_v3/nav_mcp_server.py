@@ -80,13 +80,6 @@ NAV_OBJECT_RECENTER_EPS_DEG = max(0.5, _env_float("NAV_OBJECT_RECENTER_EPS_DEG",
 NAV_OBJECT_LOSS_CONFIRM_FRAMES = max(1, int(_env_float("NAV_OBJECT_LOSS_CONFIRM_FRAMES", 2.0)))
 NAV_OBJECT_DEFAULT_STOP_DISTANCE_M = max(0.05, _env_float("NAV_OBJECT_DEFAULT_STOP_DISTANCE_M", 0.20))
 NAV_MIDPOINT_TIMEOUT_S = max(5.0, _env_float("NAV_MIDPOINT_TIMEOUT_S", 45.0))
-NAV_CONTINUOUS_SEGMENT_S = max(0.10, _env_float("NAV_CONTINUOUS_SEGMENT_S", 0.35))
-NAV_MIDPOINT_SAMPLE_OFFSETS_DEG = (-10.0, 0.0, 10.0)
-NAV_MAP_OBJECT_TTL_S = max(1.0, _env_float("NAV_MAP_OBJECT_TTL_S", 120.0))
-NAV_SESSION_MAP_TRAIL_MAX_POINTS = max(10, int(_env_float("NAV_SESSION_MAP_TRAIL_MAX_POINTS", 200.0)))
-NAV_SESSION_MAP_PERSIST_ENABLED = _env_bool("TBOT_SESSION_MAP_PERSIST_ENABLED", True)
-NAV_SESSION_MAP_SNAPSHOT_PATH = os.getenv("TBOT_SESSION_MAP_SNAPSHOT_PATH", "").strip()
-NAV_SESSION_MAP_SNAPSHOT_DIR = os.getenv("TBOT_SESSION_MAP_SNAPSHOT_DIR", "/tmp/onit").strip() or "/tmp/onit"
 
 _rclpy_init_lock = threading.Lock()
 _session_state_lock = threading.Lock()
@@ -525,24 +518,6 @@ def _extract_front_distance(collision: dict[str, Any]) -> float | None:
         front = distances.get("front")
         if isinstance(front, (int, float)) and math.isfinite(float(front)):
             return float(front)
-    return None
-
-
-def _extract_sector_distance(payload: dict[str, Any], sector: str) -> float | None:
-    direct = payload.get("distance_m")
-    if isinstance(direct, (int, float)) and math.isfinite(float(direct)):
-        return float(direct)
-    distances = payload.get("distances")
-    if isinstance(distances, dict):
-        value = distances.get(sector)
-        if isinstance(value, (int, float)) and math.isfinite(float(value)):
-            return float(value)
-    return None
-
-
-def _extract_valid_distance(value: Any) -> float | None:
-    if isinstance(value, (int, float)) and math.isfinite(float(value)):
-        return float(value)
     return None
 
 
@@ -1054,16 +1029,16 @@ async def tbot_nav_go_to_pose(
                             }
 
                         caution_scale = 0.5 if risk_level == "caution" else 1.0
-                        segment_speed = min(max_linear, max(0.03, distance))
-                        segment_speed = max(0.03, segment_speed * caution_scale)
-                        max_duration_for_distance = distance / max(segment_speed, 1e-6)
-                        segment_duration = min(NAV_CONTINUOUS_SEGMENT_S, max_duration_for_distance)
-                        if segment_duration <= 0.0:
+                        step_distance = min(distance, NAV_FORWARD_STEP_M, max_linear)
+                        step_distance = max(0.0, step_distance * caution_scale)
+                        if step_distance <= 0.0:
                             await asyncio.sleep(0.05)
                             continue
+                        step_speed = min(max_linear, max(0.03, distance))
+                        step_speed = max(0.03, step_speed * caution_scale)
                         await motion.call_tool(
-                            "tbot_motion_move_forward_continuous",
-                            {"duration_seconds": segment_duration, "speed": segment_speed},
+                            "tbot_motion_move_forward_distance",
+                            {"distance_m": step_distance, "speed": step_speed},
                         )
                 except Exception as e:
                     await _safe_motion_stop(motion)
@@ -1312,84 +1287,28 @@ async def tbot_nav_go_to_midpoint_between_objects(
     required_clearance_m = distance_to_midpoint_m + NAV_FRONT_THRESHOLD_M
 
     lidar_check: dict[str, Any] = {}
-    lidar_samples: list[dict[str, Any]] = []
-    valid_sample_distances: list[float] = []
     measured_lidar_distance_m: float | None = None
-    midpoint_safety_class = "inconclusive"
     try:
         async with Client(LIDAR_MCP_URL_V3) as lidar:
-            for offset_deg in NAV_MIDPOINT_SAMPLE_OFFSETS_DEG:
-                sample_angle_deg = relative_angle_deg + float(offset_deg)
-                sample_payload: dict[str, Any]
-                sample_distance_m: float | None = None
-                try:
-                    lidar_raw = await lidar.call_tool(
-                        "tbot_lidar_get_distance_at_angle",
-                        {"angle_deg": sample_angle_deg},
-                    )
-                    sample_payload = _extract_tool_result_dict(lidar_raw)
-                    sample_distance_m = _extract_valid_distance(sample_payload.get("distance_m"))
-                    if sample_distance_m is not None:
-                        valid_sample_distances.append(sample_distance_m)
-                except Exception as sample_error:
-                    sample_payload = {"error": str(sample_error)}
-
-                if abs(float(offset_deg)) < 1e-6:
-                    lidar_check = sample_payload
-                    measured_lidar_distance_m = sample_distance_m
-
-                lidar_samples.append(
-                    {
-                        "angle_deg": sample_angle_deg,
-                        "offset_deg": float(offset_deg),
-                        "distance_m": sample_distance_m,
-                        "status": sample_payload.get("status"),
-                        "valid_count": sample_payload.get("valid_count"),
-                        "error": sample_payload.get("error"),
-                    }
-                )
+            lidar_raw = await lidar.call_tool(
+                "tbot_lidar_get_distance_at_angle",
+                {"angle_deg": relative_angle_deg},
+            )
+            lidar_check = _extract_tool_result_dict(lidar_raw)
     except Exception as e:
         lidar_check = {"error": str(e)}
-        lidar_samples = [
-            {
-                "angle_deg": relative_angle_deg + float(offset_deg),
-                "offset_deg": float(offset_deg),
-                "distance_m": None,
-                "status": None,
-                "valid_count": None,
-                "error": str(e),
-            }
-            for offset_deg in NAV_MIDPOINT_SAMPLE_OFFSETS_DEG
-        ]
 
-    if measured_lidar_distance_m is None:
-        measured_lidar_distance_m = _extract_valid_distance(lidar_check.get("distance_m"))
-    if measured_lidar_distance_m is None and valid_sample_distances:
-        measured_lidar_distance_m = valid_sample_distances[0]
+    lidar_distance_raw = lidar_check.get("distance_m")
+    if isinstance(lidar_distance_raw, (int, float)) and math.isfinite(float(lidar_distance_raw)):
+        measured_lidar_distance_m = float(lidar_distance_raw)
 
-    if valid_sample_distances:
-        all_clear = all(distance >= required_clearance_m for distance in valid_sample_distances)
-        all_blocked = all(distance < required_clearance_m for distance in valid_sample_distances)
-        if all_clear:
-            midpoint_safety_class = "clear"
-        elif all_blocked:
-            midpoint_safety_class = "blocked"
-
-    midpoint_is_safe = midpoint_safety_class == "clear"
-    midpoint_safety = {
-        "relative_angle_deg": relative_angle_deg,
-        "distance_to_midpoint_m": distance_to_midpoint_m,
-        "required_clearance_m": required_clearance_m,
-        "measured_lidar_distance_m": measured_lidar_distance_m,
-        "is_safe": midpoint_is_safe,
-        "classification": midpoint_safety_class,
-        "samples": lidar_samples,
-        "lidar": lidar_check,
-    }
+    midpoint_is_safe = (
+        measured_lidar_distance_m is not None and measured_lidar_distance_m >= required_clearance_m
+    )
 
     used_bypass = False
     bypass_result: dict[str, Any] = {}
-    if midpoint_safety_class == "blocked":
+    if not midpoint_is_safe:
         used_bypass = True
         try:
             async with Client(MOTION_MCP_URL_V3) as motion:
@@ -1410,8 +1329,14 @@ async def tbot_nav_go_to_midpoint_between_objects(
                     "separation_m": separation_m,
                 },
                 "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
-                "midpoint_safety": midpoint_safety,
-                "map_usage": map_usage,
+                "midpoint_safety": {
+                    "relative_angle_deg": relative_angle_deg,
+                    "distance_to_midpoint_m": distance_to_midpoint_m,
+                    "required_clearance_m": required_clearance_m,
+                    "measured_lidar_distance_m": measured_lidar_distance_m,
+                    "is_safe": midpoint_is_safe,
+                    "lidar": lidar_check,
+                },
                 "used_bypass": used_bypass,
                 "bypass_result": bypass_result,
                 "nav_result": None,
@@ -1451,8 +1376,14 @@ async def tbot_nav_go_to_midpoint_between_objects(
                     "separation_m": separation_m,
                 },
                 "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
-                "midpoint_safety": midpoint_safety,
-                "map_usage": map_usage,
+                "midpoint_safety": {
+                    "relative_angle_deg": relative_angle_deg,
+                    "distance_to_midpoint_m": distance_to_midpoint_m,
+                    "required_clearance_m": required_clearance_m,
+                    "measured_lidar_distance_m": measured_lidar_distance_m,
+                    "is_safe": midpoint_is_safe,
+                    "lidar": lidar_check,
+                },
                 "used_bypass": used_bypass,
                 "bypass_result": bypass_result,
                 "nav_result": nav_result,
@@ -1470,8 +1401,14 @@ async def tbot_nav_go_to_midpoint_between_objects(
             "separation_m": separation_m,
         },
         "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
-        "midpoint_safety": midpoint_safety,
-        "map_usage": map_usage,
+        "midpoint_safety": {
+            "relative_angle_deg": relative_angle_deg,
+            "distance_to_midpoint_m": distance_to_midpoint_m,
+            "required_clearance_m": required_clearance_m,
+            "measured_lidar_distance_m": measured_lidar_distance_m,
+            "is_safe": midpoint_is_safe,
+            "lidar": lidar_check,
+        },
         "used_bypass": used_bypass,
         "bypass_result": bypass_result,
         "nav_result": nav_result,
@@ -1645,13 +1582,9 @@ async def tbot_navigate_to_object(
                             }
 
                     move_speed = max(0.03, NAV_OBJECT_MOVE_SPEED_MPS * scale)
-                    move_duration_s = min(
-                        NAV_CONTINUOUS_SEGMENT_S,
-                        allowed_step / max(move_speed, 1e-6),
-                    )
                     await motion.call_tool(
-                        "tbot_motion_move_forward_continuous",
-                        {"duration_seconds": move_duration_s, "speed": move_speed},
+                        "tbot_motion_move_forward_distance",
+                        {"distance_m": allowed_step, "speed": move_speed},
                     )
                     approach_steps += 1
 

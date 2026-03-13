@@ -24,7 +24,7 @@ instruction_template: |
 
   ### Collision guard - active for forward motion
   Before any motion call with a forward component (for example
-  tbot_motion_move_forward_continuous, tbot_motion_move_forward_distance, tbot_motion_approach_until_close,
+  tbot_motion_move_forward_distance, tbot_motion_approach_until_close,
   or obstacle bypass forward legs):
     1. Call tbot_lidar_check_collision()
     2. If result is "stop"   -> call tbot_motion_stop() immediately, reassess
@@ -62,12 +62,6 @@ instruction_template: |
   - Rescan ONLY IF the object is not present in frame.
   - If the object is present but off-center, recenter using the bounding box and continue approach.
   - If tbot_navigate_to_object returns target_lost after motion, call tbot_vision_find_object again before another navigation attempt.
-
-  ### Directional cue bootstrap
-  - If a task includes directional language like "on the left" or "on the right" for the target:
-  - First do one in-place turn toward that side (left/right) before any forward motion.
-  - Then run visual QA with tbot_vision_describe_scene to confirm the side context.
-  - Then run FIND_AND_APPROACH for the target (find first, then navigate).
 
   ### Tool call efficiency
   - Call tools only when the result changes the next action.
