@@ -477,6 +477,11 @@ def test_navigate_to_object_collision_stop_when_bypass_fails():
     state = _make_state()
     state["describe_results"] = [
         {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": false, \"confidence\": 0.1}"},
+    ]
+    state["vision_bbox_results"] = [
+        {"visible": False, "confidence": 0.0, "bbox": None, "success": False},
+        {"visible": False, "confidence": 0.0, "bbox": None, "success": False},
     ]
     state["collision_results"] = [{"risk_level": "stop", "min_forward_distance_m": 0.1, "distances": {"front": 0.1}}]
     state["bypass_results"] = [{"status": "timeout"}]
@@ -493,6 +498,56 @@ def test_navigate_to_object_collision_stop_when_bypass_fails():
 
     assert result["success"] is False
     assert result["stopped_reason"] == "collision_stop"
+    assert any(name == "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
+
+
+def test_navigate_to_object_stop_risk_with_visible_target_stops_without_bypass():
+    state = _make_state()
+    state["describe_results"] = [
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "Target object confirmed in scene."},
+    ]
+    state["collision_results"] = [{"risk_level": "stop", "min_forward_distance_m": 0.1, "distances": {"front": 0.1}}]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_navigate_to_object(target="trashcan", stop_distance=0.2))
+
+    assert result["success"] is True
+    assert result["stopped_reason"] == "reached_target"
+    assert all(name != "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
+    assert all(name != "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
+
+
+def test_navigate_to_object_stop_risk_with_visible_target_not_close_returns_blocked():
+    state = _make_state()
+    state["describe_results"] = [
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+    ]
+    state["collision_results"] = [{"risk_level": "stop", "min_forward_distance_m": 0.1, "distances": {"front": 0.1}}]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_navigate_to_object(target="trashcan", stop_distance=0.05))
+
+    assert result["success"] is False
+    assert result["stopped_reason"] == "target_blocked_visible"
+    assert all(name != "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
 
 
 def test_nav_patrol_returns_partial_completed_on_failure():

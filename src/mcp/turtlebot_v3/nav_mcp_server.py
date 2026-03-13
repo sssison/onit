@@ -796,27 +796,10 @@ async def tbot_navigate_to_object(
                 approach_steps = 0
                 while approach_steps < NAV_OBJECT_MAX_APPROACH_STEPS:
                     risk_level, scale, collision = await _guard_motion_and_get_scale(lidar, motion)
-                    if risk_level == "stop":
-                        bypass_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
-                        bypass = _extract_tool_result_dict(bypass_raw)
-                        if bypass.get("status") != "completed":
-                            await _safe_motion_stop(motion)
-                            final_pose = await tbot_nav_get_pose()
-                            return {
-                                "success": False,
-                                "final_pose": final_pose,
-                                "object_in_frame": object_in_frame,
-                                "scene_description": "",
-                                "stopped_reason": "collision_stop",
-                                "collision": collision,
-                                "bypass": bypass,
-                            }
-                        continue
-
                     front_distance_m = _extract_front_distance(collision)
                     target_distance_m: float | None = None
                     bbox_for_range: dict[str, Any] | None = None
-                    if front_distance_m is None:
+                    if front_distance_m is None or risk_level == "stop":
                         bbox_for_range = await _vision_get_target_bbox(
                             vision=vision,
                             target=target_clean,
@@ -837,7 +820,56 @@ async def tbot_navigate_to_object(
                                 if isinstance(measured, (int, float)) and math.isfinite(float(measured)):
                                     target_distance_m = float(measured)
 
-                    distance_for_limit = target_distance_m if target_distance_m is not None else front_distance_m
+                    if risk_level == "stop":
+                        visible_for_stop = await _scene_confirms_target_visible(
+                            vision=vision,
+                            target=target_clean,
+                            qualifier=qualifier,
+                        )
+                        object_in_frame = bool(visible_for_stop) or bool(bbox_for_range and bbox_for_range.get("visible"))
+                        close_enough = (
+                            (front_distance_m is not None and front_distance_m <= stop_distance_f)
+                            or (target_distance_m is not None and target_distance_m <= stop_distance_f)
+                        )
+
+                        await _safe_motion_stop(motion)
+                        if object_in_frame and close_enough:
+                            stopped_reason = "reached_target"
+                            break
+                        if object_in_frame:
+                            final_pose = await tbot_nav_get_pose()
+                            return {
+                                "success": False,
+                                "final_pose": final_pose,
+                                "object_in_frame": True,
+                                "scene_description": "",
+                                "stopped_reason": "target_blocked_visible",
+                                "collision": collision,
+                                "front_distance_m": front_distance_m,
+                                "target_distance_m": target_distance_m,
+                            }
+
+                        bypass_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
+                        bypass = _extract_tool_result_dict(bypass_raw)
+                        if bypass.get("status") != "completed":
+                            await _safe_motion_stop(motion)
+                            final_pose = await tbot_nav_get_pose()
+                            return {
+                                "success": False,
+                                "final_pose": final_pose,
+                                "object_in_frame": object_in_frame,
+                                "scene_description": "",
+                                "stopped_reason": "collision_stop",
+                                "collision": collision,
+                                "bypass": bypass,
+                            }
+                        continue
+
+                    distances_for_limit = [
+                        d for d in (target_distance_m, front_distance_m)
+                        if isinstance(d, (int, float)) and math.isfinite(float(d))
+                    ]
+                    distance_for_limit = min(distances_for_limit) if distances_for_limit else None
                     allowed_step = NAV_OBJECT_APPROACH_STEP_M * scale
                     if distance_for_limit is not None:
                         allowed_step = min(allowed_step, max(0.0, distance_for_limit - stop_distance_f))
@@ -932,11 +964,12 @@ async def tbot_navigate_to_object(
                         "stopped_reason": "max_retries",
                     }
 
-                object_in_frame = await _scene_confirms_target_visible(
-                    vision=vision,
-                    target=target_clean,
-                    qualifier=qualifier,
-                )
+                if not object_in_frame:
+                    object_in_frame = await _scene_confirms_target_visible(
+                        vision=vision,
+                        target=target_clean,
+                        qualifier=qualifier,
+                    )
                 if confirm_in_frame:
                     scene_raw = await vision.call_tool(
                         "tbot_vision_describe_scene",
