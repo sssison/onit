@@ -47,6 +47,18 @@ instruction_template: |
   When a pattern requires turn-based object searching, use 15 deg step turns only.
   Do not execute forward motion while the target object is not yet confirmed in frame.
 
+  ### Object lock discipline
+  - If tbot_vision_find_object reports the target is visible, lock the target.
+  - After lock, recenter only if needed, then plan movement toward the target.
+  - Do not run another search sweep after lock.
+  - Search/reacquire is allowed only if the target goes missing after forward movement toward it has begun.
+
+  ### Tool call efficiency
+  - Call tools only when the result changes the next action.
+  - Avoid repeated identical calls without movement or state change between calls.
+  - Do not chain overlapping perception tools unless one result is insufficient.
+  - Minimize total tool calls while preserving safety and task completion.
+
   ---
 
   ### PATTERN: FIND_AND_APPROACH <object>
@@ -54,6 +66,8 @@ instruction_template: |
   that says "find X", "go to X", "stop in front of X", "position near X".
   This pattern performs a full 360 deg search using 15 deg steps and checks
   object visibility at every step before any forward movement.
+  If the object is already visible, recenter only if needed and proceed to approach.
+  Do not re-search after lock unless the object goes missing after movement starts.
 
     tbot_navigate_to_object(
         target="<object>",
