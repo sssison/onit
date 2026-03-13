@@ -30,6 +30,9 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "tbot_nav_go_to_midpoint_between_objects(" in instruction
     assert "Use tbot_vision_find_object as the primary object finder." in instruction
     assert "It always checks the current frame first, then scans if needed." in instruction
+    assert "At the start of each task, call tbot_nav_start_session(session_id=\"{session_id}\")." in instruction
+    assert "Use tbot_nav_get_session_map() before planning any multi-step navigation." in instruction
+    assert "tbot_nav_inspect_and_map_objects(...)" in instruction
     assert "tbot_estimate_object_pose(" in instruction
     assert "Find the destination landmark first" in instruction
     assert "fixed 15 deg steps" in instruction
@@ -49,6 +52,9 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "Rescan ONLY IF the object is not present in frame." in instruction
     assert "If the object is present but off-center, recenter using the bounding box and continue approach." in instruction
     assert "tbot_vision_get_object_bbox" in instruction
+    assert "This tool uses mapped object poses when they are fresh and falls back to live estimation." in instruction
+    assert "PATTERN: GO_AROUND_OBJECT <object>" in instruction
+    assert "tbot_nav_plan_around_object(" in instruction
     assert "If nav.stopped_reason == \"target_lost\":" in instruction
     assert "Call tools only when the result changes the next action." in instruction
     assert "Avoid repeated identical calls without movement or state change between calls." in instruction

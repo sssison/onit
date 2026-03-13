@@ -4,6 +4,7 @@ import asyncio
 import math
 import os
 import sys
+import time
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -12,6 +13,14 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.mcp.turtlebot_v3 import nav_mcp_server as nav_v3
+
+
+@pytest.fixture(autouse=True)
+def _reset_session_state(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(nav_v3, "_active_session_state", None)
+    monkeypatch.setattr(nav_v3, "NAV_SESSION_MAP_PERSIST_ENABLED", False)
+    yield
+    monkeypatch.setattr(nav_v3, "_active_session_state", None)
 
 
 class _FakeNavClient:
@@ -51,6 +60,11 @@ class _FakeNavClient:
                 if self._state["angle_distance_results"]:
                     return self._state["angle_distance_results"].pop(0)
                 return {"status": "ok", "distance_m": 1.0, "valid_count": 3}
+            if name == "tbot_lidar_get_obstacle_distances":
+                if self._state["sector_distance_results"]:
+                    return self._state["sector_distance_results"].pop(0)
+                sector = str(payload.get("sector", "all"))
+                return {"status": "ok", "sector": sector, "distance_m": 1.0}
             raise AssertionError(f"Unexpected lidar tool call: {name}")
 
         if self._url == nav_v3.VISION_MCP_URL_V3:
@@ -94,6 +108,7 @@ def _make_state() -> dict[str, Any]:
         "vision_bbox_results": [],
         "describe_results": [],
         "angle_distance_results": [],
+        "sector_distance_results": [],
         "bypass_results": [],
     }
 
@@ -406,6 +421,173 @@ def test_nav_go_to_pose_reduces_step_distance_when_forward_clearance_is_tight():
     forward_calls = [payload for name, payload in state["motion_calls"] if name == "tbot_motion_move_forward_distance"]
     assert forward_calls
     assert forward_calls[0]["distance_m"] == pytest.approx(0.12)
+
+
+def test_nav_start_session_captures_initial_and_current_pose():
+    pose = {"status": "ok", "x_m": 1.2, "y_m": -0.5, "yaw_rad": 0.3, "stamp_sec": 12.0}
+    with patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value=pose),
+    ):
+        result = asyncio.run(nav_v3.tbot_nav_start_session(session_id="demo"))
+
+    assert result["status"] == "ok"
+    assert result["session_id"] == "demo"
+    assert result["initial_pose"]["x_m"] == pytest.approx(1.2)
+    assert result["current_pose"]["y_m"] == pytest.approx(-0.5)
+    assert result["object_count"] == 0
+
+
+def test_estimate_object_pose_updates_session_map_when_session_is_active():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": 2.0, "valid_count": 4}]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    pose = {"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0, "stamp_sec": 10.0}
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value=pose),
+    ):
+        session = asyncio.run(nav_v3.tbot_nav_start_session(session_id="demo"))
+        estimate = asyncio.run(nav_v3.tbot_estimate_object_pose(target="door"))
+        snapshot = asyncio.run(nav_v3.tbot_nav_get_session_map())
+
+    assert session["status"] == "ok"
+    assert estimate["success"] is True
+    assert snapshot["status"] == "ok"
+    assert snapshot["object_count"] == 1
+    assert snapshot["objects"][0]["object_name"] == "door"
+
+
+def test_midpoint_uses_session_map_when_fresh():
+    state = _make_state()
+    state["angle_distance_results"] = [
+        {"status": "ok", "distance_m": 1.0, "valid_count": 3},
+        {"status": "ok", "distance_m": 1.1, "valid_count": 3},
+        {"status": "ok", "distance_m": 1.2, "valid_count": 3},
+    ]
+
+    now_mono = time.monotonic()
+    nav_v3._active_session_state = {
+        "session_id": "demo",
+        "started_at_mono_s": now_mono,
+        "initial_pose": {"x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0},
+        "current_pose": {"x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0, "updated_at_mono_s": now_mono},
+        "robot_trail": [],
+        "objects": {
+            "chair": {
+                "key": "chair",
+                "object_name": "chair",
+                "qualifier": None,
+                "estimated_object_pose": {"x_m": 0.4, "y_m": 0.0},
+                "distance_m": 0.4,
+                "heading_deg": 0.0,
+                "confidence": "high",
+                "source": "test",
+                "seen_count": 1,
+                "last_seen_unix_s": time.time(),
+                "last_seen_mono_s": now_mono,
+            },
+            "desk": {
+                "key": "desk",
+                "object_name": "desk",
+                "qualifier": None,
+                "estimated_object_pose": {"x_m": 0.8, "y_m": 0.0},
+                "distance_m": 0.8,
+                "heading_deg": 0.0,
+                "confidence": "high",
+                "source": "test",
+                "seen_count": 1,
+                "last_seen_unix_s": time.time(),
+                "last_seen_mono_s": now_mono,
+            },
+        },
+    }
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    nav_go_mock = AsyncMock(return_value={"status": "reached"})
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_estimate_object_pose",
+        new=AsyncMock(side_effect=AssertionError("should_not_estimate_when_map_is_fresh")),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_go_to_pose",
+        new=nav_go_mock,
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_midpoint_between_objects(
+                object_1="chair",
+                object_2="desk",
+            )
+        )
+
+    assert result["success"] is True
+    assert result["map_usage"]["used_session_map"] is True
+    assert result["map_usage"]["object_1_source"] == "session_map"
+    assert result["map_usage"]["object_2_source"] == "session_map"
+    assert nav_go_mock.await_count == 1
+
+
+def test_plan_around_object_uses_map_and_picks_clearer_side():
+    state = _make_state()
+    state["sector_distance_results"] = [
+        {"status": "ok", "sector": "left", "distance_m": 0.4},
+        {"status": "ok", "sector": "right", "distance_m": 0.9},
+    ]
+    now_mono = time.monotonic()
+    nav_v3._active_session_state = {
+        "session_id": "demo",
+        "started_at_mono_s": now_mono,
+        "initial_pose": {"x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0},
+        "current_pose": {"x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0, "updated_at_mono_s": now_mono},
+        "robot_trail": [],
+        "objects": {
+            "trashcan": {
+                "key": "trashcan",
+                "object_name": "trashcan",
+                "qualifier": None,
+                "estimated_object_pose": {"x_m": 1.0, "y_m": 0.0},
+                "distance_m": 1.0,
+                "heading_deg": 0.0,
+                "confidence": "high",
+                "source": "test",
+                "seen_count": 1,
+                "last_seen_unix_s": time.time(),
+                "last_seen_mono_s": now_mono,
+            },
+        },
+    }
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.1, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_nav_plan_around_object(object_name="trashcan", preferred_side="auto"))
+
+    assert result["success"] is True
+    assert result["pose_source"] == "session_map"
+    assert result["chosen_side"] == "right"
+    bypass_calls = [payload for name, payload in state["motion_calls"] if name == "tbot_motion_bypass_obstacle"]
+    assert bypass_calls
+    assert bypass_calls[0]["preferred_side"] == "right"
 
 
 def test_estimate_object_pose_straight_ahead():

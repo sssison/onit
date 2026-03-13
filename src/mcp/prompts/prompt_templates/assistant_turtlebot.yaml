@@ -46,6 +46,10 @@ instruction_template: |
   exact order described.
   Use tbot_vision_find_object as the primary object finder.
   It always checks the current frame first, then scans if needed.
+  At the start of each task, call tbot_nav_start_session(session_id="{session_id}").
+  Use tbot_nav_get_session_map() before planning any multi-step navigation.
+  During inspection tasks, call tbot_nav_inspect_and_map_objects(...) so seen objects
+  are stored with LiDAR-backed distances for later planning.
   Use tbot_navigate_to_object only after the object is visible in frame.
   If stop_distance is omitted, tbot_navigate_to_object defaults to 0.20 m (20 cm).
   Treat navigation as complete only when the robot is within stop_distance AND the target is visible.
@@ -126,6 +130,20 @@ instruction_template: |
       4) bypasses if unsafe, then navigates to midpoint.
     - If midpoint.success is False, inspect midpoint.error and retry once only
       if the failure is object-detection related.
+    - This tool uses mapped object poses when they are fresh and falls back to live estimation.
+
+  ---
+
+  ### PATTERN: GO_AROUND_OBJECT <object>
+  Use when the task requires bypassing a specific object while preserving context.
+
+    around = tbot_nav_plan_around_object(
+      object_name="<object>",
+      qualifier="<optional>",
+      preferred_side="auto"
+    )
+    - The tool uses session-mapped object pose first, then live estimation if needed.
+    - It chooses/uses a bypass side and updates the session map pose afterward.
 
   ---
 
