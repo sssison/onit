@@ -9,7 +9,6 @@ import json
 import logging
 import math
 import os
-from pathlib import Path
 import threading
 import time
 import uuid
@@ -48,11 +47,18 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"Invalid {name}={raw!r}; expected a float") from e
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return bool(default)
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+def _env_csv(name: str, default: str) -> list[str]:
+    raw = os.getenv(name, default)
+    values = [token.strip() for token in raw.split(",") if token.strip()]
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        lowered = value.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        unique.append(value)
+    return unique
 
 
 ODOM_TOPIC = os.getenv("ODOM_TOPIC", "/odom")
@@ -68,11 +74,11 @@ NAV_HEADING_KP = _env_float("NAV_HEADING_KP", 1.8)
 NAV_FINAL_YAW_KP = _env_float("NAV_FINAL_YAW_KP", 2.0)
 NAV_FRONT_THRESHOLD_M = max(0.05, _env_float("NAV_FRONT_THRESHOLD_M", 0.1))
 NAV_MAX_CONSECUTIVE_ODOM_FAILURES = max(1, int(_env_float("NAV_MAX_CONSECUTIVE_ODOM_FAILURES", 2.0)))
-NAV_FORWARD_STEP_M = max(0.03, _env_float("NAV_FORWARD_STEP_M", 0.12))
+NAV_FORWARD_STEP_M = max(0.03, _env_float("NAV_FORWARD_STEP_M", 0.20))
 NAV_TURN_STEP_DEG = max(1.0, _env_float("NAV_TURN_STEP_DEG", 12.0))
 NAV_HEADING_ALIGN_DEG = max(5.0, _env_float("NAV_HEADING_ALIGN_DEG", 15.0))
 TBOT_CAMERA_FOV_DEG = _env_float("TBOT_CAMERA_FOV_DEG", 62.0)
-NAV_OBJECT_APPROACH_STEP_M = max(0.05, _env_float("NAV_OBJECT_APPROACH_STEP_M", 0.25))
+NAV_OBJECT_APPROACH_STEP_M = max(0.05, _env_float("NAV_OBJECT_APPROACH_STEP_M", 0.30))
 NAV_OBJECT_MOVE_SPEED_MPS = max(0.03, _env_float("NAV_OBJECT_MOVE_SPEED_MPS", 0.10))
 NAV_OBJECT_TURN_SPEED_RPS = max(0.05, _env_float("NAV_OBJECT_TURN_SPEED_RPS", 0.30))
 NAV_OBJECT_MAX_APPROACH_STEPS = max(1, int(_env_float("NAV_OBJECT_MAX_APPROACH_STEPS", 80.0)))
@@ -80,10 +86,28 @@ NAV_OBJECT_RECENTER_EPS_DEG = max(0.5, _env_float("NAV_OBJECT_RECENTER_EPS_DEG",
 NAV_OBJECT_LOSS_CONFIRM_FRAMES = max(1, int(_env_float("NAV_OBJECT_LOSS_CONFIRM_FRAMES", 2.0)))
 NAV_OBJECT_DEFAULT_STOP_DISTANCE_M = max(0.05, _env_float("NAV_OBJECT_DEFAULT_STOP_DISTANCE_M", 0.20))
 NAV_MIDPOINT_TIMEOUT_S = max(5.0, _env_float("NAV_MIDPOINT_TIMEOUT_S", 45.0))
+NAV_FORWARD_CONE_HALF_WIDTH_DEG = max(5.0, _env_float("NAV_FORWARD_CONE_HALF_WIDTH_DEG", 30.0))
+NAV_MIDPOINT_SAMPLE_OFFSETS_DEG = (-10.0, 0.0, 10.0)
+NAV_SCAN_STEP_DEG = max(1.0, _env_float("NAV_SCAN_STEP_DEG", 10.0))
+NAV_SCAN_TURN_SPEED_RPS = max(0.05, _env_float("NAV_SCAN_TURN_SPEED_RPS", 0.5))
+NAV_SCAN_TURN_DURATION_S = max(0.01, _env_float("NAV_SCAN_TURN_DURATION_S", 0.56))
+NAV_SCAN_LIDAR_HALF_WIDTH_DEG = max(1.0, _env_float("NAV_SCAN_LIDAR_HALF_WIDTH_DEG", 5.0))
+NAV_SCAN_MERGE_RADIUS_M = max(0.05, _env_float("NAV_SCAN_MERGE_RADIUS_M", 0.3))
+NAV_SCAN_RESET_DISTANCE_M = max(0.1, _env_float("NAV_SCAN_RESET_DISTANCE_M", 0.5))
+NAV_SCAN_DEFAULT_LABELS = _env_csv(
+    "NAV_SCAN_DEFAULT_LABELS",
+    "chair,table,desk,door,cabinet,trashcan,bench,box,cone,person",
+)
 
 _rclpy_init_lock = threading.Lock()
-_session_state_lock = threading.Lock()
-_active_session_state: dict[str, Any] | None = None
+_spatial_map_lock = threading.Lock()
+_spatial_map_state: dict[str, Any] = {
+    "anchor_pose": None,
+    "objects": [],
+    "last_scan_pose": None,
+    "last_scan_time_s": None,
+    "scan_count": 0,
+}
 
 
 def _validate_finite(name: str, value: Any) -> float:
@@ -109,245 +133,6 @@ def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return math.atan2(siny_cosp, cosy_cosp)
-
-
-def _normalize_session_id(session_id: str | None) -> str:
-    if isinstance(session_id, str):
-        cleaned = session_id.strip()
-        if cleaned:
-            return cleaned
-    return "default"
-
-
-def _normalize_qualifier(qualifier: str | None) -> str:
-    if not isinstance(qualifier, str):
-        return ""
-    return qualifier.strip().lower()
-
-
-def _object_track_key(object_name: str, qualifier: str | None) -> str:
-    base = object_name.strip().lower()
-    qual = _normalize_qualifier(qualifier)
-    return f"{base}::{qual}" if qual else base
-
-
-def _sanitize_session_fragment(session_id: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in session_id)
-
-
-def _snapshot_path_for_session(session_id: str) -> Path:
-    safe_id = _sanitize_session_fragment(session_id)
-    if NAV_SESSION_MAP_SNAPSHOT_PATH:
-        if "{session_id}" in NAV_SESSION_MAP_SNAPSHOT_PATH:
-            return Path(NAV_SESSION_MAP_SNAPSHOT_PATH.format(session_id=safe_id))
-        if safe_id == "default":
-            return Path(NAV_SESSION_MAP_SNAPSHOT_PATH)
-        base, ext = os.path.splitext(NAV_SESSION_MAP_SNAPSHOT_PATH)
-        suffix = ext if ext else ".json"
-        return Path(f"{base}_{safe_id}{suffix}")
-    return Path(NAV_SESSION_MAP_SNAPSHOT_DIR) / f"tbot_session_map_{safe_id}.json"
-
-
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
-    os.replace(tmp_path, path)
-
-
-def _serialize_session_state(state: dict[str, Any], include_history: bool = False) -> dict[str, Any]:
-    objects = [dict(track) for track in state.get("objects", {}).values()]
-    payload: dict[str, Any] = {
-        "status": "ok",
-        "session_id": state.get("session_id"),
-        "active": True,
-        "started_at_mono_s": state.get("started_at_mono_s"),
-        "updated_at_unix_s": time.time(),
-        "initial_pose": state.get("initial_pose"),
-        "current_pose": state.get("current_pose"),
-        "object_count": len(objects),
-        "objects": objects,
-        "snapshot_path": str(_snapshot_path_for_session(str(state.get("session_id", "default")))),
-        "meta": {
-            "object_ttl_s": NAV_MAP_OBJECT_TTL_S,
-            "trail_max_points": NAV_SESSION_MAP_TRAIL_MAX_POINTS,
-        },
-    }
-    if include_history:
-        payload["robot_trail"] = list(state.get("robot_trail", []))
-    return payload
-
-
-def _persist_active_session_snapshot() -> None:
-    if not NAV_SESSION_MAP_PERSIST_ENABLED:
-        return
-    with _session_state_lock:
-        state = dict(_active_session_state) if isinstance(_active_session_state, dict) else None
-        if state is None:
-            return
-        # Keep nested copies immutable outside the lock.
-        state["objects"] = {
-            str(key): dict(value) for key, value in dict(_active_session_state.get("objects", {})).items()  # type: ignore[union-attr]
-        }
-        state["robot_trail"] = list(_active_session_state.get("robot_trail", []))  # type: ignore[union-attr]
-    payload = _serialize_session_state(state, include_history=True)
-    _atomic_write_json(_snapshot_path_for_session(str(state.get("session_id", "default"))), payload)
-
-
-def _session_upsert_current_pose(x_m: float, y_m: float, yaw_rad: float, stamp_sec: float | None = None) -> None:
-    with _session_state_lock:
-        if not isinstance(_active_session_state, dict):
-            return
-        pose = {
-            "x_m": float(x_m),
-            "y_m": float(y_m),
-            "yaw_rad": float(yaw_rad),
-            "stamp_sec": float(stamp_sec) if isinstance(stamp_sec, (int, float)) and math.isfinite(float(stamp_sec)) else None,
-            "updated_at_mono_s": time.monotonic(),
-        }
-        _active_session_state["current_pose"] = pose
-        if _active_session_state.get("initial_pose") is None:
-            _active_session_state["initial_pose"] = dict(pose)
-        trail = _active_session_state.setdefault("robot_trail", [])
-        if isinstance(trail, list):
-            trail.append({"x_m": pose["x_m"], "y_m": pose["y_m"], "yaw_rad": pose["yaw_rad"]})
-            if len(trail) > NAV_SESSION_MAP_TRAIL_MAX_POINTS:
-                del trail[:-NAV_SESSION_MAP_TRAIL_MAX_POINTS]
-    _persist_active_session_snapshot()
-
-
-def _session_upsert_object_track(
-    object_name: str,
-    qualifier: str | None,
-    object_x_m: float,
-    object_y_m: float,
-    distance_m: float,
-    heading_deg: float,
-    confidence: str,
-    source: str,
-) -> None:
-    with _session_state_lock:
-        if not isinstance(_active_session_state, dict):
-            return
-        key = _object_track_key(object_name, qualifier)
-        tracks = _active_session_state.setdefault("objects", {})
-        if not isinstance(tracks, dict):
-            return
-        existing = tracks.get(key, {})
-        seen_count = int(existing.get("seen_count", 0)) + 1 if isinstance(existing, dict) else 1
-        track = {
-            "key": key,
-            "object_name": object_name,
-            "qualifier": qualifier.strip() if isinstance(qualifier, str) and qualifier.strip() else None,
-            "estimated_object_pose": {"x_m": float(object_x_m), "y_m": float(object_y_m)},
-            "distance_m": float(distance_m),
-            "heading_deg": float(heading_deg),
-            "confidence": confidence,
-            "source": source,
-            "seen_count": seen_count,
-            "last_seen_unix_s": time.time(),
-            "last_seen_mono_s": time.monotonic(),
-        }
-        tracks[key] = track
-    _persist_active_session_snapshot()
-
-
-def _session_get_fresh_object_track(
-    object_name: str,
-    qualifier: str | None,
-    ttl_s: float = NAV_MAP_OBJECT_TTL_S,
-) -> dict[str, Any] | None:
-    with _session_state_lock:
-        if not isinstance(_active_session_state, dict):
-            return None
-        tracks = _active_session_state.get("objects")
-        if not isinstance(tracks, dict):
-            return None
-        key = _object_track_key(object_name, qualifier)
-        track = tracks.get(key)
-        if not isinstance(track, dict):
-            return None
-        seen_mono = track.get("last_seen_mono_s")
-        if not isinstance(seen_mono, (int, float)) or not math.isfinite(float(seen_mono)):
-            return None
-        if time.monotonic() - float(seen_mono) > float(ttl_s):
-            return None
-        return dict(track)
-
-
-def _track_to_pose_estimate(track: dict[str, Any]) -> dict[str, Any] | None:
-    if not isinstance(track, dict):
-        return None
-    pose = track.get("estimated_object_pose")
-    if not isinstance(pose, dict):
-        return None
-    x_m = pose.get("x_m")
-    y_m = pose.get("y_m")
-    if not isinstance(x_m, (int, float)) or not isinstance(y_m, (int, float)):
-        return None
-    heading = track.get("heading_deg")
-    distance = track.get("distance_m")
-    confidence = track.get("confidence", "low")
-    return {
-        "success": True,
-        "x": float(x_m),
-        "y": float(y_m),
-        "heading_deg": float(heading) if isinstance(heading, (int, float)) else None,
-        "distance_m": float(distance) if isinstance(distance, (int, float)) else None,
-        "confidence": confidence,
-        "source": "session_map",
-    }
-
-
-def _session_has_active_state() -> bool:
-    with _session_state_lock:
-        return isinstance(_active_session_state, dict)
-
-
-async def _session_capture_current_pose() -> dict[str, Any] | None:
-    if not _session_has_active_state():
-        return None
-    pose = await tbot_nav_get_pose()
-    if pose.get("status") != "ok":
-        return None
-    _session_upsert_current_pose(
-        x_m=float(pose["x_m"]),
-        y_m=float(pose["y_m"]),
-        yaw_rad=float(pose["yaw_rad"]),
-        stamp_sec=float(pose["stamp_sec"]) if isinstance(pose.get("stamp_sec"), (int, float)) else None,
-    )
-    return pose
-
-
-def _session_snapshot(include_history: bool = False) -> dict[str, Any]:
-    with _session_state_lock:
-        if not isinstance(_active_session_state, dict):
-            return {"status": "no_session", "active": False}
-        state = dict(_active_session_state)
-        state["objects"] = {str(k): dict(v) for k, v in dict(_active_session_state.get("objects", {})).items()}
-        state["robot_trail"] = list(_active_session_state.get("robot_trail", []))
-    return _serialize_session_state(state, include_history=include_history)
-
-
-def _session_upsert_current_pose_from_nav_pose(pose: dict[str, Any]) -> None:
-    if not isinstance(pose, dict):
-        return
-    status = pose.get("status")
-    if status is not None and status != "ok":
-        return
-    x_m = pose.get("x_m")
-    y_m = pose.get("y_m")
-    yaw_rad = pose.get("yaw_rad")
-    if not isinstance(x_m, (int, float)) or not isinstance(y_m, (int, float)) or not isinstance(yaw_rad, (int, float)):
-        return
-    stamp = pose.get("stamp_sec")
-    _session_upsert_current_pose(
-        x_m=float(x_m),
-        y_m=float(y_m),
-        yaw_rad=float(yaw_rad),
-        stamp_sec=float(stamp) if isinstance(stamp, (int, float)) and math.isfinite(float(stamp)) else None,
-    )
 
 
 def _extract_tool_result_dict(tool_result: Any) -> dict[str, Any]:
@@ -521,24 +306,210 @@ def _extract_front_distance(collision: dict[str, Any]) -> float | None:
     return None
 
 
+def _extract_valid_distance(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
+
+
+def _extract_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value) != 0.0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "y", "1"}:
+            return True
+        if lowered in {"false", "no", "n", "0"}:
+            return False
+    return default
+
+
+def _normalize_confidence(value: Any, default: float = 1.0) -> float:
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+        if math.isfinite(parsed):
+            return max(0.0, min(1.0, parsed))
+    return max(0.0, min(1.0, float(default)))
+
+
+def _sanitize_scan_labels(labels: list[str] | None) -> list[str]:
+    if labels is None:
+        candidates = NAV_SCAN_DEFAULT_LABELS
+    else:
+        candidates = labels
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        token = value.strip()
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        cleaned.append(token)
+    return cleaned
+
+
+def _distance_between_points_m(x1: float, y1: float, x2: float, y2: float) -> float:
+    return math.hypot(x2 - x1, y2 - y1)
+
+
+def _bearing_distance_from_xy(x_m: float, y_m: float) -> tuple[float, float]:
+    distance_m = math.hypot(x_m, y_m)
+    if distance_m <= 0.0:
+        return 0.0, 0.0
+    bearing_deg = (math.degrees(math.atan2(x_m, y_m)) + 360.0) % 360.0
+    return bearing_deg, distance_m
+
+
+def _bearing_distance_to_world(
+    robot_x_m: float,
+    robot_y_m: float,
+    robot_yaw_rad: float,
+    distance_m: float,
+    bearing_deg: float,
+) -> tuple[float, float]:
+    bearing_rad = math.radians(bearing_deg)
+    local_x_right_m = distance_m * math.sin(bearing_rad)
+    local_y_forward_m = distance_m * math.cos(bearing_rad)
+
+    world_dx_m = (local_y_forward_m * math.cos(robot_yaw_rad)) + (local_x_right_m * math.sin(robot_yaw_rad))
+    world_dy_m = (local_y_forward_m * math.sin(robot_yaw_rad)) - (local_x_right_m * math.cos(robot_yaw_rad))
+    return robot_x_m + world_dx_m, robot_y_m + world_dy_m
+
+
+def _world_to_anchor_xy(
+    world_x_m: float,
+    world_y_m: float,
+    anchor_x_m: float,
+    anchor_y_m: float,
+    anchor_yaw_rad: float,
+) -> tuple[float, float]:
+    dx_m = world_x_m - anchor_x_m
+    dy_m = world_y_m - anchor_y_m
+    x_right_m = (dx_m * math.sin(anchor_yaw_rad)) - (dy_m * math.cos(anchor_yaw_rad))
+    y_forward_m = (dx_m * math.cos(anchor_yaw_rad)) + (dy_m * math.sin(anchor_yaw_rad))
+    return x_right_m, y_forward_m
+
+
+def _copy_spatial_map_state() -> dict[str, Any]:
+    with _spatial_map_lock:
+        anchor_pose = _spatial_map_state.get("anchor_pose")
+        objects = _spatial_map_state.get("objects") or []
+        last_scan_pose = _spatial_map_state.get("last_scan_pose")
+        return {
+            "anchor_pose": dict(anchor_pose) if isinstance(anchor_pose, dict) else None,
+            "objects": [dict(item) for item in objects if isinstance(item, dict)],
+            "last_scan_pose": dict(last_scan_pose) if isinstance(last_scan_pose, dict) else None,
+            "last_scan_time_s": _spatial_map_state.get("last_scan_time_s"),
+            "scan_count": int(_spatial_map_state.get("scan_count", 0)),
+        }
+
+
+def _replace_spatial_map_state(
+    *,
+    anchor_pose: dict[str, float] | None,
+    objects: list[dict[str, Any]],
+    last_scan_pose: dict[str, float] | None,
+) -> dict[str, Any]:
+    with _spatial_map_lock:
+        _spatial_map_state["anchor_pose"] = dict(anchor_pose) if isinstance(anchor_pose, dict) else None
+        _spatial_map_state["objects"] = [dict(item) for item in objects]
+        _spatial_map_state["last_scan_pose"] = dict(last_scan_pose) if isinstance(last_scan_pose, dict) else None
+        _spatial_map_state["last_scan_time_s"] = time.time()
+        _spatial_map_state["scan_count"] = int(_spatial_map_state.get("scan_count", 0)) + 1
+        return {
+            "anchor_pose": (
+                dict(_spatial_map_state["anchor_pose"])
+                if isinstance(_spatial_map_state.get("anchor_pose"), dict)
+                else None
+            ),
+            "objects": [dict(item) for item in _spatial_map_state.get("objects", []) if isinstance(item, dict)],
+            "last_scan_pose": (
+                dict(_spatial_map_state["last_scan_pose"])
+                if isinstance(_spatial_map_state.get("last_scan_pose"), dict)
+                else None
+            ),
+            "last_scan_time_s": _spatial_map_state.get("last_scan_time_s"),
+            "scan_count": int(_spatial_map_state.get("scan_count", 0)),
+        }
+
+
+def _merge_spatial_detection(
+    objects: list[dict[str, Any]],
+    *,
+    label: str,
+    x_m: float,
+    y_m: float,
+    confidence: float,
+    merge_radius_m: float = NAV_SCAN_MERGE_RADIUS_M,
+) -> None:
+    merge_index: int | None = None
+    nearest_distance: float | None = None
+    for index, entry in enumerate(objects):
+        if str(entry.get("label", "")).lower() != label.lower():
+            continue
+        existing_x = _extract_valid_distance(entry.get("x"))
+        existing_y = _extract_valid_distance(entry.get("y"))
+        if existing_x is None or existing_y is None:
+            continue
+        separation = _distance_between_points_m(existing_x, existing_y, x_m, y_m)
+        if separation > merge_radius_m:
+            continue
+        if nearest_distance is None or separation < nearest_distance:
+            nearest_distance = separation
+            merge_index = index
+
+    if merge_index is None:
+        bearing_deg, distance_m = _bearing_distance_from_xy(x_m, y_m)
+        objects.append(
+            {
+                "label": label,
+                "x": x_m,
+                "y": y_m,
+                "distance_m": distance_m,
+                "bearing_deg": bearing_deg,
+                "confidence": confidence,
+                "sighting_count": 1,
+            }
+        )
+        return
+
+    entry = objects[merge_index]
+    old_x = _extract_valid_distance(entry.get("x")) or x_m
+    old_y = _extract_valid_distance(entry.get("y")) or y_m
+    old_confidence = _normalize_confidence(entry.get("confidence"), default=confidence)
+    old_sightings = max(1, int(entry.get("sighting_count", 1)))
+
+    old_weight = max(0.05, old_confidence) * float(old_sightings)
+    new_weight = max(0.05, confidence)
+    total_weight = old_weight + new_weight
+    merged_x = ((old_x * old_weight) + (x_m * new_weight)) / total_weight
+    merged_y = ((old_y * old_weight) + (y_m * new_weight)) / total_weight
+    merged_confidence = (
+        (old_confidence * float(old_sightings)) + confidence
+    ) / float(old_sightings + 1)
+    bearing_deg, distance_m = _bearing_distance_from_xy(merged_x, merged_y)
+
+    entry["x"] = merged_x
+    entry["y"] = merged_y
+    entry["distance_m"] = distance_m
+    entry["bearing_deg"] = bearing_deg
+    entry["confidence"] = max(0.0, min(1.0, merged_confidence))
+    entry["sighting_count"] = old_sightings + 1
+
+
 def _qualifier_to_attributes(qualifier: str | None) -> list[str] | None:
     if isinstance(qualifier, str):
         cleaned = qualifier.strip()
         if cleaned:
             return [cleaned]
     return None
-
-
-def _qualifier_from_list(qualifiers: list[str] | None, index: int) -> str | None:
-    if not isinstance(qualifiers, list):
-        return None
-    if index < 0 or index >= len(qualifiers):
-        return None
-    value = qualifiers[index]
-    if not isinstance(value, str):
-        return None
-    cleaned = value.strip()
-    return cleaned if cleaned else None
 
 
 def _heading_offset_from_bbox_deg(bbox: Any, camera_fov_deg: float = TBOT_CAMERA_FOV_DEG) -> float | None:
@@ -580,7 +551,10 @@ async def _turn_by_degrees(motion: Client, turn_deg: float, speed_rps: float) ->
 async def _call_lidar_collision(lidar: Client) -> dict[str, Any]:
     raw = await lidar.call_tool(
         "tbot_lidar_check_collision",
-        {"front_threshold_m": NAV_FRONT_THRESHOLD_M},
+        {
+            "front_threshold_m": NAV_FRONT_THRESHOLD_M,
+            "sector_half_width_deg": NAV_FORWARD_CONE_HALF_WIDTH_DEG,
+        },
     )
     return _extract_tool_result_dict(raw)
 
@@ -712,151 +686,244 @@ async def tbot_nav_get_pose(timeout_s: float = ODOM_TIMEOUT_S) -> dict[str, Any]
 
 
 @mcp_nav_v3.tool()
-async def tbot_nav_start_session(
-    session_id: str | None = None,
-    reset: bool = False,
+async def tbot_scan_spatial_map(
+    labels: list[str] | None = None,
+    step_deg: float = NAV_SCAN_STEP_DEG,
+    turn_speed: float = NAV_SCAN_TURN_SPEED_RPS,
+    turn_duration_s: float = NAV_SCAN_TURN_DURATION_S,
+    lidar_half_width_deg: float = NAV_SCAN_LIDAR_HALF_WIDTH_DEG,
+    reset_if_moved_m: float = NAV_SCAN_RESET_DISTANCE_M,
 ) -> dict[str, Any]:
     """
-    Start or refresh a navigation session map and capture initial/current pose.
+    Run a 360 scan by turn/lidar/vision steps and update an in-memory spatial map.
     """
-    session_id_clean = _normalize_session_id(session_id)
-    pose = await tbot_nav_get_pose()
-    if pose.get("status") != "ok":
+    labels_clean = _sanitize_scan_labels(labels)
+    if not labels_clean:
         return {
-            "status": "no_odom",
-            "session_id": session_id_clean,
-            "active": False,
-            "error": pose.get("error", "no_odom"),
+            "success": False,
+            "error": "no_labels_configured",
+            "anchor_pose": None,
+            "objects": [],
+            "steps_requested": 0,
+            "steps_completed": 0,
+            "labels": [],
         }
 
-    current_pose = {
-        "x_m": float(pose["x_m"]),
-        "y_m": float(pose["y_m"]),
-        "yaw_rad": float(pose["yaw_rad"]),
-        "stamp_sec": float(pose["stamp_sec"]) if isinstance(pose.get("stamp_sec"), (int, float)) else None,
-        "updated_at_mono_s": time.monotonic(),
+    step_f = _validate_finite("step_deg", step_deg)
+    turn_speed_f = abs(_validate_finite("turn_speed", turn_speed))
+    turn_duration_f = _validate_finite("turn_duration_s", turn_duration_s)
+    lidar_half_width_f = _validate_finite("lidar_half_width_deg", lidar_half_width_deg)
+    reset_if_moved_f = _validate_finite("reset_if_moved_m", reset_if_moved_m)
+
+    if step_f <= 0 or step_f > 180:
+        raise ValueError("step_deg must be in (0, 180]")
+    if turn_speed_f <= 0:
+        raise ValueError("turn_speed must be > 0")
+    if turn_duration_f <= 0:
+        raise ValueError("turn_duration_s must be > 0")
+    if lidar_half_width_f <= 0:
+        raise ValueError("lidar_half_width_deg must be > 0")
+    if reset_if_moved_f < 0:
+        raise ValueError("reset_if_moved_m must be >= 0")
+
+    steps = max(1, int(round(360.0 / step_f)))
+    effective_step_deg = 360.0 / float(steps)
+    turn_duration_step_s = turn_duration_f * (effective_step_deg / NAV_SCAN_STEP_DEG)
+    scan_pose_raw = await tbot_nav_get_pose()
+    if scan_pose_raw.get("status") != "ok":
+        return {
+            "success": False,
+            "error": scan_pose_raw.get("error", "no_odom"),
+            "anchor_pose": None,
+            "objects": [],
+            "steps_requested": steps,
+            "steps_completed": 0,
+            "labels": labels_clean,
+        }
+
+    scan_pose = {
+        "x": float(scan_pose_raw["x_m"]),
+        "y": float(scan_pose_raw["y_m"]),
+        "yaw_rad": float(scan_pose_raw["yaw_rad"]),
     }
 
-    global _active_session_state
-    with _session_state_lock:
-        prior = _active_session_state if isinstance(_active_session_state, dict) else None
-        reuse_prior = (
-            prior is not None
-            and not bool(reset)
-            and str(prior.get("session_id")) == session_id_clean
-        )
-        if reuse_prior:
-            initial_pose = dict(prior.get("initial_pose") or current_pose)
-            objects = {
-                str(key): dict(value)
-                for key, value in dict(prior.get("objects", {})).items()
-            }
-            trail = list(prior.get("robot_trail", []))
-            started_at = float(prior.get("started_at_mono_s", time.monotonic()))
-        else:
-            initial_pose = dict(current_pose)
-            objects = {}
-            trail = []
-            started_at = time.monotonic()
+    state_snapshot = _copy_spatial_map_state()
+    anchor_pose = state_snapshot.get("anchor_pose")
+    objects = state_snapshot.get("objects") if isinstance(state_snapshot.get("objects"), list) else []
+    if not isinstance(anchor_pose, dict):
+        anchor_pose = dict(scan_pose)
+        objects = []
 
-        trail.append(
-            {
-                "x_m": current_pose["x_m"],
-                "y_m": current_pose["y_m"],
-                "yaw_rad": current_pose["yaw_rad"],
-            }
-        )
-        if len(trail) > NAV_SESSION_MAP_TRAIL_MAX_POINTS:
-            del trail[:-NAV_SESSION_MAP_TRAIL_MAX_POINTS]
+    reset_performed = False
+    reset_reason: str | None = None
+    distance_from_anchor = _distance_between_points_m(
+        scan_pose["x"],
+        scan_pose["y"],
+        float(anchor_pose["x"]),
+        float(anchor_pose["y"]),
+    )
+    if distance_from_anchor > reset_if_moved_f:
+        reset_performed = True
+        reset_reason = "robot_moved"
+        anchor_pose = dict(scan_pose)
+        objects = []
 
-        _active_session_state = {
-            "session_id": session_id_clean,
-            "started_at_mono_s": started_at,
-            "initial_pose": initial_pose,
-            "current_pose": current_pose,
-            "objects": objects,
-            "robot_trail": trail,
+    steps_completed = 0
+    detections_observed = 0
+    errors: list[dict[str, Any]] = []
+
+    try:
+        async with Client(MOTION_MCP_URL_V3) as motion:
+            async with Client(LIDAR_MCP_URL_V3) as lidar:
+                async with Client(VISION_MCP_URL_V3) as vision:
+                    for step_index in range(steps):
+                        await motion.call_tool(
+                            "tbot_motion_turn",
+                            {
+                                "direction": "left",
+                                "speed": turn_speed_f,
+                                "duration_seconds": turn_duration_step_s,
+                            },
+                        )
+                        steps_completed += 1
+                        bearing_deg = (float(steps_completed) * effective_step_deg) % 360.0
+
+                        obstacle_distance_m: float | None = None
+                        try:
+                            distance_raw = await lidar.call_tool(
+                                "tbot_lidar_get_distance_at_angle",
+                                {
+                                    "angle_deg": 0.0,
+                                    "half_width_deg": lidar_half_width_f,
+                                    "statistic": "min",
+                                },
+                            )
+                            distance_result = _extract_tool_result_dict(distance_raw)
+                            obstacle_distance_m = _extract_valid_distance(distance_result.get("distance_m"))
+                        except Exception as e:
+                            errors.append(
+                                {
+                                    "step": steps_completed,
+                                    "type": "lidar_error",
+                                    "error": str(e),
+                                }
+                            )
+
+                        for label in labels_clean:
+                            try:
+                                bbox_raw = await vision.call_tool(
+                                    "tbot_vision_get_object_bbox",
+                                    {"object_name": label},
+                                )
+                                bbox_result = _extract_tool_result_dict(bbox_raw)
+                            except Exception as e:
+                                errors.append(
+                                    {
+                                        "step": steps_completed,
+                                        "type": "vision_error",
+                                        "label": label,
+                                        "error": str(e),
+                                    }
+                                )
+                                continue
+
+                            if not _extract_bool(bbox_result.get("visible"), default=False):
+                                continue
+
+                            bbox = bbox_result.get("bbox")
+                            distance_m = obstacle_distance_m
+                            if distance_m is None:
+                                distance_m = _heuristic_distance_from_bbox_m(bbox)
+                            if distance_m is None:
+                                continue
+
+                            confidence = _normalize_confidence(bbox_result.get("confidence"), default=1.0)
+                            world_x_m, world_y_m = _bearing_distance_to_world(
+                                robot_x_m=scan_pose["x"],
+                                robot_y_m=scan_pose["y"],
+                                robot_yaw_rad=scan_pose["yaw_rad"],
+                                distance_m=distance_m,
+                                bearing_deg=bearing_deg,
+                            )
+                            anchor_x_m, anchor_y_m = _world_to_anchor_xy(
+                                world_x_m=world_x_m,
+                                world_y_m=world_y_m,
+                                anchor_x_m=float(anchor_pose["x"]),
+                                anchor_y_m=float(anchor_pose["y"]),
+                                anchor_yaw_rad=float(anchor_pose["yaw_rad"]),
+                            )
+                            _merge_spatial_detection(
+                                objects,
+                                label=label,
+                                x_m=anchor_x_m,
+                                y_m=anchor_y_m,
+                                confidence=confidence,
+                                merge_radius_m=NAV_SCAN_MERGE_RADIUS_M,
+                            )
+                            detections_observed += 1
+                    await _safe_motion_stop(motion)
+    except Exception as e:
+        try:
+            async with Client(MOTION_MCP_URL_V3) as motion:
+                await _safe_motion_stop(motion)
+        except Exception:
+            pass
+        stored = _replace_spatial_map_state(
+            anchor_pose=anchor_pose,
+            objects=objects,
+            last_scan_pose=scan_pose,
+        )
+        return {
+            "success": False,
+            "error": f"scan_failed: {e}",
+            "anchor_pose": stored.get("anchor_pose"),
+            "objects": stored.get("objects"),
+            "steps_requested": steps,
+            "steps_completed": steps_completed,
+            "labels": labels_clean,
+            "detections_observed": detections_observed,
+            "reset_performed": reset_performed,
+            "reset_reason": reset_reason,
+            "errors": errors,
         }
 
-    _persist_active_session_snapshot()
-    return _session_snapshot(include_history=True)
-
-
-@mcp_nav_v3.tool()
-async def tbot_nav_get_session_map(include_history: bool = False) -> dict[str, Any]:
-    """
-    Return the active session map (initial pose, current pose, tracked objects).
-    """
-    await _session_capture_current_pose()
-    return _session_snapshot(include_history=bool(include_history))
-
-
-@mcp_nav_v3.tool()
-async def tbot_nav_reset_session_map(session_id: str | None = None) -> dict[str, Any]:
-    """
-    Clear tracked objects and reset the active session baseline pose.
-    """
-    return await tbot_nav_start_session(session_id=session_id, reset=True)
-
-
-@mcp_nav_v3.tool()
-async def tbot_nav_inspect_and_map_objects(
-    objects: list[str],
-    qualifiers: list[str] | None = None,
-) -> dict[str, Any]:
-    """
-    Inspect a list of objects and upsert LiDAR-backed pose estimates into the session map.
-    """
-    if not isinstance(objects, list) or not objects:
-        raise ValueError("objects must be a non-empty list of strings")
-    if isinstance(qualifiers, list) and len(qualifiers) not in (0, len(objects)):
-        raise ValueError("qualifiers must be empty or match objects length")
-
-    if not _session_has_active_state():
-        start_result = await tbot_nav_start_session()
-        if start_result.get("status") != "ok":
-            return {
-                "status": "no_session",
-                "error": start_result.get("error", "failed_to_start_session"),
-                "session": start_result,
-                "results": [],
-            }
-
-    results: list[dict[str, Any]] = []
-    mapped_count = 0
-    for idx, raw_name in enumerate(objects):
-        name = raw_name.strip() if isinstance(raw_name, str) else ""
-        if not name:
-            results.append(
-                {
-                    "object_name": raw_name,
-                    "qualifier": _qualifier_from_list(qualifiers, idx),
-                    "success": False,
-                    "error": "invalid_object_name",
-                }
-            )
-            continue
-        qualifier = _qualifier_from_list(qualifiers, idx)
-        estimate = await tbot_estimate_object_pose(target=name, qualifier=qualifier)
-        mapped = bool(estimate.get("success"))
-        if mapped:
-            mapped_count += 1
-        results.append(
-            {
-                "object_name": name,
-                "qualifier": qualifier,
-                "success": mapped,
-                "estimate": estimate,
-            }
-        )
-
-    snapshot = _session_snapshot(include_history=False)
+    stored = _replace_spatial_map_state(
+        anchor_pose=anchor_pose,
+        objects=objects,
+        last_scan_pose=scan_pose,
+    )
     return {
-        "status": "ok",
-        "requested_count": len(objects),
-        "mapped_count": mapped_count,
-        "results": results,
-        "session": snapshot,
+        "success": True,
+        "anchor_pose": stored.get("anchor_pose"),
+        "objects": stored.get("objects"),
+        "steps_requested": steps,
+        "steps_completed": steps_completed,
+        "labels": labels_clean,
+        "detections_observed": detections_observed,
+        "reset_performed": reset_performed,
+        "reset_reason": reset_reason,
+        "errors": errors,
+        "scan_count": stored.get("scan_count"),
+        "last_scan_pose": stored.get("last_scan_pose"),
+        "last_scan_time_s": stored.get("last_scan_time_s"),
+    }
+
+
+@mcp_nav_v3.tool()
+async def tbot_get_spatial_map() -> dict[str, Any]:
+    """
+    Return the in-memory spatial map built by tbot_scan_spatial_map.
+    """
+    snapshot = _copy_spatial_map_state()
+    anchor_pose = snapshot.get("anchor_pose")
+    status = "ok" if isinstance(anchor_pose, dict) else "empty"
+    return {
+        "status": status,
+        "anchor_pose": anchor_pose,
+        "objects": snapshot.get("objects", []),
+        "last_scan_pose": snapshot.get("last_scan_pose"),
+        "last_scan_time_s": snapshot.get("last_scan_time_s"),
+        "scan_count": snapshot.get("scan_count", 0),
     }
 
 
@@ -949,12 +1016,6 @@ async def tbot_nav_go_to_pose(
                     "child_frame_id": odom.get("child_frame_id"),
                     "stamp_sec": odom.get("stamp_sec"),
                 }
-                _session_upsert_current_pose(
-                    x_m=x_cur,
-                    y_m=y_cur,
-                    yaw_rad=yaw_cur,
-                    stamp_sec=float(odom["stamp_sec"]) if isinstance(odom.get("stamp_sec"), (int, float)) else None,
-                )
 
                 dx = x_target - x_cur
                 dy = y_target - y_cur
@@ -1002,11 +1063,7 @@ async def tbot_nav_go_to_pose(
                         )
                     else:
                         try:
-                            collision_raw = await lidar.call_tool(
-                                "tbot_lidar_check_collision",
-                                {"front_threshold_m": NAV_FRONT_THRESHOLD_M},
-                            )
-                            collision = _extract_tool_result_dict(collision_raw)
+                            collision = await _call_lidar_collision(lidar)
                             risk_level = collision.get("risk_level", "unknown")
                             front_distance = _extract_front_distance(collision)
                         except Exception as e:
@@ -1029,16 +1086,29 @@ async def tbot_nav_go_to_pose(
                             }
 
                         caution_scale = 0.5 if risk_level == "caution" else 1.0
-                        step_distance = min(distance, NAV_FORWARD_STEP_M, max_linear)
-                        step_distance = max(0.0, step_distance * caution_scale)
-                        if step_distance <= 0.0:
-                            await asyncio.sleep(0.05)
-                            continue
-                        step_speed = min(max_linear, max(0.03, distance))
-                        step_speed = max(0.03, step_speed * caution_scale)
+                        segment_speed = min(max_linear, max(0.03, distance))
+                        segment_speed = max(0.03, segment_speed * caution_scale)
+                        base_step_m = min(distance, NAV_FORWARD_STEP_M) * caution_scale
+                        step_distance_m = base_step_m
+                        if front_distance is not None:
+                            clearance_cap_m = max(0.0, front_distance - NAV_FRONT_THRESHOLD_M)
+                            step_distance_m = min(step_distance_m, clearance_cap_m)
+                        if step_distance_m <= 0.0 and not reached_pos:
+                            await _safe_motion_stop(motion)
+                            return {
+                                "status": "collision_blocked",
+                                "target": {"x_m": x_target, "y_m": y_target, "yaw_rad": yaw_target},
+                                "distance_remaining_m": distance,
+                                "yaw_error_rad": yaw_error,
+                                "elapsed_s": time.monotonic() - started,
+                                "steps": steps,
+                                "last_pose": last_pose,
+                                "front_distance_m": front_distance,
+                                "collision": collision,
+                            }
                         await motion.call_tool(
                             "tbot_motion_move_forward_distance",
-                            {"distance_m": step_distance, "speed": step_speed},
+                            {"distance_m": step_distance_m, "speed": segment_speed},
                         )
                 except Exception as e:
                     await _safe_motion_stop(motion)
@@ -1147,23 +1217,6 @@ async def tbot_estimate_object_pose(
     object_x = robot_x + (lidar_distance_m * math.cos(object_heading_rad))
     object_y = robot_y + (lidar_distance_m * math.sin(object_heading_rad))
 
-    _session_upsert_current_pose(
-        x_m=robot_x,
-        y_m=robot_y,
-        yaw_rad=float(pose["yaw_rad"]),
-        stamp_sec=float(pose["stamp_sec"]) if isinstance(pose.get("stamp_sec"), (int, float)) else None,
-    )
-    _session_upsert_object_track(
-        object_name=target_clean,
-        qualifier=qualifier,
-        object_x_m=object_x,
-        object_y_m=object_y,
-        distance_m=lidar_distance_m,
-        heading_deg=object_heading_deg,
-        confidence=confidence,
-        source="tbot_estimate_object_pose",
-    )
-
     return {
         "success": True,
         "x": object_x,
@@ -1196,19 +1249,7 @@ async def tbot_nav_go_to_midpoint_between_objects(
     if timeout_f <= 0:
         raise ValueError("timeout_s must be > 0")
 
-    map_usage: dict[str, Any] = {
-        "object_1_source": "estimated_live",
-        "object_2_source": "estimated_live",
-        "used_session_map": False,
-    }
-
-    pose_1_track = _session_get_fresh_object_track(object_1_clean, qualifier_1, NAV_MAP_OBJECT_TTL_S)
-    pose_1 = _track_to_pose_estimate(pose_1_track) if pose_1_track is not None else None
-    if pose_1 is not None:
-        map_usage["object_1_source"] = "session_map"
-        map_usage["used_session_map"] = True
-    else:
-        pose_1 = await tbot_estimate_object_pose(target=object_1_clean, qualifier=qualifier_1)
+    pose_1 = await tbot_estimate_object_pose(target=object_1_clean, qualifier=qualifier_1)
     if not bool(pose_1.get("success")):
         return {
             "success": False,
@@ -1218,19 +1259,12 @@ async def tbot_nav_go_to_midpoint_between_objects(
             "relative_from_object_1": None,
             "midpoint": None,
             "midpoint_safety": None,
-            "map_usage": map_usage,
             "used_bypass": False,
             "bypass_result": {},
             "nav_result": None,
         }
 
-    pose_2_track = _session_get_fresh_object_track(object_2_clean, qualifier_2, NAV_MAP_OBJECT_TTL_S)
-    pose_2 = _track_to_pose_estimate(pose_2_track) if pose_2_track is not None else None
-    if pose_2 is not None:
-        map_usage["object_2_source"] = "session_map"
-        map_usage["used_session_map"] = True
-    else:
-        pose_2 = await tbot_estimate_object_pose(target=object_2_clean, qualifier=qualifier_2)
+    pose_2 = await tbot_estimate_object_pose(target=object_2_clean, qualifier=qualifier_2)
     if not bool(pose_2.get("success")):
         return {
             "success": False,
@@ -1240,7 +1274,6 @@ async def tbot_nav_go_to_midpoint_between_objects(
             "relative_from_object_1": None,
             "midpoint": None,
             "midpoint_safety": None,
-            "map_usage": map_usage,
             "used_bypass": False,
             "bypass_result": {},
             "nav_result": None,
@@ -1270,7 +1303,6 @@ async def tbot_nav_go_to_midpoint_between_objects(
             },
             "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
             "midpoint_safety": None,
-            "map_usage": map_usage,
             "used_bypass": False,
             "bypass_result": {},
             "nav_result": None,
@@ -1287,28 +1319,84 @@ async def tbot_nav_go_to_midpoint_between_objects(
     required_clearance_m = distance_to_midpoint_m + NAV_FRONT_THRESHOLD_M
 
     lidar_check: dict[str, Any] = {}
+    lidar_samples: list[dict[str, Any]] = []
+    valid_sample_distances: list[float] = []
     measured_lidar_distance_m: float | None = None
+    midpoint_safety_class = "inconclusive"
     try:
         async with Client(LIDAR_MCP_URL_V3) as lidar:
-            lidar_raw = await lidar.call_tool(
-                "tbot_lidar_get_distance_at_angle",
-                {"angle_deg": relative_angle_deg},
-            )
-            lidar_check = _extract_tool_result_dict(lidar_raw)
+            for offset_deg in NAV_MIDPOINT_SAMPLE_OFFSETS_DEG:
+                sample_angle_deg = relative_angle_deg + float(offset_deg)
+                sample_payload: dict[str, Any]
+                sample_distance_m: float | None = None
+                try:
+                    lidar_raw = await lidar.call_tool(
+                        "tbot_lidar_get_distance_at_angle",
+                        {"angle_deg": sample_angle_deg},
+                    )
+                    sample_payload = _extract_tool_result_dict(lidar_raw)
+                    sample_distance_m = _extract_valid_distance(sample_payload.get("distance_m"))
+                    if sample_distance_m is not None:
+                        valid_sample_distances.append(sample_distance_m)
+                except Exception as sample_error:
+                    sample_payload = {"error": str(sample_error)}
+
+                if abs(float(offset_deg)) < 1e-6:
+                    lidar_check = sample_payload
+                    measured_lidar_distance_m = sample_distance_m
+
+                lidar_samples.append(
+                    {
+                        "angle_deg": sample_angle_deg,
+                        "offset_deg": float(offset_deg),
+                        "distance_m": sample_distance_m,
+                        "status": sample_payload.get("status"),
+                        "valid_count": sample_payload.get("valid_count"),
+                        "error": sample_payload.get("error"),
+                    }
+                )
     except Exception as e:
         lidar_check = {"error": str(e)}
+        lidar_samples = [
+            {
+                "angle_deg": relative_angle_deg + float(offset_deg),
+                "offset_deg": float(offset_deg),
+                "distance_m": None,
+                "status": None,
+                "valid_count": None,
+                "error": str(e),
+            }
+            for offset_deg in NAV_MIDPOINT_SAMPLE_OFFSETS_DEG
+        ]
 
-    lidar_distance_raw = lidar_check.get("distance_m")
-    if isinstance(lidar_distance_raw, (int, float)) and math.isfinite(float(lidar_distance_raw)):
-        measured_lidar_distance_m = float(lidar_distance_raw)
+    if measured_lidar_distance_m is None:
+        measured_lidar_distance_m = _extract_valid_distance(lidar_check.get("distance_m"))
+    if measured_lidar_distance_m is None and valid_sample_distances:
+        measured_lidar_distance_m = valid_sample_distances[0]
 
-    midpoint_is_safe = (
-        measured_lidar_distance_m is not None and measured_lidar_distance_m >= required_clearance_m
-    )
+    if valid_sample_distances:
+        all_clear = all(distance >= required_clearance_m for distance in valid_sample_distances)
+        all_blocked = all(distance < required_clearance_m for distance in valid_sample_distances)
+        if all_clear:
+            midpoint_safety_class = "clear"
+        elif all_blocked:
+            midpoint_safety_class = "blocked"
+
+    midpoint_is_safe = midpoint_safety_class == "clear"
+    midpoint_safety = {
+        "relative_angle_deg": relative_angle_deg,
+        "distance_to_midpoint_m": distance_to_midpoint_m,
+        "required_clearance_m": required_clearance_m,
+        "measured_lidar_distance_m": measured_lidar_distance_m,
+        "is_safe": midpoint_is_safe,
+        "classification": midpoint_safety_class,
+        "samples": lidar_samples,
+        "lidar": lidar_check,
+    }
 
     used_bypass = False
     bypass_result: dict[str, Any] = {}
-    if not midpoint_is_safe:
+    if midpoint_safety_class == "blocked":
         used_bypass = True
         try:
             async with Client(MOTION_MCP_URL_V3) as motion:
@@ -1329,14 +1417,7 @@ async def tbot_nav_go_to_midpoint_between_objects(
                     "separation_m": separation_m,
                 },
                 "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
-                "midpoint_safety": {
-                    "relative_angle_deg": relative_angle_deg,
-                    "distance_to_midpoint_m": distance_to_midpoint_m,
-                    "required_clearance_m": required_clearance_m,
-                    "measured_lidar_distance_m": measured_lidar_distance_m,
-                    "is_safe": midpoint_is_safe,
-                    "lidar": lidar_check,
-                },
+                "midpoint_safety": midpoint_safety,
                 "used_bypass": used_bypass,
                 "bypass_result": bypass_result,
                 "nav_result": None,
@@ -1376,14 +1457,7 @@ async def tbot_nav_go_to_midpoint_between_objects(
                     "separation_m": separation_m,
                 },
                 "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
-                "midpoint_safety": {
-                    "relative_angle_deg": relative_angle_deg,
-                    "distance_to_midpoint_m": distance_to_midpoint_m,
-                    "required_clearance_m": required_clearance_m,
-                    "measured_lidar_distance_m": measured_lidar_distance_m,
-                    "is_safe": midpoint_is_safe,
-                    "lidar": lidar_check,
-                },
+                "midpoint_safety": midpoint_safety,
                 "used_bypass": used_bypass,
                 "bypass_result": bypass_result,
                 "nav_result": nav_result,
@@ -1401,14 +1475,7 @@ async def tbot_nav_go_to_midpoint_between_objects(
             "separation_m": separation_m,
         },
         "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
-        "midpoint_safety": {
-            "relative_angle_deg": relative_angle_deg,
-            "distance_to_midpoint_m": distance_to_midpoint_m,
-            "required_clearance_m": required_clearance_m,
-            "measured_lidar_distance_m": measured_lidar_distance_m,
-            "is_safe": midpoint_is_safe,
-            "lidar": lidar_check,
-        },
+        "midpoint_safety": midpoint_safety,
         "used_bypass": used_bypass,
         "bypass_result": bypass_result,
         "nav_result": nav_result,
@@ -1434,9 +1501,7 @@ async def tbot_navigate_to_object(
     if stop_distance_f <= 0:
         raise ValueError("stop_distance must be > 0")
 
-    await _session_capture_current_pose()
     final_pose = await tbot_nav_get_pose()
-    _session_upsert_current_pose_from_nav_pose(final_pose)
     object_in_frame = False
     scene_description = ""
     stopped_reason = "target_not_visible"
@@ -1452,7 +1517,6 @@ async def tbot_navigate_to_object(
                 if not initial_visible:
                     await _safe_motion_stop(motion)
                     final_pose = await tbot_nav_get_pose()
-                    _session_upsert_current_pose_from_nav_pose(final_pose)
                     return {
                         "success": False,
                         "final_pose": final_pose,
@@ -1515,7 +1579,6 @@ async def tbot_navigate_to_object(
                             break
                         if object_in_frame:
                             final_pose = await tbot_nav_get_pose()
-                            _session_upsert_current_pose_from_nav_pose(final_pose)
                             return {
                                 "success": False,
                                 "final_pose": final_pose,
@@ -1532,7 +1595,6 @@ async def tbot_navigate_to_object(
                         if bypass.get("status") != "completed":
                             await _safe_motion_stop(motion)
                             final_pose = await tbot_nav_get_pose()
-                            _session_upsert_current_pose_from_nav_pose(final_pose)
                             return {
                                 "success": False,
                                 "final_pose": final_pose,
@@ -1552,6 +1614,9 @@ async def tbot_navigate_to_object(
                     allowed_step = NAV_OBJECT_APPROACH_STEP_M * scale
                     if distance_for_limit is not None:
                         allowed_step = min(allowed_step, max(0.0, distance_for_limit - stop_distance_f))
+                    if front_distance_m is not None:
+                        # Keep a stop buffer from the nearest obstacle in the forward +/-cone.
+                        allowed_step = min(allowed_step, max(0.0, front_distance_m - stop_distance_f))
 
                     near_target = distance_for_limit is not None and distance_for_limit <= stop_distance_f
                     blocked = allowed_step <= 0.0
@@ -1569,7 +1634,6 @@ async def tbot_navigate_to_object(
                         if blocked:
                             await _safe_motion_stop(motion)
                             final_pose = await tbot_nav_get_pose()
-                            _session_upsert_current_pose_from_nav_pose(final_pose)
                             return {
                                 "success": False,
                                 "final_pose": final_pose,
@@ -1625,7 +1689,6 @@ async def tbot_navigate_to_object(
                     if not object_in_frame:
                         await _safe_motion_stop(motion)
                         final_pose = await tbot_nav_get_pose()
-                        _session_upsert_current_pose_from_nav_pose(final_pose)
                         return {
                             "success": False,
                             "final_pose": final_pose,
@@ -1637,7 +1700,6 @@ async def tbot_navigate_to_object(
                 if stopped_reason != "reached_target":
                     await _safe_motion_stop(motion)
                     final_pose = await tbot_nav_get_pose()
-                    _session_upsert_current_pose_from_nav_pose(final_pose)
                     return {
                         "success": False,
                         "final_pose": final_pose,
@@ -1652,12 +1714,6 @@ async def tbot_navigate_to_object(
                         target=target_clean,
                         qualifier=qualifier,
                     )
-                # Refresh object map entry at arrival so planners can reuse it.
-                if _session_has_active_state():
-                    try:
-                        await tbot_estimate_object_pose(target=target_clean, qualifier=qualifier)
-                    except Exception:
-                        pass
                 if confirm_in_frame:
                     scene_raw = await vision.call_tool(
                         "tbot_vision_describe_scene",
@@ -1667,91 +1723,12 @@ async def tbot_navigate_to_object(
                     scene_description = str(scene.get("description", ""))
 
     final_pose = await tbot_nav_get_pose()
-    _session_upsert_current_pose_from_nav_pose(final_pose)
     return {
         "success": (stopped_reason == "reached_target" and (not confirm_in_frame or object_in_frame)),
         "final_pose": final_pose,
         "object_in_frame": object_in_frame,
         "scene_description": scene_description,
         "stopped_reason": stopped_reason,
-    }
-
-
-@mcp_nav_v3.tool()
-async def tbot_nav_plan_around_object(
-    object_name: str,
-    qualifier: str | None = None,
-    preferred_side: str = "auto",
-) -> dict[str, Any]:
-    """
-    Plan and execute a bypass around a mapped object while updating session pose.
-    """
-    object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
-    if not object_name_clean:
-        raise ValueError("object_name must be a non-empty string")
-    preferred_clean = preferred_side.strip().lower() if isinstance(preferred_side, str) else "auto"
-    if preferred_clean not in ("left", "right", "auto"):
-        raise ValueError("preferred_side must be 'left', 'right', or 'auto'")
-
-    track = _session_get_fresh_object_track(object_name_clean, qualifier, NAV_MAP_OBJECT_TTL_S)
-    pose_source = "session_map"
-    pose_estimate = _track_to_pose_estimate(track) if track is not None else None
-    if pose_estimate is None:
-        pose_source = "live_estimate"
-        pose_estimate = await tbot_estimate_object_pose(target=object_name_clean, qualifier=qualifier)
-        if not bool(pose_estimate.get("success")):
-            return {
-                "success": False,
-                "status": "object_not_localized",
-                "object_name": object_name_clean,
-                "qualifier": qualifier,
-                "pose_source": pose_source,
-                "object_pose": pose_estimate,
-            }
-
-    left_distance: float | None = None
-    right_distance: float | None = None
-    lidar_error: str | None = None
-    try:
-        async with Client(LIDAR_MCP_URL_V3) as lidar:
-            left_raw = await lidar.call_tool("tbot_lidar_get_obstacle_distances", {"sector": "left"})
-            right_raw = await lidar.call_tool("tbot_lidar_get_obstacle_distances", {"sector": "right"})
-        left_result = _extract_tool_result_dict(left_raw)
-        right_result = _extract_tool_result_dict(right_raw)
-        left_distance = _extract_sector_distance(left_result, "left")
-        right_distance = _extract_sector_distance(right_result, "right")
-    except Exception as e:
-        lidar_error = str(e)
-
-    chosen_side = preferred_clean
-    if chosen_side == "auto":
-        left_cmp = left_distance if isinstance(left_distance, (int, float)) else -1.0
-        right_cmp = right_distance if isinstance(right_distance, (int, float)) else -1.0
-        chosen_side = "left" if left_cmp >= right_cmp else "right"
-
-    bypass_result: dict[str, Any] = {}
-    try:
-        async with Client(MOTION_MCP_URL_V3) as motion:
-            raw = await motion.call_tool("tbot_motion_bypass_obstacle", {"preferred_side": chosen_side})
-            bypass_result = _extract_tool_result_dict(raw)
-    except Exception as e:
-        bypass_result = {"status": "error", "error": str(e)}
-
-    final_pose = await _session_capture_current_pose()
-    return {
-        "success": bypass_result.get("status") == "completed",
-        "status": bypass_result.get("status", "error"),
-        "object_name": object_name_clean,
-        "qualifier": qualifier,
-        "pose_source": pose_source,
-        "object_pose": pose_estimate,
-        "chosen_side": chosen_side,
-        "left_distance_m": left_distance,
-        "right_distance_m": right_distance,
-        "lidar_error": lidar_error,
-        "bypass_result": bypass_result,
-        "final_pose": final_pose,
-        "session": _session_snapshot(include_history=False),
     }
 
 

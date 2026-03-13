@@ -4,7 +4,6 @@ import asyncio
 import math
 import os
 import sys
-import time
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -13,14 +12,6 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.mcp.turtlebot_v3 import nav_mcp_server as nav_v3
-
-
-@pytest.fixture(autouse=True)
-def _reset_session_state(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(nav_v3, "_active_session_state", None)
-    monkeypatch.setattr(nav_v3, "NAV_SESSION_MAP_PERSIST_ENABLED", False)
-    yield
-    monkeypatch.setattr(nav_v3, "_active_session_state", None)
 
 
 class _FakeNavClient:
@@ -60,11 +51,6 @@ class _FakeNavClient:
                 if self._state["angle_distance_results"]:
                     return self._state["angle_distance_results"].pop(0)
                 return {"status": "ok", "distance_m": 1.0, "valid_count": 3}
-            if name == "tbot_lidar_get_obstacle_distances":
-                if self._state["sector_distance_results"]:
-                    return self._state["sector_distance_results"].pop(0)
-                sector = str(payload.get("sector", "all"))
-                return {"status": "ok", "sector": sector, "distance_m": 1.0}
             raise AssertionError(f"Unexpected lidar tool call: {name}")
 
         if self._url == nav_v3.VISION_MCP_URL_V3:
@@ -108,7 +94,6 @@ def _make_state() -> dict[str, Any]:
         "vision_bbox_results": [],
         "describe_results": [],
         "angle_distance_results": [],
-        "sector_distance_results": [],
         "bypass_results": [],
     }
 
@@ -127,6 +112,15 @@ def _odom(x_m: float, y_m: float, yaw_rad: float = 0.0) -> dict[str, Any]:
         "stamp_sec": 1.0,
         "age_mono_s": 0.01,
     }
+
+
+def _reset_spatial_map_state() -> None:
+    with nav_v3._spatial_map_lock:
+        nav_v3._spatial_map_state["anchor_pose"] = None
+        nav_v3._spatial_map_state["objects"] = []
+        nav_v3._spatial_map_state["last_scan_pose"] = None
+        nav_v3._spatial_map_state["last_scan_time_s"] = None
+        nav_v3._spatial_map_state["scan_count"] = 0
 
 
 def test_nav_get_pose_returns_no_odom_when_rclpy_unavailable():
@@ -345,6 +339,82 @@ def test_nav_go_to_pose_collision_blocked():
 
     assert result["status"] == "collision_blocked"
     assert any(name == "tbot_motion_stop" for name, _ in state["motion_calls"])
+
+
+def test_nav_go_to_pose_collision_check_uses_forward_cone_half_width():
+    state = _make_state()
+    state["collision_results"] = [
+        {"risk_level": "clear", "min_forward_distance_m": 1.5, "distances": {"front": 1.5}},
+    ]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    odom_sequence = [
+        _odom(0.0, 0.0, 0.0),
+        _odom(1.0, 0.0, 0.0),
+    ]
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "_get_one_odom",
+        new=AsyncMock(side_effect=odom_sequence),
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_pose(
+                target_x_m=1.0,
+                target_y_m=0.0,
+                pos_tolerance_m=0.1,
+                timeout_s=5.0,
+            )
+        )
+
+    assert result["status"] == "reached"
+    lidar_check_calls = [payload for name, payload in state["lidar_calls"] if name == "tbot_lidar_check_collision"]
+    assert lidar_check_calls
+    assert lidar_check_calls[0]["sector_half_width_deg"] == pytest.approx(nav_v3.NAV_FORWARD_CONE_HALF_WIDTH_DEG)
+
+
+def test_nav_go_to_pose_reduces_step_distance_when_forward_clearance_is_tight():
+    state = _make_state()
+    state["collision_results"] = [
+        {"risk_level": "clear", "min_forward_distance_m": 0.22, "distances": {"front": 0.22}},
+    ]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    odom_sequence = [
+        _odom(0.0, 0.0, 0.0),
+        _odom(1.0, 0.0, 0.0),
+    ]
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "_get_one_odom",
+        new=AsyncMock(side_effect=odom_sequence),
+    ), patch.object(
+        nav_v3,
+        "NAV_FORWARD_STEP_M",
+        0.20,
+    ), patch.object(
+        nav_v3,
+        "NAV_FRONT_THRESHOLD_M",
+        0.10,
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_pose(
+                target_x_m=1.0,
+                target_y_m=0.0,
+                pos_tolerance_m=0.1,
+                timeout_s=5.0,
+            )
+        )
+
+    assert result["status"] == "reached"
+    forward_calls = [payload for name, payload in state["motion_calls"] if name == "tbot_motion_move_forward_distance"]
+    assert forward_calls
+    assert forward_calls[0]["distance_m"] == pytest.approx(0.12)
 
 
 def test_estimate_object_pose_straight_ahead():
@@ -567,7 +637,11 @@ def test_navigate_to_object_stop_risk_with_visible_target_not_close_returns_bloc
 
 def test_go_to_midpoint_between_objects_clear_path_reaches_midpoint():
     state = _make_state()
-    state["angle_distance_results"] = [{"status": "ok", "distance_m": 1.0, "valid_count": 3}]
+    state["angle_distance_results"] = [
+        {"status": "ok", "distance_m": 1.0, "valid_count": 3},
+        {"status": "ok", "distance_m": 1.1, "valid_count": 3},
+        {"status": "ok", "distance_m": 1.2, "valid_count": 3},
+    ]
     pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
     pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
 
@@ -597,6 +671,7 @@ def test_go_to_midpoint_between_objects_clear_path_reaches_midpoint():
 
     assert result["success"] is True
     assert result["used_bypass"] is False
+    assert result["midpoint_safety"]["classification"] == "clear"
     assert result["midpoint"]["x_m"] == pytest.approx(0.6)
     assert result["midpoint"]["y_m"] == pytest.approx(0.0)
     assert nav_go_mock.await_count == 1
@@ -605,7 +680,11 @@ def test_go_to_midpoint_between_objects_clear_path_reaches_midpoint():
 
 def test_go_to_midpoint_between_objects_unsafe_path_bypass_then_reach():
     state = _make_state()
-    state["angle_distance_results"] = [{"status": "ok", "distance_m": 0.2, "valid_count": 3}]
+    state["angle_distance_results"] = [
+        {"status": "ok", "distance_m": 0.2, "valid_count": 3},
+        {"status": "ok", "distance_m": 0.25, "valid_count": 3},
+        {"status": "ok", "distance_m": 0.3, "valid_count": 3},
+    ]
     pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
     pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
 
@@ -635,13 +714,18 @@ def test_go_to_midpoint_between_objects_unsafe_path_bypass_then_reach():
 
     assert result["success"] is True
     assert result["used_bypass"] is True
+    assert result["midpoint_safety"]["classification"] == "blocked"
     assert nav_go_mock.await_count == 1
     assert any(name == "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
 
 
 def test_go_to_midpoint_between_objects_unsafe_path_bypass_fails():
     state = _make_state()
-    state["angle_distance_results"] = [{"status": "ok", "distance_m": 0.2, "valid_count": 3}]
+    state["angle_distance_results"] = [
+        {"status": "ok", "distance_m": 0.2, "valid_count": 3},
+        {"status": "ok", "distance_m": 0.25, "valid_count": 3},
+        {"status": "ok", "distance_m": 0.3, "valid_count": 3},
+    ]
     state["bypass_results"] = [{"status": "timeout"}]
     pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
     pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
@@ -672,13 +756,18 @@ def test_go_to_midpoint_between_objects_unsafe_path_bypass_fails():
 
     assert result["success"] is False
     assert result["error"] == "midpoint_unsafe_bypass_failed"
+    assert result["midpoint_safety"]["classification"] == "blocked"
     assert nav_go_mock.await_count == 0
     assert any(name == "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
 
 
 def test_go_to_midpoint_between_objects_collision_blocked_then_single_bypass_retry():
     state = _make_state()
-    state["angle_distance_results"] = [{"status": "ok", "distance_m": 1.0, "valid_count": 3}]
+    state["angle_distance_results"] = [
+        {"status": "ok", "distance_m": 0.2, "valid_count": 3},
+        {"status": "ok", "distance_m": 1.0, "valid_count": 3},
+        {"status": "ok", "distance_m": 1.2, "valid_count": 3},
+    ]
     pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
     pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
 
@@ -708,6 +797,7 @@ def test_go_to_midpoint_between_objects_collision_blocked_then_single_bypass_ret
 
     assert result["success"] is True
     assert result["used_bypass"] is True
+    assert result["midpoint_safety"]["classification"] == "inconclusive"
     assert nav_go_mock.await_count == 2
     assert any(name == "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
 
@@ -759,3 +849,132 @@ def test_nav_patrol_returns_partial_completed_on_failure():
 
     assert result["status"] == "partial_completed"
     assert result["completed_waypoints"] == 1
+
+
+def test_scan_spatial_map_collects_visible_objects():
+    _reset_spatial_map_state()
+    state = _make_state()
+    state["vision_bbox_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": False, "confidence": 0.0, "bbox": None},
+    ]
+    state["angle_distance_results"] = [
+        {"status": "ok", "distance_m": 1.0, "valid_count": 4},
+        {"status": "ok", "distance_m": 1.5, "valid_count": 4},
+    ]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_scan_spatial_map(
+                labels=["chair"],
+                step_deg=180.0,
+                turn_speed=0.5,
+                turn_duration_s=0.56,
+                lidar_half_width_deg=5.0,
+            )
+        )
+
+    assert result["success"] is True
+    assert result["steps_requested"] == 2
+    assert result["steps_completed"] == 2
+    assert len(result["objects"]) == 1
+    assert result["objects"][0]["label"] == "chair"
+    assert any(name == "tbot_motion_turn" for name, _ in state["motion_calls"])
+    assert any(name == "tbot_lidar_get_distance_at_angle" for name, _ in state["lidar_calls"])
+    assert any(name == "tbot_vision_get_object_bbox" for name, _ in state["vision_calls"])
+
+
+def test_get_spatial_map_is_empty_before_scan():
+    _reset_spatial_map_state()
+    result = asyncio.run(nav_v3.tbot_get_spatial_map())
+    assert result["status"] == "empty"
+    assert result["objects"] == []
+
+
+def test_merge_spatial_detection_merges_nearby_and_splits_far_entries():
+    objects: list[dict[str, Any]] = []
+    nav_v3._merge_spatial_detection(objects, label="chair", x_m=0.0, y_m=1.0, confidence=0.8)
+    nav_v3._merge_spatial_detection(objects, label="chair", x_m=0.1, y_m=1.0, confidence=0.7)
+    assert len(objects) == 1
+    assert objects[0]["sighting_count"] == 2
+
+    nav_v3._merge_spatial_detection(objects, label="chair", x_m=1.0, y_m=1.0, confidence=0.9)
+    assert len(objects) == 2
+
+
+def test_scan_spatial_map_resets_when_robot_moves_past_threshold():
+    _reset_spatial_map_state()
+    first_state = _make_state()
+    first_state["vision_bbox_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": False, "confidence": 0.0, "bbox": None},
+    ]
+    first_state["angle_distance_results"] = [
+        {"status": "ok", "distance_m": 1.0, "valid_count": 4},
+        {"status": "ok", "distance_m": 1.0, "valid_count": 4},
+    ]
+
+    def first_fake_client(url: str):
+        return _FakeNavClient(url, first_state)
+
+    with patch.object(nav_v3, "Client", side_effect=first_fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        first_result = asyncio.run(nav_v3.tbot_scan_spatial_map(labels=["chair"], step_deg=180.0))
+    assert first_result["success"] is True
+    assert any(obj["label"] == "chair" for obj in first_result["objects"])
+
+    second_state = _make_state()
+    second_state["vision_bbox_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": False, "confidence": 0.0, "bbox": None},
+    ]
+    second_state["angle_distance_results"] = [
+        {"status": "ok", "distance_m": 1.0, "valid_count": 4},
+        {"status": "ok", "distance_m": 1.0, "valid_count": 4},
+    ]
+
+    def second_fake_client(url: str):
+        return _FakeNavClient(url, second_state)
+
+    with patch.object(nav_v3, "Client", side_effect=second_fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 1.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ):
+        second_result = asyncio.run(
+            nav_v3.tbot_scan_spatial_map(
+                labels=["desk"],
+                step_deg=180.0,
+                reset_if_moved_m=0.5,
+            )
+        )
+
+    assert second_result["success"] is True
+    assert second_result["reset_performed"] is True
+    assert second_result["anchor_pose"]["x"] == pytest.approx(1.0)
+    labels = [obj["label"] for obj in second_result["objects"]]
+    assert "desk" in labels
+    assert "chair" not in labels
+
+
+def test_bearing_distance_from_xy_cardinal_conventions():
+    bearing_0, distance_0 = nav_v3._bearing_distance_from_xy(0.0, 1.0)
+    bearing_90, _ = nav_v3._bearing_distance_from_xy(1.0, 0.0)
+    bearing_180, _ = nav_v3._bearing_distance_from_xy(0.0, -1.0)
+    bearing_270, _ = nav_v3._bearing_distance_from_xy(-1.0, 0.0)
+
+    assert distance_0 == pytest.approx(1.0)
+    assert bearing_0 == pytest.approx(0.0)
+    assert bearing_90 == pytest.approx(90.0)
+    assert bearing_180 == pytest.approx(180.0)
+    assert bearing_270 == pytest.approx(270.0)
