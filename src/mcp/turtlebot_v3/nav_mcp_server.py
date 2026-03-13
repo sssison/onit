@@ -71,6 +71,7 @@ NAV_OBJECT_MAX_APPROACH_STEPS = max(1, int(_env_float("NAV_OBJECT_MAX_APPROACH_S
 NAV_OBJECT_RECENTER_EPS_DEG = max(0.5, _env_float("NAV_OBJECT_RECENTER_EPS_DEG", 1.0))
 NAV_OBJECT_LOSS_CONFIRM_FRAMES = max(1, int(_env_float("NAV_OBJECT_LOSS_CONFIRM_FRAMES", 2.0)))
 NAV_OBJECT_DEFAULT_STOP_DISTANCE_M = max(0.05, _env_float("NAV_OBJECT_DEFAULT_STOP_DISTANCE_M", 0.20))
+NAV_MIDPOINT_TIMEOUT_S = max(5.0, _env_float("NAV_MIDPOINT_TIMEOUT_S", 45.0))
 
 _rclpy_init_lock = threading.Lock()
 
@@ -738,6 +739,225 @@ async def tbot_estimate_object_pose(
         "distance_m": lidar_distance_m,
         "confidence": confidence,
         "lidar": lidar_raw,
+    }
+
+
+@mcp_nav_v3.tool()
+async def tbot_nav_go_to_midpoint_between_objects(
+    object_1: str,
+    object_2: str,
+    qualifier_1: str | None = None,
+    qualifier_2: str | None = None,
+    timeout_s: float = NAV_MIDPOINT_TIMEOUT_S,
+) -> dict[str, Any]:
+    """
+    Estimate two object poses, compute midpoint, pre-check with LiDAR, bypass if needed, then navigate.
+    """
+    object_1_clean = object_1.strip() if isinstance(object_1, str) else ""
+    object_2_clean = object_2.strip() if isinstance(object_2, str) else ""
+    if not object_1_clean:
+        raise ValueError("object_1 must be a non-empty string")
+    if not object_2_clean:
+        raise ValueError("object_2 must be a non-empty string")
+    timeout_f = _validate_finite("timeout_s", timeout_s)
+    if timeout_f <= 0:
+        raise ValueError("timeout_s must be > 0")
+
+    pose_1 = await tbot_estimate_object_pose(target=object_1_clean, qualifier=qualifier_1)
+    if not bool(pose_1.get("success")):
+        return {
+            "success": False,
+            "error": "object_1_not_found_or_unresolved",
+            "object_1_pose": pose_1,
+            "object_2_pose": None,
+            "relative_from_object_1": None,
+            "midpoint": None,
+            "midpoint_safety": None,
+            "used_bypass": False,
+            "bypass_result": {},
+            "nav_result": None,
+        }
+
+    pose_2 = await tbot_estimate_object_pose(target=object_2_clean, qualifier=qualifier_2)
+    if not bool(pose_2.get("success")):
+        return {
+            "success": False,
+            "error": "object_2_not_found_or_unresolved",
+            "object_1_pose": pose_1,
+            "object_2_pose": pose_2,
+            "relative_from_object_1": None,
+            "midpoint": None,
+            "midpoint_safety": None,
+            "used_bypass": False,
+            "bypass_result": {},
+            "nav_result": None,
+        }
+
+    x1 = float(pose_1["x"])
+    y1 = float(pose_1["y"])
+    x2 = float(pose_2["x"])
+    y2 = float(pose_2["y"])
+    delta_x = x2 - x1
+    delta_y = y2 - y1
+    separation_m = math.hypot(delta_x, delta_y)
+    midpoint_x = x1 + (delta_x / 2.0)
+    midpoint_y = y1 + (delta_y / 2.0)
+
+    robot_pose = await tbot_nav_get_pose()
+    if robot_pose.get("status") != "ok":
+        return {
+            "success": False,
+            "error": robot_pose.get("error", "no_odom"),
+            "object_1_pose": pose_1,
+            "object_2_pose": pose_2,
+            "relative_from_object_1": {
+                "dx_m": delta_x,
+                "dy_m": delta_y,
+                "separation_m": separation_m,
+            },
+            "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
+            "midpoint_safety": None,
+            "used_bypass": False,
+            "bypass_result": {},
+            "nav_result": None,
+        }
+
+    robot_x = float(robot_pose["x_m"])
+    robot_y = float(robot_pose["y_m"])
+    robot_yaw = float(robot_pose["yaw_rad"])
+    to_mid_x = midpoint_x - robot_x
+    to_mid_y = midpoint_y - robot_y
+    distance_to_midpoint_m = math.hypot(to_mid_x, to_mid_y)
+    heading_to_midpoint = math.atan2(to_mid_y, to_mid_x)
+    relative_angle_deg = math.degrees(_wrap_to_pi(heading_to_midpoint - robot_yaw))
+    required_clearance_m = distance_to_midpoint_m + NAV_FRONT_THRESHOLD_M
+
+    lidar_check: dict[str, Any] = {}
+    measured_lidar_distance_m: float | None = None
+    try:
+        async with Client(LIDAR_MCP_URL_V3) as lidar:
+            lidar_raw = await lidar.call_tool(
+                "tbot_lidar_get_distance_at_angle",
+                {"angle_deg": relative_angle_deg},
+            )
+            lidar_check = _extract_tool_result_dict(lidar_raw)
+    except Exception as e:
+        lidar_check = {"error": str(e)}
+
+    lidar_distance_raw = lidar_check.get("distance_m")
+    if isinstance(lidar_distance_raw, (int, float)) and math.isfinite(float(lidar_distance_raw)):
+        measured_lidar_distance_m = float(lidar_distance_raw)
+
+    midpoint_is_safe = (
+        measured_lidar_distance_m is not None and measured_lidar_distance_m >= required_clearance_m
+    )
+
+    used_bypass = False
+    bypass_result: dict[str, Any] = {}
+    if not midpoint_is_safe:
+        used_bypass = True
+        try:
+            async with Client(MOTION_MCP_URL_V3) as motion:
+                bypass_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
+                bypass_result = _extract_tool_result_dict(bypass_raw)
+        except Exception as e:
+            bypass_result = {"status": "error", "error": str(e)}
+
+        if bypass_result.get("status") != "completed":
+            return {
+                "success": False,
+                "error": "midpoint_unsafe_bypass_failed",
+                "object_1_pose": pose_1,
+                "object_2_pose": pose_2,
+                "relative_from_object_1": {
+                    "dx_m": delta_x,
+                    "dy_m": delta_y,
+                    "separation_m": separation_m,
+                },
+                "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
+                "midpoint_safety": {
+                    "relative_angle_deg": relative_angle_deg,
+                    "distance_to_midpoint_m": distance_to_midpoint_m,
+                    "required_clearance_m": required_clearance_m,
+                    "measured_lidar_distance_m": measured_lidar_distance_m,
+                    "is_safe": midpoint_is_safe,
+                    "lidar": lidar_check,
+                },
+                "used_bypass": used_bypass,
+                "bypass_result": bypass_result,
+                "nav_result": None,
+            }
+
+    nav_result = await tbot_nav_go_to_pose(
+        target_x_m=midpoint_x,
+        target_y_m=midpoint_y,
+        timeout_s=timeout_f,
+    )
+
+    if nav_result.get("status") == "collision_blocked" and not used_bypass:
+        used_bypass = True
+        try:
+            async with Client(MOTION_MCP_URL_V3) as motion:
+                bypass_retry_raw = await motion.call_tool("tbot_motion_bypass_obstacle", {})
+                bypass_result = _extract_tool_result_dict(bypass_retry_raw)
+        except Exception as e:
+            bypass_result = {"status": "error", "error": str(e)}
+
+        if bypass_result.get("status") == "completed":
+            retry_timeout_s = max(5.0, timeout_f * 0.5)
+            nav_result = await tbot_nav_go_to_pose(
+                target_x_m=midpoint_x,
+                target_y_m=midpoint_y,
+                timeout_s=retry_timeout_s,
+            )
+        else:
+            return {
+                "success": False,
+                "error": "midpoint_retry_bypass_failed",
+                "object_1_pose": pose_1,
+                "object_2_pose": pose_2,
+                "relative_from_object_1": {
+                    "dx_m": delta_x,
+                    "dy_m": delta_y,
+                    "separation_m": separation_m,
+                },
+                "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
+                "midpoint_safety": {
+                    "relative_angle_deg": relative_angle_deg,
+                    "distance_to_midpoint_m": distance_to_midpoint_m,
+                    "required_clearance_m": required_clearance_m,
+                    "measured_lidar_distance_m": measured_lidar_distance_m,
+                    "is_safe": midpoint_is_safe,
+                    "lidar": lidar_check,
+                },
+                "used_bypass": used_bypass,
+                "bypass_result": bypass_result,
+                "nav_result": nav_result,
+            }
+
+    reached = nav_result.get("status") == "reached"
+    return {
+        "success": reached,
+        "error": None if reached else str(nav_result.get("status", "midpoint_nav_failed")),
+        "object_1_pose": pose_1,
+        "object_2_pose": pose_2,
+        "relative_from_object_1": {
+            "dx_m": delta_x,
+            "dy_m": delta_y,
+            "separation_m": separation_m,
+        },
+        "midpoint": {"x_m": midpoint_x, "y_m": midpoint_y},
+        "midpoint_safety": {
+            "relative_angle_deg": relative_angle_deg,
+            "distance_to_midpoint_m": distance_to_midpoint_m,
+            "required_clearance_m": required_clearance_m,
+            "measured_lidar_distance_m": measured_lidar_distance_m,
+            "is_safe": midpoint_is_safe,
+            "lidar": lidar_check,
+        },
+        "used_bypass": used_bypass,
+        "bypass_result": bypass_result,
+        "nav_result": nav_result,
     }
 
 

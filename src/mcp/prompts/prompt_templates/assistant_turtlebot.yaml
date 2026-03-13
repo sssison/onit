@@ -97,21 +97,27 @@ instruction_template: |
   If the task also requires knowing the absolute position of the object
   (e.g. to compute a midpoint or patrol waypoint), call
   tbot_estimate_object_pose BEFORE calling tbot_navigate_to_object, while
-  the robot is still at a distance.
+  the robot is still at a distance (example:
+  tbot_estimate_object_pose(target="<object>")).
 
   ---
 
   ### PATTERN: MIDPOINT_NAVIGATE between two objects
   Use when the task requires navigating to the space between two objects.
 
-    pose_a = tbot_estimate_object_pose(target="<object A>")
-    pose_b = tbot_estimate_object_pose(target="<object B>")
-    mid_x  = (pose_a.x + pose_b.x) / 2
-    mid_y  = (pose_a.y + pose_b.y) / 2
-    tbot_nav_go_to_pose(target_x_m=mid_x, target_y_m=mid_y)
-
-  If pose_a.success or pose_b.success is False, rotate 45 deg and retry
-  the failed estimate up to 4 times before aborting.
+    midpoint = tbot_nav_go_to_midpoint_between_objects(
+      object_1="<object A>",
+      object_2="<object B>",
+      qualifier_1="<optional>",
+      qualifier_2="<optional>"
+    )
+    - This tool internally:
+      1) estimates object A and object B poses,
+      2) computes midpoint and relative delta,
+      3) checks midpoint safety with LiDAR,
+      4) bypasses if unsafe, then navigates to midpoint.
+    - If midpoint.success is False, inspect midpoint.error and retry once only
+      if the failure is object-detection related.
 
   ---
 

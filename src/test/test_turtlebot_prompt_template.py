@@ -27,6 +27,7 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "PATTERN: FIND_AND_APPROACH <object>" in instruction
     assert "PATTERN: WALL_FOLLOW to <destination>" in instruction
     assert "tbot_navigate_to_object(" in instruction
+    assert "tbot_nav_go_to_midpoint_between_objects(" in instruction
     assert "Use tbot_vision_find_object as the primary object finder." in instruction
     assert "It always checks the current frame first, then scans if needed." in instruction
     assert "tbot_estimate_object_pose(" in instruction

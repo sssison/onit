@@ -550,6 +550,179 @@ def test_navigate_to_object_stop_risk_with_visible_target_not_close_returns_bloc
     assert all(name != "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
 
 
+def test_go_to_midpoint_between_objects_clear_path_reaches_midpoint():
+    state = _make_state()
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": 1.0, "valid_count": 3}]
+    pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
+    pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    nav_go_mock = AsyncMock(return_value={"status": "reached"})
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_estimate_object_pose",
+        new=AsyncMock(side_effect=[pose_a, pose_b]),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_go_to_pose",
+        new=nav_go_mock,
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_midpoint_between_objects(
+                object_1="chair",
+                object_2="desk",
+            )
+        )
+
+    assert result["success"] is True
+    assert result["used_bypass"] is False
+    assert result["midpoint"]["x_m"] == pytest.approx(0.6)
+    assert result["midpoint"]["y_m"] == pytest.approx(0.0)
+    assert nav_go_mock.await_count == 1
+    assert all(name != "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
+
+
+def test_go_to_midpoint_between_objects_unsafe_path_bypass_then_reach():
+    state = _make_state()
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": 0.2, "valid_count": 3}]
+    pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
+    pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    nav_go_mock = AsyncMock(return_value={"status": "reached"})
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_estimate_object_pose",
+        new=AsyncMock(side_effect=[pose_a, pose_b]),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_go_to_pose",
+        new=nav_go_mock,
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_midpoint_between_objects(
+                object_1="chair",
+                object_2="desk",
+            )
+        )
+
+    assert result["success"] is True
+    assert result["used_bypass"] is True
+    assert nav_go_mock.await_count == 1
+    assert any(name == "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
+
+
+def test_go_to_midpoint_between_objects_unsafe_path_bypass_fails():
+    state = _make_state()
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": 0.2, "valid_count": 3}]
+    state["bypass_results"] = [{"status": "timeout"}]
+    pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
+    pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    nav_go_mock = AsyncMock(return_value={"status": "reached"})
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_estimate_object_pose",
+        new=AsyncMock(side_effect=[pose_a, pose_b]),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_go_to_pose",
+        new=nav_go_mock,
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_midpoint_between_objects(
+                object_1="chair",
+                object_2="desk",
+            )
+        )
+
+    assert result["success"] is False
+    assert result["error"] == "midpoint_unsafe_bypass_failed"
+    assert nav_go_mock.await_count == 0
+    assert any(name == "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
+
+
+def test_go_to_midpoint_between_objects_collision_blocked_then_single_bypass_retry():
+    state = _make_state()
+    state["angle_distance_results"] = [{"status": "ok", "distance_m": 1.0, "valid_count": 3}]
+    pose_a = {"success": True, "x": 0.4, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.4, "confidence": "high"}
+    pose_b = {"success": True, "x": 0.8, "y": 0.0, "heading_deg": 0.0, "distance_m": 0.8, "confidence": "high"}
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    nav_go_mock = AsyncMock(side_effect=[{"status": "collision_blocked"}, {"status": "reached"}])
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_estimate_object_pose",
+        new=AsyncMock(side_effect=[pose_a, pose_b]),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
+    ), patch.object(
+        nav_v3,
+        "tbot_nav_go_to_pose",
+        new=nav_go_mock,
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_midpoint_between_objects(
+                object_1="chair",
+                object_2="desk",
+            )
+        )
+
+    assert result["success"] is True
+    assert result["used_bypass"] is True
+    assert nav_go_mock.await_count == 2
+    assert any(name == "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
+
+
+def test_go_to_midpoint_between_objects_fails_when_object_estimation_fails():
+    pose_fail = {
+        "success": False,
+        "x": None,
+        "y": None,
+        "heading_deg": None,
+        "distance_m": None,
+        "confidence": "low",
+        "error": "target_not_found",
+    }
+    with patch.object(
+        nav_v3,
+        "tbot_estimate_object_pose",
+        new=AsyncMock(side_effect=[pose_fail]),
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_midpoint_between_objects(
+                object_1="chair",
+                object_2="desk",
+            )
+        )
+
+    assert result["success"] is False
+    assert result["error"] == "object_1_not_found_or_unresolved"
+
+
 def test_nav_patrol_returns_partial_completed_on_failure():
     with patch.object(
         nav_v3,
