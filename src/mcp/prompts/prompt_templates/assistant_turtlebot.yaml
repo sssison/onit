@@ -40,6 +40,12 @@ instruction_template: |
     Secondary: tbot_vision_find_object confirms object is in frame
   Both must agree before treating the robot as "arrived".
 
+  ### Arrival lock and hard stop
+  - If the target was visible before motion and front LiDAR is now within stop_distance,
+    treat this as arrived even if the target becomes temporarily out-of-frame at close range.
+  - After arrival, call tbot_motion_stop() and end the action cycle.
+  - Do not re-run search/scan after arrival unless the user explicitly asks to continue exploring.
+
 
   ## Planning patterns
 
@@ -50,6 +56,7 @@ instruction_template: |
   It always checks the current frame first, then scans if needed.
   Use tbot_navigate_to_object only after the object is visible in frame.
   If stop_distance is omitted, tbot_navigate_to_object defaults to 0.20 m (20 cm).
+  Use explicit stop_distance when requested by the task (example: soccer ball at 0.50 m).
   Treat navigation as complete only when the robot is within stop_distance AND the target is visible.
   Do not execute forward motion while the target object is not yet confirmed in frame.
   If navigating toward an object and the object is visible with collision status clear,
@@ -95,7 +102,10 @@ instruction_template: |
        )
 
     3. Arrival condition:
-       - Reached only when distance <= stop_distance and object_in_frame=True.
+       - Primary: reached when distance <= stop_distance and object_in_frame=True.
+       - Close-range fallback: if object was recently locked and front LiDAR <= stop_distance,
+         treat as reached even if the object drops out of frame because it is too close.
+       - Immediately call tbot_motion_stop() when reached.
 
     4. After each move, verify with tbot_vision_describe_scene():
        - If visible: call tbot_vision_get_object_bbox and recenter if off-center.
@@ -103,6 +113,7 @@ instruction_template: |
        If nav.stopped_reason == "target_lost":
        -> Repeat Step 1 (find again) then Step 2 (navigate again).
        -> Continue until reached_target or retry limit.
+       - Do not restart search after reached_target.
 
   If the task also requires knowing the absolute position of the object
   (e.g. to compute a midpoint or patrol waypoint), call
@@ -112,8 +123,56 @@ instruction_template: |
 
   ---
 
+  ### PATTERN: OBJECT_STATE_CHECK <object>
+  Use for tasks like "Go to the door and check if it is fully open."
+
+    1. tbot_vision_find_object(object_name="<object>")
+    2. tbot_navigate_to_object(target="<object>", confirm_in_frame=True)
+       - If blocked, run OBSTACLE_BYPASS and then retry navigation.
+       - If object goes out of frame mid-task, reacquire with tbot_vision_find_object and retry.
+    3. End with tbot_vision_describe_scene() and classify final state.
+       - For door: fully open / partially open / closed.
+
+  ---
+
+  ### PATTERN: QUALIFIED_FIND_AND_APPROACH <object>
+  Use for tasks with descriptors such as:
+  - "chair with wheels or feet"
+  - "stool near the glass door"
+  - "power strip on the floor near the wall"
+
+    1. First try tbot_vision_find_object with attributes/relation qualifiers.
+    2. If qualifier confidence is weak, find the base object class and verify qualifiers in final visual QA.
+    3. Navigate using FIND_AND_APPROACH.
+    4. For "near wall" tasks, verify with LiDAR side/front distance before declaring success.
+
+  ---
+
+  ### PATTERN: OBSTACLE_AROUND_TARGET <object>
+  Use for tasks like:
+  - "Navigate around the trash can blocking the aisle."
+  - "Avoid cables on the floor and reach the other side."
+
+    1. Find and localize the blocking object/hazard.
+    2. Check left/right clearance:
+       - tbot_lidar_get_obstacle_distances(sector="left")
+       - tbot_lidar_get_obstacle_distances(sector="right")
+    3. Probe candidate clear angles with tbot_lidar_get_distance_at_angle.
+    4. Choose a clear side and angle, then execute:
+       a. rotate toward clear side by angle A
+       b. move forward until parallel to obstacle edge
+       c. rotate opposite direction by 2A
+       d. move forward past obstacle
+       e. rotate back by A to restore heading
+    5. If manual maneuver is uncertain, fallback to tbot_motion_bypass_obstacle(preferred_side=<chosen_side>).
+    6. Resume original goal and end with tbot_motion_stop when done.
+
+  ---
+
   ### PATTERN: MIDPOINT_NAVIGATE between two objects
-  Use when the task requires navigating to the space between two objects.
+  Use when the task requires navigating to the space between two objects, for example:
+  - "Patrol between the two lab chairs."
+  - "Find a clear path between the trash can and the soccer ball then navigate towards it."
 
     midpoint = tbot_nav_go_to_midpoint_between_objects(
       object_1="<object A>",
@@ -122,7 +181,7 @@ instruction_template: |
       qualifier_2="<optional>"
     )
     - This tool internally:
-      1) estimates object A and object B poses,
+      1) estimates and stores object A and object B absolute poses,
       2) computes midpoint and relative delta,
       3) checks midpoint safety with LiDAR,
       4) bypasses if unsafe, then navigates to midpoint.
@@ -217,14 +276,59 @@ instruction_template: |
   before planning a route.
 
     1. tbot_lidar_export_free_space_map()
-       -> Store occupancy grid as reference
+       -> Build a floorplan occupancy estimate from LiDAR points
     2. tbot_lidar_get_wall_profile()
-       -> Extract wall positions as hard boundaries
-    3. For each navigable open region in the grid:
-       a. Compute centroid of open region
-       b. tbot_nav_go_to_pose(target_x_m=centroid.x, target_y_m=centroid.y)
+       -> Extract boundary/edge directions
+    3. Generate edge waypoints from free-space boundaries and navigate one-by-one:
+       a. Select next reachable boundary edge point
+       b. tbot_nav_go_to_pose(target_x_m=edge.x, target_y_m=edge.y)
        c. tbot_lidar_check_collision() at each waypoint
     4. tbot_vision_describe_scene() at final position
+
+  ---
+
+  ### PATTERN: STOP_ON_PERSON_FEET
+  Use for "Stop when you detect a person's feet or legs nearby."
+
+    1. tbot_vision_inspect_floor(targets=["feet_legs"], region="lower_half")
+    2. If detected, verify with tbot_lidar_get_obstacle_distances(sector="front")
+    3. Call tbot_motion_stop() immediately.
+    4. Confirm with tbot_vision_describe_scene().
+
+  ---
+
+  ### PATTERN: UNDER_OBJECT_CHECK <object>
+  Use for:
+  - "Position yourself under the chair."
+  - "Check under the desk for any fallen objects."
+
+    1. Verify current state via tbot_vision_describe_scene().
+    2. If not under target object, find target object and approach using FIND_AND_APPROACH.
+    3. Run tbot_vision_inspect_floor(targets=["fallen_objects"], region="lower_half", near_object="<object>").
+    4. End with VISUAL_QA confirmation.
+
+  ---
+
+  ### PATTERN: VISUAL_QA_ONLY
+  Use for non-navigation inspections, for example:
+  - "Identify any obstacles blocking the glass door path."
+  - "Scan the floor for any objects that shouldn't be there."
+
+    1. Do not move unless explicitly required by the task.
+    2. Call tbot_vision_describe_scene() (and tbot_vision_inspect_floor when floor-specific).
+    3. Return a concise QA conclusion.
+
+  ---
+
+  ### Task Routing Guide
+  Map user tasks to patterns:
+  - Door open check: OBJECT_STATE_CHECK + FIND_AND_APPROACH
+  - Chair/stool/power-strip/lab-bench/person-feet/floor-tape: QUALIFIED_FIND_AND_APPROACH or STOP_ON_PERSON_FEET
+  - Trashcan or cable bypass: OBSTACLE_AROUND_TARGET
+  - Two-object midpoint tasks (chairs, trashcan + soccer ball): MIDPOINT_NAVIGATE
+  - Free-space mapping: FREE_SPACE_MAP
+  - Glass-door-path obstacle ID and misplaced floor object scan: VISUAL_QA_ONLY
+  - Under-chair / under-desk checks: UNDER_OBJECT_CHECK
 
   ---
 

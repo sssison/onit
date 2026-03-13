@@ -19,6 +19,9 @@ def test_turtlebot_prompt_includes_sensor_priority_and_collision_guard():
     assert "### Collision guard - active for forward motion" in instruction
     assert "Before any motion call with a forward component" in instruction
     assert "For pure in-place turning/search rotations, do not call LiDAR collision checks." in instruction
+    assert "### Arrival lock and hard stop" in instruction
+    assert "If the target was visible before motion and front LiDAR is now within stop_distance," in instruction
+    assert "Do not re-run search/scan after arrival unless the user explicitly asks to continue exploring." in instruction
 
 
 def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools():
@@ -30,6 +33,7 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "tbot_nav_go_to_midpoint_between_objects(" in instruction
     assert "Use tbot_vision_find_object as the primary object finder." in instruction
     assert "It always checks the current frame first, then scans if needed." in instruction
+    assert "Use explicit stop_distance when requested by the task (example: soccer ball at 0.50 m)." in instruction
     assert "tbot_estimate_object_pose(" in instruction
     assert "Find the destination landmark first" in instruction
     assert "fixed 15 deg steps" in instruction
@@ -50,9 +54,22 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "If the object is present but off-center, recenter using the bounding box and continue approach." in instruction
     assert "tbot_vision_get_object_bbox" in instruction
     assert "If nav.stopped_reason == \"target_lost\":" in instruction
+    assert "Close-range fallback: if object was recently locked and front LiDAR <= stop_distance," in instruction
+    assert "Immediately call tbot_motion_stop() when reached." in instruction
+    assert "Do not restart search after reached_target." in instruction
     assert "Call tools only when the result changes the next action." in instruction
     assert "Avoid repeated identical calls without movement or state change between calls." in instruction
     assert "Never simulate or guess sensor readings. Always call LiDAR/vision/nav tools for measurements." in instruction
+    assert "PATTERN: OBJECT_STATE_CHECK <object>" in instruction
+    assert "PATTERN: QUALIFIED_FIND_AND_APPROACH <object>" in instruction
+    assert "PATTERN: OBSTACLE_AROUND_TARGET <object>" in instruction
+    assert "PATTERN: STOP_ON_PERSON_FEET" in instruction
+    assert "PATTERN: UNDER_OBJECT_CHECK <object>" in instruction
+    assert "PATTERN: VISUAL_QA_ONLY" in instruction
+    assert "### Task Routing Guide" in instruction
+    assert "Door open check: OBJECT_STATE_CHECK + FIND_AND_APPROACH" in instruction
+    assert "Trashcan or cable bypass: OBSTACLE_AROUND_TARGET" in instruction
+    assert "Two-object midpoint tasks (chairs, trashcan + soccer ball): MIDPOINT_NAVIGATE" in instruction
     assert "If the task asks to confirm \"no spills\" on the floor:" in instruction
     assert "Perform a full 360 deg spill sweep before concluding clear." in instruction
     assert "Use fixed 15 deg turn steps for 24 steps total:" in instruction
