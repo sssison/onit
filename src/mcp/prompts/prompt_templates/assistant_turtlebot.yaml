@@ -76,12 +76,9 @@ instruction_template: |
   - Minimize total tool calls while preserving safety and task completion.
 
   ### Spatial scan and map memory
-  - At the start of a new task in unknown surroundings, call tbot_scan_spatial_map().
-  - tbot_scan_spatial_map performs a full turn sweep and fuses:
-    1) turn steps,
-    2) LiDAR distance at the current bearing,
-    3) per-label vision bbox checks from the current frame.
-  - After scan, call tbot_get_spatial_map() to inspect the stored anchor pose and detected objects.
+  - tbot_vision_find_object is the scan driver for map updates.
+  - If tbot_vision_find_object must turn-scan to find the target, it records the detected target into SpatialMap automatically.
+  - Use tbot_get_spatial_map() to inspect the stored anchor pose and detected objects.
   - SpatialMap object convention:
     bearing 0 deg = ahead (+y), 90 deg = right (+x), 180 deg = behind (-y), 270 deg = left (-x).
     Use x = distance * sin(bearing), y = distance * cos(bearing) when reasoning about map entries.
@@ -89,26 +86,18 @@ instruction_template: |
     if separation <= 0.3 m, merge with confidence-weighted averaging and increment sighting_count;
     otherwise keep as a separate entry.
   - Trust map entries for navigation only when confidence >= 0.7 and sighting_count >= 2.
-  - If the robot has moved significantly since the last scan, run tbot_scan_spatial_map() again.
+  - If the map is stale or missing a target, run tbot_vision_find_object for that target to refresh the map.
 
   ---
 
-  ### PATTERN: SPATIAL_SCAN_360
-  Use this when surroundings are unknown or when task context depends on relative object layout.
+  ### PATTERN: FIND_UPDATES_MAP
+  Use this when you need to locate a specific object and keep map memory current.
 
-    1. scan = tbot_scan_spatial_map(
-         labels=["chair", "table", "door"]   # optional; omit to use defaults
-       )
+    1. finder = tbot_vision_find_object(object_name="<object>", attributes=["<optional>"])
+       - If finder needed scan turns, the object observation is written into SpatialMap.
 
     2. map = tbot_get_spatial_map()
-       - Read anchor_pose and objects[]
-       - For each object entry, use label, x, y, bearing_deg, distance_m, confidence, sighting_count
-
-    3. Navigation decision:
-       - If target label has trusted entry (confidence >= 0.7 and sighting_count >= 2), navigate.
-       - If not trusted, reacquire with tbot_vision_find_object before moving.
-
-    4. If robot moved after scan and layout is stale, scan again before planning.
+       - Read anchor_pose and objects[] and reuse trusted entries for downstream planning.
 
   ---
 
@@ -234,9 +223,16 @@ instruction_template: |
 
     1. tbot_vision_inspect_floor()
        -> Categorize findings: cables / spills / objects / clear
-    2. If hazard found:
+    2. If the task asks to confirm "no spills" on the floor:
+       - Perform a full 360 deg spill sweep before concluding clear.
+       - Use fixed 15 deg turn steps for 24 steps total:
+         a. tbot_motion_turn(...15 deg...)
+         b. tbot_vision_inspect_floor(targets=["spill"], region="lower_half")
+       - Report "no spills detected" only if all 24 checks report no spill.
+       - If any step reports a spill, report spill detected and include relative direction.
+    3. If hazard found:
        -> Apply OBSTACLE_BYPASS using hazard bounding box as obstacle width
-    3. tbot_vision_describe_scene() at end for visual QA
+    4. tbot_vision_describe_scene() at end for visual QA
 
   ---
 

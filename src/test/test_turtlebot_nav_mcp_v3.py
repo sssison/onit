@@ -118,9 +118,10 @@ def _reset_spatial_map_state() -> None:
     with nav_v3._spatial_map_lock:
         nav_v3._spatial_map_state["anchor_pose"] = None
         nav_v3._spatial_map_state["objects"] = []
-        nav_v3._spatial_map_state["last_scan_pose"] = None
-        nav_v3._spatial_map_state["last_scan_time_s"] = None
+        nav_v3._spatial_map_state["last_update_pose"] = None
+        nav_v3._spatial_map_state["last_update_time_s"] = None
         nav_v3._spatial_map_state["scan_count"] = 0
+        nav_v3._spatial_map_state["update_count"] = 0
 
 
 def test_nav_get_pose_returns_no_odom_when_rclpy_unavailable():
@@ -851,44 +852,27 @@ def test_nav_patrol_returns_partial_completed_on_failure():
     assert result["completed_waypoints"] == 1
 
 
-def test_scan_spatial_map_collects_visible_objects():
+def test_spatial_map_record_observation_updates_map():
     _reset_spatial_map_state()
-    state = _make_state()
-    state["vision_bbox_results"] = [
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": False, "confidence": 0.0, "bbox": None},
-    ]
-    state["angle_distance_results"] = [
-        {"status": "ok", "distance_m": 1.0, "valid_count": 4},
-        {"status": "ok", "distance_m": 1.5, "valid_count": 4},
-    ]
-
-    def fake_client(url: str):
-        return _FakeNavClient(url, state)
-
-    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+    with patch.object(
         nav_v3,
         "tbot_nav_get_pose",
         new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
     ):
         result = asyncio.run(
-            nav_v3.tbot_scan_spatial_map(
-                labels=["chair"],
-                step_deg=180.0,
-                turn_speed=0.5,
-                turn_duration_s=0.56,
-                lidar_half_width_deg=5.0,
+            nav_v3.tbot_spatial_map_record_observation(
+                label="chair",
+                bearing_deg=0.0,
+                distance_m=1.0,
+                confidence=0.9,
             )
         )
 
     assert result["success"] is True
-    assert result["steps_requested"] == 2
-    assert result["steps_completed"] == 2
     assert len(result["objects"]) == 1
     assert result["objects"][0]["label"] == "chair"
-    assert any(name == "tbot_motion_turn" for name, _ in state["motion_calls"])
-    assert any(name == "tbot_lidar_get_distance_at_angle" for name, _ in state["lidar_calls"])
-    assert any(name == "tbot_vision_get_object_bbox" for name, _ in state["vision_calls"])
+    assert result["objects"][0]["x"] == pytest.approx(0.0, abs=1e-3)
+    assert result["objects"][0]["y"] == pytest.approx(1.0, abs=1e-3)
 
 
 def test_get_spatial_map_is_empty_before_scan():
@@ -909,52 +893,33 @@ def test_merge_spatial_detection_merges_nearby_and_splits_far_entries():
     assert len(objects) == 2
 
 
-def test_scan_spatial_map_resets_when_robot_moves_past_threshold():
+def test_spatial_map_record_observation_resets_when_robot_moves_past_threshold():
     _reset_spatial_map_state()
-    first_state = _make_state()
-    first_state["vision_bbox_results"] = [
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": False, "confidence": 0.0, "bbox": None},
-    ]
-    first_state["angle_distance_results"] = [
-        {"status": "ok", "distance_m": 1.0, "valid_count": 4},
-        {"status": "ok", "distance_m": 1.0, "valid_count": 4},
-    ]
-
-    def first_fake_client(url: str):
-        return _FakeNavClient(url, first_state)
-
-    with patch.object(nav_v3, "Client", side_effect=first_fake_client), patch.object(
+    with patch.object(
         nav_v3,
         "tbot_nav_get_pose",
         new=AsyncMock(return_value={"status": "ok", "x_m": 0.0, "y_m": 0.0, "yaw_rad": 0.0}),
     ):
-        first_result = asyncio.run(nav_v3.tbot_scan_spatial_map(labels=["chair"], step_deg=180.0))
+        first_result = asyncio.run(
+            nav_v3.tbot_spatial_map_record_observation(
+                label="chair",
+                bearing_deg=0.0,
+                distance_m=1.0,
+            )
+        )
     assert first_result["success"] is True
     assert any(obj["label"] == "chair" for obj in first_result["objects"])
 
-    second_state = _make_state()
-    second_state["vision_bbox_results"] = [
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": False, "confidence": 0.0, "bbox": None},
-    ]
-    second_state["angle_distance_results"] = [
-        {"status": "ok", "distance_m": 1.0, "valid_count": 4},
-        {"status": "ok", "distance_m": 1.0, "valid_count": 4},
-    ]
-
-    def second_fake_client(url: str):
-        return _FakeNavClient(url, second_state)
-
-    with patch.object(nav_v3, "Client", side_effect=second_fake_client), patch.object(
+    with patch.object(
         nav_v3,
         "tbot_nav_get_pose",
         new=AsyncMock(return_value={"status": "ok", "x_m": 1.0, "y_m": 0.0, "yaw_rad": 0.0}),
     ):
         second_result = asyncio.run(
-            nav_v3.tbot_scan_spatial_map(
-                labels=["desk"],
-                step_deg=180.0,
+            nav_v3.tbot_spatial_map_record_observation(
+                label="desk",
+                bearing_deg=0.0,
+                distance_m=1.0,
                 reset_if_moved_m=0.5,
             )
         )

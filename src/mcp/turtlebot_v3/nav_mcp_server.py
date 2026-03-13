@@ -47,20 +47,6 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"Invalid {name}={raw!r}; expected a float") from e
 
 
-def _env_csv(name: str, default: str) -> list[str]:
-    raw = os.getenv(name, default)
-    values = [token.strip() for token in raw.split(",") if token.strip()]
-    seen: set[str] = set()
-    unique: list[str] = []
-    for value in values:
-        lowered = value.lower()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        unique.append(value)
-    return unique
-
-
 ODOM_TOPIC = os.getenv("ODOM_TOPIC", "/odom")
 ODOM_TIMEOUT_S = _env_float("ODOM_TIMEOUT_S", 1.0)
 ODOM_STALE_TIMEOUT_S = _env_float("ODOM_STALE_TIMEOUT_S", 0.5)
@@ -88,25 +74,19 @@ NAV_OBJECT_DEFAULT_STOP_DISTANCE_M = max(0.05, _env_float("NAV_OBJECT_DEFAULT_ST
 NAV_MIDPOINT_TIMEOUT_S = max(5.0, _env_float("NAV_MIDPOINT_TIMEOUT_S", 45.0))
 NAV_FORWARD_CONE_HALF_WIDTH_DEG = max(5.0, _env_float("NAV_FORWARD_CONE_HALF_WIDTH_DEG", 30.0))
 NAV_MIDPOINT_SAMPLE_OFFSETS_DEG = (-10.0, 0.0, 10.0)
-NAV_SCAN_STEP_DEG = max(1.0, _env_float("NAV_SCAN_STEP_DEG", 10.0))
-NAV_SCAN_TURN_SPEED_RPS = max(0.05, _env_float("NAV_SCAN_TURN_SPEED_RPS", 0.5))
-NAV_SCAN_TURN_DURATION_S = max(0.01, _env_float("NAV_SCAN_TURN_DURATION_S", 0.56))
-NAV_SCAN_LIDAR_HALF_WIDTH_DEG = max(1.0, _env_float("NAV_SCAN_LIDAR_HALF_WIDTH_DEG", 5.0))
-NAV_SCAN_MERGE_RADIUS_M = max(0.05, _env_float("NAV_SCAN_MERGE_RADIUS_M", 0.3))
-NAV_SCAN_RESET_DISTANCE_M = max(0.1, _env_float("NAV_SCAN_RESET_DISTANCE_M", 0.5))
-NAV_SCAN_DEFAULT_LABELS = _env_csv(
-    "NAV_SCAN_DEFAULT_LABELS",
-    "chair,table,desk,door,cabinet,trashcan,bench,box,cone,person",
-)
+NAV_SPATIAL_MAP_MERGE_RADIUS_M = max(0.05, _env_float("NAV_SPATIAL_MAP_MERGE_RADIUS_M", 0.3))
+NAV_SPATIAL_MAP_RESET_DISTANCE_M = max(0.1, _env_float("NAV_SPATIAL_MAP_RESET_DISTANCE_M", 0.5))
 
 _rclpy_init_lock = threading.Lock()
 _spatial_map_lock = threading.Lock()
 _spatial_map_state: dict[str, Any] = {
     "anchor_pose": None,
     "objects": [],
-    "last_scan_pose": None,
-    "last_scan_time_s": None,
+    "last_update_pose": None,
+    "last_update_time_s": None,
+    # Keep scan_count for backward-compatibility with callers already reading it.
     "scan_count": 0,
+    "update_count": 0,
 }
 
 
@@ -312,47 +292,12 @@ def _extract_valid_distance(value: Any) -> float | None:
     return None
 
 
-def _extract_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and math.isfinite(float(value)):
-        return float(value) != 0.0
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "yes", "y", "1"}:
-            return True
-        if lowered in {"false", "no", "n", "0"}:
-            return False
-    return default
-
-
 def _normalize_confidence(value: Any, default: float = 1.0) -> float:
     if isinstance(value, (int, float)):
         parsed = float(value)
         if math.isfinite(parsed):
             return max(0.0, min(1.0, parsed))
     return max(0.0, min(1.0, float(default)))
-
-
-def _sanitize_scan_labels(labels: list[str] | None) -> list[str]:
-    if labels is None:
-        candidates = NAV_SCAN_DEFAULT_LABELS
-    else:
-        candidates = labels
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for value in candidates:
-        if not isinstance(value, str):
-            continue
-        token = value.strip()
-        if not token:
-            continue
-        lowered = token.lower()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        cleaned.append(token)
-    return cleaned
 
 
 def _distance_between_points_m(x1: float, y1: float, x2: float, y2: float) -> float:
@@ -401,13 +346,16 @@ def _copy_spatial_map_state() -> dict[str, Any]:
     with _spatial_map_lock:
         anchor_pose = _spatial_map_state.get("anchor_pose")
         objects = _spatial_map_state.get("objects") or []
-        last_scan_pose = _spatial_map_state.get("last_scan_pose")
+        last_update_pose = _spatial_map_state.get("last_update_pose")
         return {
             "anchor_pose": dict(anchor_pose) if isinstance(anchor_pose, dict) else None,
             "objects": [dict(item) for item in objects if isinstance(item, dict)],
-            "last_scan_pose": dict(last_scan_pose) if isinstance(last_scan_pose, dict) else None,
-            "last_scan_time_s": _spatial_map_state.get("last_scan_time_s"),
+            "last_update_pose": dict(last_update_pose) if isinstance(last_update_pose, dict) else None,
+            "last_update_time_s": _spatial_map_state.get("last_update_time_s"),
+            "last_scan_pose": dict(last_update_pose) if isinstance(last_update_pose, dict) else None,
+            "last_scan_time_s": _spatial_map_state.get("last_update_time_s"),
             "scan_count": int(_spatial_map_state.get("scan_count", 0)),
+            "update_count": int(_spatial_map_state.get("update_count", 0)),
         }
 
 
@@ -415,14 +363,17 @@ def _replace_spatial_map_state(
     *,
     anchor_pose: dict[str, float] | None,
     objects: list[dict[str, Any]],
-    last_scan_pose: dict[str, float] | None,
+    last_update_pose: dict[str, float] | None,
 ) -> dict[str, Any]:
     with _spatial_map_lock:
         _spatial_map_state["anchor_pose"] = dict(anchor_pose) if isinstance(anchor_pose, dict) else None
         _spatial_map_state["objects"] = [dict(item) for item in objects]
-        _spatial_map_state["last_scan_pose"] = dict(last_scan_pose) if isinstance(last_scan_pose, dict) else None
-        _spatial_map_state["last_scan_time_s"] = time.time()
+        _spatial_map_state["last_update_pose"] = (
+            dict(last_update_pose) if isinstance(last_update_pose, dict) else None
+        )
+        _spatial_map_state["last_update_time_s"] = time.time()
         _spatial_map_state["scan_count"] = int(_spatial_map_state.get("scan_count", 0)) + 1
+        _spatial_map_state["update_count"] = int(_spatial_map_state.get("update_count", 0)) + 1
         return {
             "anchor_pose": (
                 dict(_spatial_map_state["anchor_pose"])
@@ -430,13 +381,20 @@ def _replace_spatial_map_state(
                 else None
             ),
             "objects": [dict(item) for item in _spatial_map_state.get("objects", []) if isinstance(item, dict)],
-            "last_scan_pose": (
-                dict(_spatial_map_state["last_scan_pose"])
-                if isinstance(_spatial_map_state.get("last_scan_pose"), dict)
+            "last_update_pose": (
+                dict(_spatial_map_state["last_update_pose"])
+                if isinstance(_spatial_map_state.get("last_update_pose"), dict)
                 else None
             ),
-            "last_scan_time_s": _spatial_map_state.get("last_scan_time_s"),
+            "last_update_time_s": _spatial_map_state.get("last_update_time_s"),
+            "last_scan_pose": (
+                dict(_spatial_map_state["last_update_pose"])
+                if isinstance(_spatial_map_state.get("last_update_pose"), dict)
+                else None
+            ),
+            "last_scan_time_s": _spatial_map_state.get("last_update_time_s"),
             "scan_count": int(_spatial_map_state.get("scan_count", 0)),
+            "update_count": int(_spatial_map_state.get("update_count", 0)),
         }
 
 
@@ -447,7 +405,7 @@ def _merge_spatial_detection(
     x_m: float,
     y_m: float,
     confidence: float,
-    merge_radius_m: float = NAV_SCAN_MERGE_RADIUS_M,
+    merge_radius_m: float = NAV_SPATIAL_MAP_MERGE_RADIUS_M,
 ) -> None:
     merge_index: int | None = None
     nearest_distance: float | None = None
@@ -686,233 +644,116 @@ async def tbot_nav_get_pose(timeout_s: float = ODOM_TIMEOUT_S) -> dict[str, Any]
 
 
 @mcp_nav_v3.tool()
-async def tbot_scan_spatial_map(
-    labels: list[str] | None = None,
-    step_deg: float = NAV_SCAN_STEP_DEG,
-    turn_speed: float = NAV_SCAN_TURN_SPEED_RPS,
-    turn_duration_s: float = NAV_SCAN_TURN_DURATION_S,
-    lidar_half_width_deg: float = NAV_SCAN_LIDAR_HALF_WIDTH_DEG,
-    reset_if_moved_m: float = NAV_SCAN_RESET_DISTANCE_M,
+async def tbot_spatial_map_record_observation(
+    label: str,
+    bearing_deg: float = 0.0,
+    distance_m: float | None = None,
+    confidence: float = 1.0,
+    reset_if_moved_m: float = NAV_SPATIAL_MAP_RESET_DISTANCE_M,
 ) -> dict[str, Any]:
     """
-    Run a 360 scan by turn/lidar/vision steps and update an in-memory spatial map.
+    Record a single object observation into the in-memory spatial map.
     """
-    labels_clean = _sanitize_scan_labels(labels)
-    if not labels_clean:
-        return {
-            "success": False,
-            "error": "no_labels_configured",
-            "anchor_pose": None,
-            "objects": [],
-            "steps_requested": 0,
-            "steps_completed": 0,
-            "labels": [],
-        }
+    label_clean = label.strip() if isinstance(label, str) else ""
+    if not label_clean:
+        raise ValueError("label must be a non-empty string")
 
-    step_f = _validate_finite("step_deg", step_deg)
-    turn_speed_f = abs(_validate_finite("turn_speed", turn_speed))
-    turn_duration_f = _validate_finite("turn_duration_s", turn_duration_s)
-    lidar_half_width_f = _validate_finite("lidar_half_width_deg", lidar_half_width_deg)
+    bearing_f = _validate_finite("bearing_deg", bearing_deg)
+    confidence_f = _normalize_confidence(confidence, default=1.0)
     reset_if_moved_f = _validate_finite("reset_if_moved_m", reset_if_moved_m)
-
-    if step_f <= 0 or step_f > 180:
-        raise ValueError("step_deg must be in (0, 180]")
-    if turn_speed_f <= 0:
-        raise ValueError("turn_speed must be > 0")
-    if turn_duration_f <= 0:
-        raise ValueError("turn_duration_s must be > 0")
-    if lidar_half_width_f <= 0:
-        raise ValueError("lidar_half_width_deg must be > 0")
     if reset_if_moved_f < 0:
         raise ValueError("reset_if_moved_m must be >= 0")
 
-    steps = max(1, int(round(360.0 / step_f)))
-    effective_step_deg = 360.0 / float(steps)
-    turn_duration_step_s = turn_duration_f * (effective_step_deg / NAV_SCAN_STEP_DEG)
-    scan_pose_raw = await tbot_nav_get_pose()
-    if scan_pose_raw.get("status") != "ok":
+    if distance_m is None:
         return {
             "success": False,
-            "error": scan_pose_raw.get("error", "no_odom"),
-            "anchor_pose": None,
-            "objects": [],
-            "steps_requested": steps,
-            "steps_completed": 0,
-            "labels": labels_clean,
+            "error": "distance_m_required",
+            "label": label_clean,
+        }
+    distance_f = _validate_finite("distance_m", distance_m)
+    if distance_f <= 0:
+        raise ValueError("distance_m must be > 0")
+
+    pose = await tbot_nav_get_pose()
+    if pose.get("status") != "ok":
+        return {
+            "success": False,
+            "error": pose.get("error", "no_odom"),
+            "label": label_clean,
         }
 
-    scan_pose = {
-        "x": float(scan_pose_raw["x_m"]),
-        "y": float(scan_pose_raw["y_m"]),
-        "yaw_rad": float(scan_pose_raw["yaw_rad"]),
+    current_pose = {
+        "x": float(pose["x_m"]),
+        "y": float(pose["y_m"]),
+        "yaw_rad": float(pose["yaw_rad"]),
     }
 
     state_snapshot = _copy_spatial_map_state()
     anchor_pose = state_snapshot.get("anchor_pose")
     objects = state_snapshot.get("objects") if isinstance(state_snapshot.get("objects"), list) else []
-    if not isinstance(anchor_pose, dict):
-        anchor_pose = dict(scan_pose)
-        objects = []
 
     reset_performed = False
-    reset_reason: str | None = None
-    distance_from_anchor = _distance_between_points_m(
-        scan_pose["x"],
-        scan_pose["y"],
-        float(anchor_pose["x"]),
-        float(anchor_pose["y"]),
-    )
-    if distance_from_anchor > reset_if_moved_f:
-        reset_performed = True
-        reset_reason = "robot_moved"
-        anchor_pose = dict(scan_pose)
+    if not isinstance(anchor_pose, dict):
+        anchor_pose = dict(current_pose)
         objects = []
-
-    steps_completed = 0
-    detections_observed = 0
-    errors: list[dict[str, Any]] = []
-
-    try:
-        async with Client(MOTION_MCP_URL_V3) as motion:
-            async with Client(LIDAR_MCP_URL_V3) as lidar:
-                async with Client(VISION_MCP_URL_V3) as vision:
-                    for step_index in range(steps):
-                        await motion.call_tool(
-                            "tbot_motion_turn",
-                            {
-                                "direction": "left",
-                                "speed": turn_speed_f,
-                                "duration_seconds": turn_duration_step_s,
-                            },
-                        )
-                        steps_completed += 1
-                        bearing_deg = (float(steps_completed) * effective_step_deg) % 360.0
-
-                        obstacle_distance_m: float | None = None
-                        try:
-                            distance_raw = await lidar.call_tool(
-                                "tbot_lidar_get_distance_at_angle",
-                                {
-                                    "angle_deg": 0.0,
-                                    "half_width_deg": lidar_half_width_f,
-                                    "statistic": "min",
-                                },
-                            )
-                            distance_result = _extract_tool_result_dict(distance_raw)
-                            obstacle_distance_m = _extract_valid_distance(distance_result.get("distance_m"))
-                        except Exception as e:
-                            errors.append(
-                                {
-                                    "step": steps_completed,
-                                    "type": "lidar_error",
-                                    "error": str(e),
-                                }
-                            )
-
-                        for label in labels_clean:
-                            try:
-                                bbox_raw = await vision.call_tool(
-                                    "tbot_vision_get_object_bbox",
-                                    {"object_name": label},
-                                )
-                                bbox_result = _extract_tool_result_dict(bbox_raw)
-                            except Exception as e:
-                                errors.append(
-                                    {
-                                        "step": steps_completed,
-                                        "type": "vision_error",
-                                        "label": label,
-                                        "error": str(e),
-                                    }
-                                )
-                                continue
-
-                            if not _extract_bool(bbox_result.get("visible"), default=False):
-                                continue
-
-                            bbox = bbox_result.get("bbox")
-                            distance_m = obstacle_distance_m
-                            if distance_m is None:
-                                distance_m = _heuristic_distance_from_bbox_m(bbox)
-                            if distance_m is None:
-                                continue
-
-                            confidence = _normalize_confidence(bbox_result.get("confidence"), default=1.0)
-                            world_x_m, world_y_m = _bearing_distance_to_world(
-                                robot_x_m=scan_pose["x"],
-                                robot_y_m=scan_pose["y"],
-                                robot_yaw_rad=scan_pose["yaw_rad"],
-                                distance_m=distance_m,
-                                bearing_deg=bearing_deg,
-                            )
-                            anchor_x_m, anchor_y_m = _world_to_anchor_xy(
-                                world_x_m=world_x_m,
-                                world_y_m=world_y_m,
-                                anchor_x_m=float(anchor_pose["x"]),
-                                anchor_y_m=float(anchor_pose["y"]),
-                                anchor_yaw_rad=float(anchor_pose["yaw_rad"]),
-                            )
-                            _merge_spatial_detection(
-                                objects,
-                                label=label,
-                                x_m=anchor_x_m,
-                                y_m=anchor_y_m,
-                                confidence=confidence,
-                                merge_radius_m=NAV_SCAN_MERGE_RADIUS_M,
-                            )
-                            detections_observed += 1
-                    await _safe_motion_stop(motion)
-    except Exception as e:
-        try:
-            async with Client(MOTION_MCP_URL_V3) as motion:
-                await _safe_motion_stop(motion)
-        except Exception:
-            pass
-        stored = _replace_spatial_map_state(
-            anchor_pose=anchor_pose,
-            objects=objects,
-            last_scan_pose=scan_pose,
+    else:
+        distance_from_anchor_m = _distance_between_points_m(
+            current_pose["x"],
+            current_pose["y"],
+            float(anchor_pose["x"]),
+            float(anchor_pose["y"]),
         )
-        return {
-            "success": False,
-            "error": f"scan_failed: {e}",
-            "anchor_pose": stored.get("anchor_pose"),
-            "objects": stored.get("objects"),
-            "steps_requested": steps,
-            "steps_completed": steps_completed,
-            "labels": labels_clean,
-            "detections_observed": detections_observed,
-            "reset_performed": reset_performed,
-            "reset_reason": reset_reason,
-            "errors": errors,
-        }
+        if distance_from_anchor_m > reset_if_moved_f:
+            anchor_pose = dict(current_pose)
+            objects = []
+            reset_performed = True
+
+    world_x_m, world_y_m = _bearing_distance_to_world(
+        robot_x_m=current_pose["x"],
+        robot_y_m=current_pose["y"],
+        robot_yaw_rad=current_pose["yaw_rad"],
+        distance_m=distance_f,
+        bearing_deg=bearing_f,
+    )
+    anchor_x_m, anchor_y_m = _world_to_anchor_xy(
+        world_x_m=world_x_m,
+        world_y_m=world_y_m,
+        anchor_x_m=float(anchor_pose["x"]),
+        anchor_y_m=float(anchor_pose["y"]),
+        anchor_yaw_rad=float(anchor_pose["yaw_rad"]),
+    )
+    _merge_spatial_detection(
+        objects,
+        label=label_clean,
+        x_m=anchor_x_m,
+        y_m=anchor_y_m,
+        confidence=confidence_f,
+        merge_radius_m=NAV_SPATIAL_MAP_MERGE_RADIUS_M,
+    )
 
     stored = _replace_spatial_map_state(
         anchor_pose=anchor_pose,
         objects=objects,
-        last_scan_pose=scan_pose,
+        last_update_pose=current_pose,
     )
     return {
         "success": True,
+        "label": label_clean,
+        "bearing_deg": bearing_f,
+        "distance_m": distance_f,
+        "confidence": confidence_f,
+        "anchor_xy": {"x": anchor_x_m, "y": anchor_y_m},
+        "reset_performed": reset_performed,
         "anchor_pose": stored.get("anchor_pose"),
         "objects": stored.get("objects"),
-        "steps_requested": steps,
-        "steps_completed": steps_completed,
-        "labels": labels_clean,
-        "detections_observed": detections_observed,
-        "reset_performed": reset_performed,
-        "reset_reason": reset_reason,
-        "errors": errors,
-        "scan_count": stored.get("scan_count"),
-        "last_scan_pose": stored.get("last_scan_pose"),
-        "last_scan_time_s": stored.get("last_scan_time_s"),
+        "update_count": stored.get("update_count", 0),
     }
 
 
 @mcp_nav_v3.tool()
 async def tbot_get_spatial_map() -> dict[str, Any]:
     """
-    Return the in-memory spatial map built by tbot_scan_spatial_map.
+    Return the current in-memory spatial map.
     """
     snapshot = _copy_spatial_map_state()
     anchor_pose = snapshot.get("anchor_pose")
@@ -921,6 +762,10 @@ async def tbot_get_spatial_map() -> dict[str, Any]:
         "status": status,
         "anchor_pose": anchor_pose,
         "objects": snapshot.get("objects", []),
+        "last_update_pose": snapshot.get("last_update_pose"),
+        "last_update_time_s": snapshot.get("last_update_time_s"),
+        "update_count": snapshot.get("update_count", 0),
+        # Backward-compatible aliases.
         "last_scan_pose": snapshot.get("last_scan_pose"),
         "last_scan_time_s": snapshot.get("last_scan_time_s"),
         "scan_count": snapshot.get("scan_count", 0),
