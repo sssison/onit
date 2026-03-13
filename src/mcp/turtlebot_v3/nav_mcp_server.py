@@ -335,7 +335,6 @@ async def _attempt_reacquire_target(
     step_deg = NAV_OBJECT_SWEEP_STEP_DEG
     arc_deg = NAV_OBJECT_REACQUIRE_STEPS * step_deg
     first_sign = 1.0 if str(preferred_side).lower() == "left" else -1.0
-    second_sign = -first_sign
 
     for _ in range(NAV_OBJECT_REACQUIRE_STEPS):
         await _turn_by_degrees(motion, first_sign * step_deg, NAV_OBJECT_TURN_SPEED_RPS)
@@ -344,14 +343,6 @@ async def _attempt_reacquire_target(
             return view
 
     await _turn_by_degrees(motion, -(first_sign * arc_deg), NAV_OBJECT_TURN_SPEED_RPS)
-
-    for _ in range(NAV_OBJECT_REACQUIRE_STEPS):
-        await _turn_by_degrees(motion, second_sign * step_deg, NAV_OBJECT_TURN_SPEED_RPS)
-        view = await _vision_find_target(vision, target, qualifier)
-        if bool(view.get("visible")):
-            return view
-
-    await _turn_by_degrees(motion, -(second_sign * arc_deg), NAV_OBJECT_TURN_SPEED_RPS)
     return None
 
 

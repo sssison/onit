@@ -52,6 +52,7 @@ instruction_template: |
   - After lock, recenter only if needed, then plan movement toward the target.
   - Do not run another search sweep after lock.
   - Search/reacquire is allowed only if the target goes missing after forward movement toward it has begun.
+  - During reacquire, search only toward the last-seen side up to 90 deg using 15 deg steps; do not sweep the opposite side in the same reacquire attempt.
 
   ### Tool call efficiency
   - Call tools only when the result changes the next action.

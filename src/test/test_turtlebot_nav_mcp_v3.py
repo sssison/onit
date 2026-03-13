@@ -406,12 +406,11 @@ def test_navigate_to_object_reacquire_failures_return_max_retries():
     assert result["stopped_reason"] == "max_retries"
 
 
-def test_attempt_reacquire_target_scans_preferred_90_then_opposite_90():
+def test_attempt_reacquire_target_scans_only_preferred_90_and_returns_center():
     state = _make_state()
     state["vision_find_results"] = [
-        {"visible": False, "confidence": 0.1, "bbox": None} for _ in range(nav_v3.NAV_OBJECT_REACQUIRE_STEPS)
-    ] + [
-        {"visible": True, "confidence": 0.8, "bbox": {"cx": 0.7, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": False, "confidence": 0.1, "bbox": None}
+        for _ in range(nav_v3.NAV_OBJECT_REACQUIRE_STEPS)
     ]
     vision = _FakeNavClient(nav_v3.VISION_MCP_URL_V3, state)
     motion = _FakeNavClient(nav_v3.MOTION_MCP_URL_V3, state)
@@ -426,9 +425,9 @@ def test_attempt_reacquire_target_scans_preferred_90_then_opposite_90():
         )
     )
 
-    assert result is not None
+    assert result is None
     turn_calls = [payload for name, payload in state["motion_calls"] if name == "tbot_motion_turn"]
-    assert len(turn_calls) == nav_v3.NAV_OBJECT_REACQUIRE_STEPS + 2
+    assert len(turn_calls) == nav_v3.NAV_OBJECT_REACQUIRE_STEPS + 1
     for payload in turn_calls[: nav_v3.NAV_OBJECT_REACQUIRE_STEPS]:
         assert payload["direction"] == "left"
         assert payload["duration_seconds"] == pytest.approx(math.radians(15.0) / nav_v3.NAV_OBJECT_TURN_SPEED_RPS)
@@ -436,8 +435,6 @@ def test_attempt_reacquire_target_scans_preferred_90_then_opposite_90():
     assert turn_calls[nav_v3.NAV_OBJECT_REACQUIRE_STEPS]["duration_seconds"] == pytest.approx(
         math.radians(90.0) / nav_v3.NAV_OBJECT_TURN_SPEED_RPS
     )
-    assert turn_calls[-1]["direction"] == "right"
-    assert turn_calls[-1]["duration_seconds"] == pytest.approx(math.radians(15.0) / nav_v3.NAV_OBJECT_TURN_SPEED_RPS)
     assert len(state["lidar_calls"]) == 0
 
 

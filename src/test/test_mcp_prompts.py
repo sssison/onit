@@ -109,6 +109,7 @@ class TestAssistantInstruction:
         assert "PATTERN: FIND_AND_APPROACH <object>" in result
         assert "If tbot_vision_find_object reports the target is visible, lock the target." in result
         assert "Do not run another search sweep after lock." in result
+        assert "do not sweep the opposite side in the same reacquire attempt." in result
         assert "Call tools only when the result changes the next action." in result
         assert "v3_instruction_template" not in result
         assert "(V3)" not in result
