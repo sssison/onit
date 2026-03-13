@@ -52,6 +52,8 @@ instruction_template: |
   - If tbot_vision_find_object reports the target is visible, lock the target.
   - After lock, recenter only if needed, then plan movement toward the target.
   - Do not run another search sweep after lock.
+  - Rescan ONLY IF the object is not present in frame.
+  - If the object is present but off-center, recenter using the bounding box and continue approach.
   - If tbot_navigate_to_object returns target_lost after motion, call tbot_vision_find_object(search_mode="scan360") again before another navigation attempt.
 
   ### Tool call efficiency
@@ -80,7 +82,10 @@ instruction_template: |
            confirm_in_frame=True   <- always True when task requires visual QA
        )
 
-    3. If nav.stopped_reason == "target_lost":
+    3. After each move, verify with tbot_vision_find_object(search_mode="frame_only"):
+       - If visible: continue approaching; if off-center, recenter from bbox.
+       - If not visible: treat as target_lost and reacquire with scan360.
+       If nav.stopped_reason == "target_lost":
        -> Repeat Step 1 (find again) then Step 2 (navigate again).
        -> Continue until reached_target or retry limit.
 

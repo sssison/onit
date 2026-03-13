@@ -68,6 +68,8 @@ NAV_OBJECT_APPROACH_STEP_M = max(0.05, _env_float("NAV_OBJECT_APPROACH_STEP_M", 
 NAV_OBJECT_MOVE_SPEED_MPS = max(0.03, _env_float("NAV_OBJECT_MOVE_SPEED_MPS", 0.10))
 NAV_OBJECT_TURN_SPEED_RPS = max(0.05, _env_float("NAV_OBJECT_TURN_SPEED_RPS", 0.30))
 NAV_OBJECT_MAX_APPROACH_STEPS = max(1, int(_env_float("NAV_OBJECT_MAX_APPROACH_STEPS", 80.0)))
+NAV_OBJECT_RECENTER_EPS_DEG = max(0.5, _env_float("NAV_OBJECT_RECENTER_EPS_DEG", 1.0))
+NAV_OBJECT_LOSS_CONFIRM_FRAMES = max(1, int(_env_float("NAV_OBJECT_LOSS_CONFIRM_FRAMES", 2.0)))
 
 _rclpy_init_lock = threading.Lock()
 
@@ -318,6 +320,24 @@ async def _vision_find_target(
         payload["attributes"] = attrs
     raw = await vision.call_tool("tbot_vision_find_object", payload)
     return _extract_tool_result_dict(raw)
+
+
+async def _recenter_to_visible_target_if_needed(
+    motion: Client,
+    target_view: dict[str, Any],
+) -> bool:
+    heading_offset_deg = _heading_offset_from_bbox_deg(
+        target_view.get("bbox"),
+        TBOT_CAMERA_FOV_DEG,
+    )
+    if heading_offset_deg is None or abs(heading_offset_deg) < NAV_OBJECT_RECENTER_EPS_DEG:
+        return False
+    await _turn_by_degrees(
+        motion=motion,
+        turn_deg=heading_offset_deg,
+        speed_rps=NAV_OBJECT_TURN_SPEED_RPS,
+    )
+    return True
 
 
 @mcp_nav_v3.tool()
@@ -657,7 +677,8 @@ async def tbot_navigate_to_object(
     confirm_in_frame: bool = True,
 ) -> dict[str, Any]:
     """
-    Find an object, approach safely with collision checks, and optionally run visual confirmation.
+    Approach a visible object with collision checks and optional visual confirmation.
+    If the object is visible but off-center, recenter in-place via bbox instead of rescanning.
     """
     target_clean = target.strip() if isinstance(target, str) else ""
     if not target_clean:
@@ -692,6 +713,7 @@ async def tbot_navigate_to_object(
                     }
 
                 object_in_frame = True
+                await _recenter_to_visible_target_if_needed(motion, initial_view)
 
                 approach_steps = 0
                 while approach_steps < NAV_OBJECT_MAX_APPROACH_STEPS:
@@ -741,6 +763,23 @@ async def tbot_navigate_to_object(
                         search_mode="frame_only",
                     )
                     object_in_frame = bool(post_move_view.get("visible"))
+                    if object_in_frame:
+                        await _recenter_to_visible_target_if_needed(motion, post_move_view)
+                        continue
+
+                    # Confirm absence across additional frame checks before declaring target_lost.
+                    for _ in range(max(0, NAV_OBJECT_LOSS_CONFIRM_FRAMES - 1)):
+                        confirm_view = await _vision_find_target(
+                            vision=vision,
+                            target=target_clean,
+                            qualifier=qualifier,
+                            search_mode="frame_only",
+                        )
+                        if bool(confirm_view.get("visible")):
+                            object_in_frame = True
+                            await _recenter_to_visible_target_if_needed(motion, confirm_view)
+                            break
+
                     if not object_in_frame:
                         await _safe_motion_stop(motion)
                         final_pose = await tbot_nav_get_pose()

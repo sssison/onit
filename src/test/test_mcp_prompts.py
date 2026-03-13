@@ -110,6 +110,8 @@ class TestAssistantInstruction:
         assert 'tbot_vision_find_object(search_mode="scan360")' in result
         assert "If tbot_vision_find_object reports the target is visible, lock the target." in result
         assert "Do not run another search sweep after lock." in result
+        assert "Rescan ONLY IF the object is not present in frame." in result
+        assert "If the object is present but off-center, recenter using the bounding box and continue approach." in result
         assert "If nav.stopped_reason == \"target_lost\":" in result
         assert "Call tools only when the result changes the next action." in result
         assert "v3_instruction_template" not in result

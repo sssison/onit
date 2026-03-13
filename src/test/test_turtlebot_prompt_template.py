@@ -38,6 +38,8 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "Do not execute forward motion while the target object is not yet confirmed in frame." in instruction
     assert "If tbot_vision_find_object reports the target is visible, lock the target." in instruction
     assert "Do not run another search sweep after lock." in instruction
+    assert "Rescan ONLY IF the object is not present in frame." in instruction
+    assert "If the object is present but off-center, recenter using the bounding box and continue approach." in instruction
     assert "If nav.stopped_reason == \"target_lost\":" in instruction
     assert "Call tools only when the result changes the next action." in instruction
     assert "Avoid repeated identical calls without movement or state change between calls." in instruction

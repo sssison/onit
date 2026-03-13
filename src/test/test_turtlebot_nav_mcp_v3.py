@@ -145,6 +145,7 @@ def test_navigate_to_object_returns_target_lost_after_move():
     state["vision_find_results"] = [
         {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
         {"visible": False, "confidence": 0.1, "bbox": None},
+        {"visible": False, "confidence": 0.1, "bbox": None},
     ]
     state["collision_results"] = [
         {"risk_level": "clear", "min_forward_distance_m": 1.0, "distances": {"front": 1.0}},
@@ -163,6 +164,61 @@ def test_navigate_to_object_returns_target_lost_after_move():
     assert result["success"] is False
     assert result["stopped_reason"] == "target_lost"
     assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
+
+
+def test_navigate_to_object_recenters_when_visible_off_center_after_move():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.82, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    state["collision_results"] = [
+        {"risk_level": "clear", "min_forward_distance_m": 1.0, "distances": {"front": 1.0}},
+        {"risk_level": "clear", "min_forward_distance_m": 0.55, "distances": {"front": 0.55}},
+    ]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.4, "y_m": 0.1, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_navigate_to_object(target="cabinet", stop_distance=0.6))
+
+    assert result["success"] is True
+    assert result["stopped_reason"] == "reached_target"
+    assert any(name == "tbot_motion_turn" for name, _ in state["motion_calls"])
+    assert result["stopped_reason"] != "target_lost"
+
+
+def test_navigate_to_object_does_not_declare_loss_on_single_miss():
+    state = _make_state()
+    state["vision_find_results"] = [
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": False, "confidence": 0.1, "bbox": None},
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.52, "cy": 0.5, "w": 0.2, "h": 0.2}},
+        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    state["collision_results"] = [
+        {"risk_level": "clear", "min_forward_distance_m": 1.0, "distances": {"front": 1.0}},
+        {"risk_level": "clear", "min_forward_distance_m": 0.55, "distances": {"front": 0.55}},
+    ]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "tbot_nav_get_pose",
+        new=AsyncMock(return_value={"status": "ok", "x_m": 0.4, "y_m": 0.1, "yaw_rad": 0.0}),
+    ):
+        result = asyncio.run(nav_v3.tbot_navigate_to_object(target="cabinet", stop_distance=0.6))
+
+    assert result["success"] is True
+    assert result["stopped_reason"] == "reached_target"
 
 
 def test_nav_go_to_pose_reaches_target_without_timed_motion():
