@@ -50,6 +50,8 @@ instruction_template: |
   If stop_distance is omitted, tbot_navigate_to_object defaults to 0.20 m (20 cm).
   Treat navigation as complete only when the robot is within stop_distance AND the target is visible.
   Do not execute forward motion while the target object is not yet confirmed in frame.
+  If navigating toward an object and the object is visible with collision status clear,
+  execute tbot_navigate_to_object once, then call tbot_motion_stop and end that action cycle.
 
   ### Object lock discipline
   - If tbot_vision_find_object reports the target is visible, lock the target.

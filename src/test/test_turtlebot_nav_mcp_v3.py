@@ -33,7 +33,7 @@ class _FakeNavClient:
                 if self._state["bypass_results"]:
                     return self._state["bypass_results"].pop(0)
                 return {"status": "completed"}
-            if name in ("tbot_motion_turn", "tbot_motion_stop", "tbot_motion_move_forward_continuous"):
+            if name in ("tbot_motion_turn", "tbot_motion_stop", "tbot_motion_move_forward_distance"):
                 return {"status": "ok"}
             raise AssertionError(f"Unexpected motion tool call: {name}")
 
@@ -151,7 +151,7 @@ def test_navigate_to_object_requires_target_visible_at_start():
 
     assert result["success"] is False
     assert result["stopped_reason"] == "target_not_visible"
-    assert all(name != "tbot_motion_move_forward_continuous" for name, _ in state["motion_calls"])
+    assert all(name != "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
 
 
 def test_navigate_to_object_returns_target_lost_after_move():
@@ -177,7 +177,7 @@ def test_navigate_to_object_returns_target_lost_after_move():
 
     assert result["success"] is False
     assert result["stopped_reason"] == "target_lost"
-    assert any(name == "tbot_motion_move_forward_continuous" for name, _ in state["motion_calls"])
+    assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
 
 
 def test_navigate_to_object_recenters_when_visible_off_center_after_move():
@@ -269,7 +269,7 @@ def test_nav_go_to_pose_reaches_target_without_timed_motion():
 
     assert result["status"] == "reached"
     assert result["distance_remaining_m"] <= 0.1
-    assert any(name == "tbot_motion_move_forward_continuous" for name, _ in state["motion_calls"])
+    assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
     assert all(name != "tbot_motion_move_timed" for name, _ in state["motion_calls"])
 
 
@@ -330,6 +330,82 @@ def test_nav_go_to_pose_collision_blocked():
 
     assert result["status"] == "collision_blocked"
     assert any(name == "tbot_motion_stop" for name, _ in state["motion_calls"])
+
+
+def test_nav_go_to_pose_collision_check_uses_forward_cone_half_width():
+    state = _make_state()
+    state["collision_results"] = [
+        {"risk_level": "clear", "min_forward_distance_m": 1.5, "distances": {"front": 1.5}},
+    ]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    odom_sequence = [
+        _odom(0.0, 0.0, 0.0),
+        _odom(1.0, 0.0, 0.0),
+    ]
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "_get_one_odom",
+        new=AsyncMock(side_effect=odom_sequence),
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_pose(
+                target_x_m=1.0,
+                target_y_m=0.0,
+                pos_tolerance_m=0.1,
+                timeout_s=5.0,
+            )
+        )
+
+    assert result["status"] == "reached"
+    lidar_check_calls = [payload for name, payload in state["lidar_calls"] if name == "tbot_lidar_check_collision"]
+    assert lidar_check_calls
+    assert lidar_check_calls[0]["sector_half_width_deg"] == pytest.approx(nav_v3.NAV_FORWARD_CONE_HALF_WIDTH_DEG)
+
+
+def test_nav_go_to_pose_reduces_step_distance_when_forward_clearance_is_tight():
+    state = _make_state()
+    state["collision_results"] = [
+        {"risk_level": "clear", "min_forward_distance_m": 0.22, "distances": {"front": 0.22}},
+    ]
+
+    def fake_client(url: str):
+        return _FakeNavClient(url, state)
+
+    odom_sequence = [
+        _odom(0.0, 0.0, 0.0),
+        _odom(1.0, 0.0, 0.0),
+    ]
+
+    with patch.object(nav_v3, "Client", side_effect=fake_client), patch.object(
+        nav_v3,
+        "_get_one_odom",
+        new=AsyncMock(side_effect=odom_sequence),
+    ), patch.object(
+        nav_v3,
+        "NAV_FORWARD_STEP_M",
+        0.20,
+    ), patch.object(
+        nav_v3,
+        "NAV_FRONT_THRESHOLD_M",
+        0.10,
+    ):
+        result = asyncio.run(
+            nav_v3.tbot_nav_go_to_pose(
+                target_x_m=1.0,
+                target_y_m=0.0,
+                pos_tolerance_m=0.1,
+                timeout_s=5.0,
+            )
+        )
+
+    assert result["status"] == "reached"
+    forward_calls = [payload for name, payload in state["motion_calls"] if name == "tbot_motion_move_forward_distance"]
+    assert forward_calls
+    assert forward_calls[0]["distance_m"] == pytest.approx(0.12)
 
 
 def test_estimate_object_pose_straight_ahead():
@@ -438,7 +514,7 @@ def test_navigate_to_object_reaches_target_and_confirms_scene():
     assert result["stopped_reason"] == "reached_target"
     assert result["object_in_frame"] is True
     assert "confirmed" in result["scene_description"].lower()
-    assert any(name == "tbot_motion_move_forward_continuous" for name, _ in state["motion_calls"])
+    assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
 
 
 def test_navigate_to_object_uses_describe_scene_and_bbox_checks():
@@ -524,7 +600,7 @@ def test_navigate_to_object_stop_risk_with_visible_target_stops_without_bypass()
     assert result["success"] is True
     assert result["stopped_reason"] == "reached_target"
     assert all(name != "tbot_motion_bypass_obstacle" for name, _ in state["motion_calls"])
-    assert all(name != "tbot_motion_move_forward_continuous" for name, _ in state["motion_calls"])
+    assert all(name != "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
 
 
 def test_navigate_to_object_stop_risk_with_visible_target_not_close_returns_blocked():

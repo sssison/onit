@@ -60,11 +60,11 @@ NAV_HEADING_KP = _env_float("NAV_HEADING_KP", 1.8)
 NAV_FINAL_YAW_KP = _env_float("NAV_FINAL_YAW_KP", 2.0)
 NAV_FRONT_THRESHOLD_M = max(0.05, _env_float("NAV_FRONT_THRESHOLD_M", 0.1))
 NAV_MAX_CONSECUTIVE_ODOM_FAILURES = max(1, int(_env_float("NAV_MAX_CONSECUTIVE_ODOM_FAILURES", 2.0)))
-NAV_FORWARD_STEP_M = max(0.03, _env_float("NAV_FORWARD_STEP_M", 0.12))
+NAV_FORWARD_STEP_M = max(0.03, _env_float("NAV_FORWARD_STEP_M", 0.20))
 NAV_TURN_STEP_DEG = max(1.0, _env_float("NAV_TURN_STEP_DEG", 12.0))
 NAV_HEADING_ALIGN_DEG = max(5.0, _env_float("NAV_HEADING_ALIGN_DEG", 15.0))
 TBOT_CAMERA_FOV_DEG = _env_float("TBOT_CAMERA_FOV_DEG", 62.0)
-NAV_OBJECT_APPROACH_STEP_M = max(0.05, _env_float("NAV_OBJECT_APPROACH_STEP_M", 0.25))
+NAV_OBJECT_APPROACH_STEP_M = max(0.05, _env_float("NAV_OBJECT_APPROACH_STEP_M", 0.30))
 NAV_OBJECT_MOVE_SPEED_MPS = max(0.03, _env_float("NAV_OBJECT_MOVE_SPEED_MPS", 0.10))
 NAV_OBJECT_TURN_SPEED_RPS = max(0.05, _env_float("NAV_OBJECT_TURN_SPEED_RPS", 0.30))
 NAV_OBJECT_MAX_APPROACH_STEPS = max(1, int(_env_float("NAV_OBJECT_MAX_APPROACH_STEPS", 80.0)))
@@ -72,7 +72,7 @@ NAV_OBJECT_RECENTER_EPS_DEG = max(0.5, _env_float("NAV_OBJECT_RECENTER_EPS_DEG",
 NAV_OBJECT_LOSS_CONFIRM_FRAMES = max(1, int(_env_float("NAV_OBJECT_LOSS_CONFIRM_FRAMES", 2.0)))
 NAV_OBJECT_DEFAULT_STOP_DISTANCE_M = max(0.05, _env_float("NAV_OBJECT_DEFAULT_STOP_DISTANCE_M", 0.20))
 NAV_MIDPOINT_TIMEOUT_S = max(5.0, _env_float("NAV_MIDPOINT_TIMEOUT_S", 45.0))
-NAV_CONTINUOUS_SEGMENT_S = max(0.10, _env_float("NAV_CONTINUOUS_SEGMENT_S", 0.35))
+NAV_FORWARD_CONE_HALF_WIDTH_DEG = max(5.0, _env_float("NAV_FORWARD_CONE_HALF_WIDTH_DEG", 30.0))
 NAV_MIDPOINT_SAMPLE_OFFSETS_DEG = (-10.0, 0.0, 10.0)
 
 _rclpy_init_lock = threading.Lock()
@@ -327,7 +327,10 @@ async def _turn_by_degrees(motion: Client, turn_deg: float, speed_rps: float) ->
 async def _call_lidar_collision(lidar: Client) -> dict[str, Any]:
     raw = await lidar.call_tool(
         "tbot_lidar_check_collision",
-        {"front_threshold_m": NAV_FRONT_THRESHOLD_M},
+        {
+            "front_threshold_m": NAV_FRONT_THRESHOLD_M,
+            "sector_half_width_deg": NAV_FORWARD_CONE_HALF_WIDTH_DEG,
+        },
     )
     return _extract_tool_result_dict(raw)
 
@@ -594,11 +597,7 @@ async def tbot_nav_go_to_pose(
                         )
                     else:
                         try:
-                            collision_raw = await lidar.call_tool(
-                                "tbot_lidar_check_collision",
-                                {"front_threshold_m": NAV_FRONT_THRESHOLD_M},
-                            )
-                            collision = _extract_tool_result_dict(collision_raw)
+                            collision = await _call_lidar_collision(lidar)
                             risk_level = collision.get("risk_level", "unknown")
                             front_distance = _extract_front_distance(collision)
                         except Exception as e:
@@ -623,14 +622,27 @@ async def tbot_nav_go_to_pose(
                         caution_scale = 0.5 if risk_level == "caution" else 1.0
                         segment_speed = min(max_linear, max(0.03, distance))
                         segment_speed = max(0.03, segment_speed * caution_scale)
-                        max_duration_for_distance = distance / max(segment_speed, 1e-6)
-                        segment_duration = min(NAV_CONTINUOUS_SEGMENT_S, max_duration_for_distance)
-                        if segment_duration <= 0.0:
-                            await asyncio.sleep(0.05)
-                            continue
+                        base_step_m = min(distance, NAV_FORWARD_STEP_M) * caution_scale
+                        step_distance_m = base_step_m
+                        if front_distance is not None:
+                            clearance_cap_m = max(0.0, front_distance - NAV_FRONT_THRESHOLD_M)
+                            step_distance_m = min(step_distance_m, clearance_cap_m)
+                        if step_distance_m <= 0.0 and not reached_pos:
+                            await _safe_motion_stop(motion)
+                            return {
+                                "status": "collision_blocked",
+                                "target": {"x_m": x_target, "y_m": y_target, "yaw_rad": yaw_target},
+                                "distance_remaining_m": distance,
+                                "yaw_error_rad": yaw_error,
+                                "elapsed_s": time.monotonic() - started,
+                                "steps": steps,
+                                "last_pose": last_pose,
+                                "front_distance_m": front_distance,
+                                "collision": collision,
+                            }
                         await motion.call_tool(
-                            "tbot_motion_move_forward_continuous",
-                            {"duration_seconds": segment_duration, "speed": segment_speed},
+                            "tbot_motion_move_forward_distance",
+                            {"distance_m": step_distance_m, "speed": segment_speed},
                         )
                 except Exception as e:
                     await _safe_motion_stop(motion)
@@ -1136,6 +1148,9 @@ async def tbot_navigate_to_object(
                     allowed_step = NAV_OBJECT_APPROACH_STEP_M * scale
                     if distance_for_limit is not None:
                         allowed_step = min(allowed_step, max(0.0, distance_for_limit - stop_distance_f))
+                    if front_distance_m is not None:
+                        # Keep a stop buffer from the nearest obstacle in the forward +/-cone.
+                        allowed_step = min(allowed_step, max(0.0, front_distance_m - stop_distance_f))
 
                     near_target = distance_for_limit is not None and distance_for_limit <= stop_distance_f
                     blocked = allowed_step <= 0.0
@@ -1165,13 +1180,9 @@ async def tbot_navigate_to_object(
                             }
 
                     move_speed = max(0.03, NAV_OBJECT_MOVE_SPEED_MPS * scale)
-                    move_duration_s = min(
-                        NAV_CONTINUOUS_SEGMENT_S,
-                        allowed_step / max(move_speed, 1e-6),
-                    )
                     await motion.call_tool(
-                        "tbot_motion_move_forward_continuous",
-                        {"duration_seconds": move_duration_s, "speed": move_speed},
+                        "tbot_motion_move_forward_distance",
+                        {"distance_m": allowed_step, "speed": move_speed},
                     )
                     approach_steps += 1
 
