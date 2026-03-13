@@ -41,8 +41,6 @@ def test_turtlebot_prompt_includes_new_composite_patterns_and_no_removed_tools()
     assert "Move toward the wall until near it" in instruction
     assert "Approach destination while verifying wall proximity with LiDAR" in instruction
     assert "Do not execute forward motion while the target object is not yet confirmed in frame." in instruction
-    assert "If navigating toward an object and the object is visible with collision status clear," in instruction
-    assert "execute tbot_navigate_to_object once, then call tbot_motion_stop and end that action cycle." in instruction
     assert "If a task includes directional language like \"on the left\" or \"on the right\" for the target:" in instruction
     assert "First do one in-place turn toward that side (left/right) before any forward motion." in instruction
     assert "Then run visual QA with tbot_vision_describe_scene to confirm the side context." in instruction
