@@ -334,21 +334,13 @@ async def tbot_vision_find_object(
     attributes: list[str] | None = None,
     anchor_object: str | None = None,
     relation: str | None = None,
-    search_mode: str = "scan360",
 ) -> dict[str, Any]:
     """
-    Find a named object in camera frames.
-
-    search_mode:
-      - "scan360": perform 360 scan in 10 deg steps and recenter once from bbox.
-      - "frame_only": single-frame detection without robot movement.
+    Find a named object by checking the current frame first, then scanning if needed.
     """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
         raise ValueError("object_name must be a non-empty string")
-    search_mode_clean = str(search_mode).strip().lower()
-    if search_mode_clean not in {"scan360", "frame_only"}:
-        raise ValueError("search_mode must be 'scan360' or 'frame_only'")
 
     host = os.getenv("TBOT_VISION_HOST", DEFAULT_VISION_HOST)
     model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
@@ -356,7 +348,6 @@ async def tbot_vision_find_object(
         "host": host,
         "model": model,
         "timeout_s": VISION_TIMEOUT_S,
-        "search_mode": search_mode_clean,
     }
 
     result = await _find_object_in_frame(
@@ -365,16 +356,6 @@ async def tbot_vision_find_object(
         anchor_object=anchor_object,
         relation=relation,
     )
-    if search_mode_clean == "frame_only":
-        return {
-            **result,
-            "success": bool(result.get("visible")),
-            "scan_steps": 0,
-            "degrees_swept": 0.0,
-            "recenter_applied": False,
-            "stopped_reason": "found" if bool(result.get("visible")) else "not_found",
-            "model_info": model_info,
-        }
 
     scan_steps = 0
     recenter_applied = False
@@ -475,6 +456,42 @@ async def tbot_vision_find_object(
         "degrees_swept": float(scan_steps * VISION_SCAN_STEP_DEG),
         "recenter_applied": recenter_applied,
         "stopped_reason": "found",
+        "model_info": model_info,
+    }
+
+
+@mcp_vision_v3.tool()
+async def tbot_vision_get_object_bbox(
+    object_name: str,
+    attributes: list[str] | None = None,
+    anchor_object: str | None = None,
+    relation: str | None = None,
+) -> dict[str, Any]:
+    """
+    Get object visibility and bbox from the current frame only (no scan/turn).
+    """
+    object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
+    if not object_name_clean:
+        raise ValueError("object_name must be a non-empty string")
+
+    host = os.getenv("TBOT_VISION_HOST", DEFAULT_VISION_HOST)
+    model = os.getenv("TBOT_VISION_MODEL", DEFAULT_VISION_MODEL)
+    model_info = {
+        "host": host,
+        "model": model,
+        "timeout_s": VISION_TIMEOUT_S,
+    }
+
+    result = await _find_object_in_frame(
+        object_name_clean,
+        attributes=attributes,
+        anchor_object=anchor_object,
+        relation=relation,
+    )
+    has_bbox = isinstance(result.get("bbox"), dict)
+    return {
+        **result,
+        "success": bool(result.get("visible")) and has_bbox,
         "model_info": model_info,
     }
 

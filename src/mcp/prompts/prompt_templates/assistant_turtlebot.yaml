@@ -44,7 +44,8 @@ instruction_template: |
   Reference these patterns by name in your plans. Do not reconstruct them
   from scratch - use the composite tools or call the primitive tools in the
   exact order described.
-  Use tbot_vision_find_object(search_mode="scan360") as the primary object finder.
+  Use tbot_vision_find_object as the primary object finder.
+  It always checks the current frame first, then scans if needed.
   Use tbot_navigate_to_object only after the object is visible in frame.
   Do not execute forward motion while the target object is not yet confirmed in frame.
 
@@ -54,7 +55,7 @@ instruction_template: |
   - Do not run another search sweep after lock.
   - Rescan ONLY IF the object is not present in frame.
   - If the object is present but off-center, recenter using the bounding box and continue approach.
-  - If tbot_navigate_to_object returns target_lost after motion, call tbot_vision_find_object(search_mode="scan360") again before another navigation attempt.
+  - If tbot_navigate_to_object returns target_lost after motion, call tbot_vision_find_object again before another navigation attempt.
 
   ### Tool call efficiency
   - Call tools only when the result changes the next action.
@@ -70,8 +71,7 @@ instruction_template: |
 
     1. finder = tbot_vision_find_object(
            object_name="<object>",
-           attributes=["<optional>"],
-           search_mode="scan360"
+           attributes=["<optional>"]
        )
        -> finder must return visible=True before any navigation.
 
@@ -82,9 +82,9 @@ instruction_template: |
            confirm_in_frame=True   <- always True when task requires visual QA
        )
 
-    3. After each move, verify with tbot_vision_find_object(search_mode="frame_only"):
-       - If visible: continue approaching; if off-center, recenter from bbox.
-       - If not visible: treat as target_lost and reacquire with scan360.
+    3. After each move, verify with tbot_vision_describe_scene():
+       - If visible: call tbot_vision_get_object_bbox and recenter if off-center.
+       - If not visible: treat as target_lost and reacquire with tbot_vision_find_object.
        If nav.stopped_reason == "target_lost":
        -> Repeat Step 1 (find again) then Step 2 (navigate again).
        -> Continue until reached_target or retry limit.

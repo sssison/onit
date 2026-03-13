@@ -106,6 +106,79 @@ def test_vision_find_object_visible_with_position():
         {
             "matched": True,
             "confidence": 0.85,
+            "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.3},
+        }
+    )
+    mock_client = _make_mock_llm_client(response_json)
+    motion_calls: list[tuple[str, dict]] = []
+
+    def fake_motion_client(url: str):
+        assert url == vision_v3.MOTION_MCP_URL_V3
+        return _FakeMotionClient(motion_calls)
+
+    with patch(
+        "builtins.open",
+        MagicMock(
+            return_value=MagicMock(
+                __enter__=lambda s: s,
+                __exit__=MagicMock(return_value=False),
+                read=MagicMock(return_value=raw),
+            )
+        ),
+    ), patch.object(vision_v3, "AsyncOpenAI", return_value=mock_client), patch.object(
+        vision_v3, "Client", side_effect=fake_motion_client
+    ):
+        result = asyncio.run(vision_v3.tbot_vision_find_object("chair"))
+
+    assert result["visible"] is True
+    assert result["position"] == "center"
+    assert result["confidence"] == pytest.approx(0.85)
+    assert result["scan_steps"] == 0
+    assert len(motion_calls) == 0
+    create_kwargs = mock_client.chat.completions.create.await_args.kwargs
+    assert create_kwargs["extra_body"] == vision_v3._vision_extra_body()
+    user_text = create_kwargs["messages"][1]["content"][0]["text"]
+    assert user_text.startswith("/no_think\n")
+
+
+def test_vision_find_object_not_visible():
+    raw = b"\xff\xd8\xff"
+    response_json = json.dumps({"matched": False, "confidence": 0.05, "bbox": None})
+    mock_client = _make_mock_llm_client(response_json)
+    motion_calls: list[tuple[str, dict]] = []
+
+    def fake_motion_client(url: str):
+        assert url == vision_v3.MOTION_MCP_URL_V3
+        return _FakeMotionClient(motion_calls)
+
+    with patch(
+        "builtins.open",
+        MagicMock(
+            return_value=MagicMock(
+                __enter__=lambda s: s,
+                __exit__=MagicMock(return_value=False),
+                read=MagicMock(return_value=raw),
+            )
+        ),
+    ), patch.object(vision_v3, "AsyncOpenAI", return_value=mock_client), patch.object(
+        vision_v3, "Client", side_effect=fake_motion_client
+    ), patch.object(
+        vision_v3, "VISION_SCAN_MAX_STEPS", 1
+    ):
+        result = asyncio.run(vision_v3.tbot_vision_find_object("elephant"))
+
+    assert result["visible"] is False
+    assert result["position"] is None
+    assert result["bbox"] is None
+    assert result["stopped_reason"] == "max_retries"
+
+
+def test_vision_get_object_bbox_is_frame_only():
+    raw = b"\xff\xd8\xff"
+    response_json = json.dumps(
+        {
+            "matched": True,
+            "confidence": 0.85,
             "bbox": {"cx": 0.7, "cy": 0.5, "w": 0.2, "h": 0.3},
         }
     )
@@ -121,37 +194,11 @@ def test_vision_find_object_visible_with_position():
             )
         ),
     ), patch.object(vision_v3, "AsyncOpenAI", return_value=mock_client):
-        result = asyncio.run(vision_v3.tbot_vision_find_object("chair", search_mode="frame_only"))
+        result = asyncio.run(vision_v3.tbot_vision_get_object_bbox("chair"))
 
     assert result["visible"] is True
     assert result["position"] == "right"
-    assert result["confidence"] == pytest.approx(0.85)
-    create_kwargs = mock_client.chat.completions.create.await_args.kwargs
-    assert create_kwargs["extra_body"] == vision_v3._vision_extra_body()
-    user_text = create_kwargs["messages"][1]["content"][0]["text"]
-    assert user_text.startswith("/no_think\n")
-
-
-def test_vision_find_object_not_visible():
-    raw = b"\xff\xd8\xff"
-    response_json = json.dumps({"matched": False, "confidence": 0.05, "bbox": None})
-    mock_client = _make_mock_llm_client(response_json)
-
-    with patch(
-        "builtins.open",
-        MagicMock(
-            return_value=MagicMock(
-                __enter__=lambda s: s,
-                __exit__=MagicMock(return_value=False),
-                read=MagicMock(return_value=raw),
-            )
-        ),
-    ), patch.object(vision_v3, "AsyncOpenAI", return_value=mock_client):
-        result = asyncio.run(vision_v3.tbot_vision_find_object("elephant", search_mode="frame_only"))
-
-    assert result["visible"] is False
-    assert result["position"] is None
-    assert result["bbox"] is None
+    assert result["success"] is True
 
 
 def test_vision_find_object_rejects_empty_name():

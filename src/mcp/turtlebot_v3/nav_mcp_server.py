@@ -122,6 +122,38 @@ def _extract_tool_result_dict(tool_result: Any) -> dict[str, Any]:
     return {}
 
 
+def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    end = -1
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end == -1:
+        return None
+    try:
+        parsed = json.loads(text[start:end])
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _is_odom_stale(odom: dict[str, Any], stale_timeout_s: float) -> bool:
     if stale_timeout_s <= 0:
         return False
@@ -312,14 +344,53 @@ async def _vision_find_target(
     vision: Client,
     target: str,
     qualifier: str | None,
-    search_mode: str = "frame_only",
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {"object_name": target, "search_mode": search_mode}
+    payload: dict[str, Any] = {"object_name": target}
     attrs = _qualifier_to_attributes(qualifier)
     if attrs:
         payload["attributes"] = attrs
     raw = await vision.call_tool("tbot_vision_find_object", payload)
     return _extract_tool_result_dict(raw)
+
+
+async def _vision_get_target_bbox(
+    vision: Client,
+    target: str,
+    qualifier: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"object_name": target}
+    attrs = _qualifier_to_attributes(qualifier)
+    if attrs:
+        payload["attributes"] = attrs
+    raw = await vision.call_tool("tbot_vision_get_object_bbox", payload)
+    return _extract_tool_result_dict(raw)
+
+
+async def _scene_confirms_target_visible(
+    vision: Client,
+    target: str,
+    qualifier: str | None,
+) -> bool:
+    qualifier_text = f" with qualifier '{qualifier.strip()}'" if isinstance(qualifier, str) and qualifier.strip() else ""
+    prompt = (
+        "Return JSON only with keys visible (boolean) and confidence (0..1). "
+        f"Is the target object '{target}'{qualifier_text} currently visible in frame?"
+    )
+    raw = await vision.call_tool("tbot_vision_describe_scene", {"prompt": prompt})
+    scene = _extract_tool_result_dict(raw)
+    description = str(scene.get("description", ""))
+    parsed = _extract_first_json_object(description) or {}
+    visible = parsed.get("visible")
+    if isinstance(visible, bool):
+        return visible
+
+    desc_lower = description.lower()
+    target_lower = target.lower()
+    if "not visible" in desc_lower or "not present" in desc_lower or "cannot see" in desc_lower:
+        return False
+    if target_lower in desc_lower and any(token in desc_lower for token in ("visible", "present", "confirmed", "seen")):
+        return True
+    return False
 
 
 async def _recenter_to_visible_target_if_needed(
@@ -695,13 +766,12 @@ async def tbot_navigate_to_object(
     async with Client(VISION_MCP_URL_V3) as vision:
         async with Client(MOTION_MCP_URL_V3) as motion:
             async with Client(LIDAR_MCP_URL_V3) as lidar:
-                initial_view = await _vision_find_target(
+                initial_visible = await _scene_confirms_target_visible(
                     vision=vision,
                     target=target_clean,
                     qualifier=qualifier,
-                    search_mode="frame_only",
                 )
-                if not bool(initial_view.get("visible")):
+                if not initial_visible:
                     await _safe_motion_stop(motion)
                     final_pose = await tbot_nav_get_pose()
                     return {
@@ -713,7 +783,13 @@ async def tbot_navigate_to_object(
                     }
 
                 object_in_frame = True
-                await _recenter_to_visible_target_if_needed(motion, initial_view)
+                initial_bbox_view = await _vision_get_target_bbox(
+                    vision=vision,
+                    target=target_clean,
+                    qualifier=qualifier,
+                )
+                if bool(initial_bbox_view.get("visible")):
+                    await _recenter_to_visible_target_if_needed(motion, initial_bbox_view)
 
                 approach_steps = 0
                 while approach_steps < NAV_OBJECT_MAX_APPROACH_STEPS:
@@ -756,28 +832,38 @@ async def tbot_navigate_to_object(
                     )
                     approach_steps += 1
 
-                    post_move_view = await _vision_find_target(
+                    post_move_visible = await _scene_confirms_target_visible(
                         vision=vision,
                         target=target_clean,
                         qualifier=qualifier,
-                        search_mode="frame_only",
                     )
-                    object_in_frame = bool(post_move_view.get("visible"))
+                    object_in_frame = bool(post_move_visible)
                     if object_in_frame:
-                        await _recenter_to_visible_target_if_needed(motion, post_move_view)
+                        bbox_view = await _vision_get_target_bbox(
+                            vision=vision,
+                            target=target_clean,
+                            qualifier=qualifier,
+                        )
+                        if bool(bbox_view.get("visible")):
+                            await _recenter_to_visible_target_if_needed(motion, bbox_view)
                         continue
 
                     # Confirm absence across additional frame checks before declaring target_lost.
                     for _ in range(max(0, NAV_OBJECT_LOSS_CONFIRM_FRAMES - 1)):
-                        confirm_view = await _vision_find_target(
+                        confirm_visible = await _scene_confirms_target_visible(
                             vision=vision,
                             target=target_clean,
                             qualifier=qualifier,
-                            search_mode="frame_only",
                         )
-                        if bool(confirm_view.get("visible")):
+                        if bool(confirm_visible):
                             object_in_frame = True
-                            await _recenter_to_visible_target_if_needed(motion, confirm_view)
+                            confirm_bbox = await _vision_get_target_bbox(
+                                vision=vision,
+                                target=target_clean,
+                                qualifier=qualifier,
+                            )
+                            if bool(confirm_bbox.get("visible")):
+                                await _recenter_to_visible_target_if_needed(motion, confirm_bbox)
                             break
 
                     if not object_in_frame:
@@ -802,8 +888,11 @@ async def tbot_navigate_to_object(
                         "stopped_reason": "max_retries",
                     }
 
-                object_result = await _vision_find_target(vision, target_clean, qualifier)
-                object_in_frame = bool(object_result.get("visible"))
+                object_in_frame = await _scene_confirms_target_visible(
+                    vision=vision,
+                    target=target_clean,
+                    qualifier=qualifier,
+                )
                 if confirm_in_frame:
                     scene_raw = await vision.call_tool(
                         "tbot_vision_describe_scene",

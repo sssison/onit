@@ -64,8 +64,20 @@ class _FakeNavClient:
                     "position": "center",
                     "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2},
                 }
+            if name == "tbot_vision_get_object_bbox":
+                if self._state["vision_bbox_results"]:
+                    return self._state["vision_bbox_results"].pop(0)
+                return {
+                    "visible": True,
+                    "confidence": 0.9,
+                    "position": "center",
+                    "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2},
+                    "success": True,
+                }
             if name == "tbot_vision_describe_scene":
-                return {"description": "Target object confirmed in scene."}
+                if self._state["describe_results"]:
+                    return self._state["describe_results"].pop(0)
+                return {"description": "{\"visible\": true, \"confidence\": 0.9}"}
             raise AssertionError(f"Unexpected vision tool call: {name}")
 
         raise AssertionError(f"Unexpected MCP URL in test: {self._url}")
@@ -79,6 +91,8 @@ def _make_state() -> dict[str, Any]:
         "vision_calls": [],
         "collision_results": [],
         "vision_find_results": [],
+        "vision_bbox_results": [],
+        "describe_results": [],
         "angle_distance_results": [],
         "bypass_results": [],
     }
@@ -121,8 +135,8 @@ def test_nav_get_pose_returns_pose():
 
 def test_navigate_to_object_requires_target_visible_at_start():
     state = _make_state()
-    state["vision_find_results"] = [
-        {"visible": False, "confidence": 0.1, "bbox": None},
+    state["describe_results"] = [
+        {"description": "{\"visible\": false, \"confidence\": 0.2}"},
     ]
 
     def fake_client(url: str):
@@ -142,10 +156,10 @@ def test_navigate_to_object_requires_target_visible_at_start():
 
 def test_navigate_to_object_returns_target_lost_after_move():
     state = _make_state()
-    state["vision_find_results"] = [
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": False, "confidence": 0.1, "bbox": None},
-        {"visible": False, "confidence": 0.1, "bbox": None},
+    state["describe_results"] = [
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": false, \"confidence\": 0.1}"},
+        {"description": "{\"visible\": false, \"confidence\": 0.1}"},
     ]
     state["collision_results"] = [
         {"risk_level": "clear", "min_forward_distance_m": 1.0, "distances": {"front": 1.0}},
@@ -168,10 +182,15 @@ def test_navigate_to_object_returns_target_lost_after_move():
 
 def test_navigate_to_object_recenters_when_visible_off_center_after_move():
     state = _make_state()
-    state["vision_find_results"] = [
+    state["vision_bbox_results"] = [
         {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
         {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.82, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    ]
+    state["describe_results"] = [
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "Target object confirmed in scene."},
     ]
     state["collision_results"] = [
         {"risk_level": "clear", "min_forward_distance_m": 1.0, "distances": {"front": 1.0}},
@@ -196,11 +215,12 @@ def test_navigate_to_object_recenters_when_visible_off_center_after_move():
 
 def test_navigate_to_object_does_not_declare_loss_on_single_miss():
     state = _make_state()
-    state["vision_find_results"] = [
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": False, "confidence": 0.1, "bbox": None},
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.52, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    state["describe_results"] = [
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": false, \"confidence\": 0.1}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "Target object confirmed in scene."},
     ]
     state["collision_results"] = [
         {"risk_level": "clear", "min_forward_distance_m": 1.0, "distances": {"front": 1.0}},
@@ -387,10 +407,11 @@ def test_estimate_object_pose_lidar_occluded_returns_low_confidence():
 
 def test_navigate_to_object_reaches_target_and_confirms_scene():
     state = _make_state()
-    state["vision_find_results"] = [
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    state["describe_results"] = [
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "Target object confirmed in scene."},
     ]
     state["collision_results"] = [
         {"risk_level": "clear", "min_forward_distance_m": 1.0, "distances": {"front": 1.0}},
@@ -420,12 +441,13 @@ def test_navigate_to_object_reaches_target_and_confirms_scene():
     assert any(name == "tbot_motion_move_forward_distance" for name, _ in state["motion_calls"])
 
 
-def test_navigate_to_object_uses_frame_only_checks():
+def test_navigate_to_object_uses_describe_scene_and_bbox_checks():
     state = _make_state()
-    state["vision_find_results"] = [
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    state["describe_results"] = [
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
+        {"description": "Target object confirmed in scene."},
     ]
     state["collision_results"] = [
         {"risk_level": "clear", "min_forward_distance_m": 1.0, "distances": {"front": 1.0}},
@@ -443,16 +465,18 @@ def test_navigate_to_object_uses_frame_only_checks():
         result = asyncio.run(nav_v3.tbot_navigate_to_object(target="cabinet", stop_distance=0.6))
 
     assert result["success"] is True
-    vision_payloads = [payload for name, payload in state["vision_calls"] if name == "tbot_vision_find_object"]
-    assert len(vision_payloads) >= 2
-    assert all(payload.get("search_mode") == "frame_only" for payload in vision_payloads)
+    find_calls = [payload for name, payload in state["vision_calls"] if name == "tbot_vision_find_object"]
+    describe_calls = [payload for name, payload in state["vision_calls"] if name == "tbot_vision_describe_scene"]
+    bbox_calls = [payload for name, payload in state["vision_calls"] if name == "tbot_vision_get_object_bbox"]
+    assert len(find_calls) == 0
+    assert len(describe_calls) >= 2
+    assert len(bbox_calls) >= 1
 
 
 def test_navigate_to_object_collision_stop_when_bypass_fails():
     state = _make_state()
-    state["vision_find_results"] = [
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
-        {"visible": True, "confidence": 0.9, "bbox": {"cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}},
+    state["describe_results"] = [
+        {"description": "{\"visible\": true, \"confidence\": 0.9}"},
     ]
     state["collision_results"] = [{"risk_level": "stop", "min_forward_distance_m": 0.1, "distances": {"front": 0.1}}]
     state["bypass_results"] = [{"status": "timeout"}]
