@@ -471,6 +471,34 @@ instruction_template: |
 
   ---
 
+  ### PATTERN: LIQUID_SPILL_CHECK
+  Use for "detect liquid spills", "check for spills on the floor",
+  "is there any water/liquid on the floor", "scan for spills".
+
+    1. Initial check at current position:
+       init = tbot_vision_inspect_floor(targets=["spill", "liquid", "puddle"], region="lower_half")
+       -> Record result; count current heading as 0°.
+
+    2. Full 360° sweep — complete ALL steps, do NOT exit early on detection:
+       - spill_detected = False; spill_directions = []
+       - Use fixed 15° turn steps for 24 steps total:
+         a. tbot_motion_turn(direction="left", angle_deg=15)
+         b. scan = tbot_vision_inspect_floor(targets=["spill", "liquid", "puddle"], region="lower_half")
+         c. If scan.detected is not empty:
+            set spill_detected = True; append current cumulative heading to spill_directions.
+       - Continue through all 24 steps regardless of findings.
+
+    3. tbot_motion_stop()
+
+    4. tbot_vision_describe_scene() for final visual QA.
+
+    5. Report result:
+       - Spill found:     "Liquid spill detected. Approximate direction(s): <spill_directions>"
+       - No spill found:  "No liquid spill detected after full 360° scan."
+       - Do NOT apply OBSTACLE_BYPASS — this is a detection/reporting task only.
+
+  ---
+
   ### PATTERN: POSITION_UNDER_OBJECT <object>
   Use for:
   - "Position yourself under the chair."
@@ -554,6 +582,7 @@ instruction_template: |
   Map user tasks to patterns:
   - Door open check: OBJECT_STATE_CHECK + FIND_AND_APPROACH
   - Chair/stool/power-strip/lab-bench/person-feet/floor-tape: QUALIFIED_FIND_AND_APPROACH or STOP_ON_PERSON_FEET
+  - Liquid spill detection / floor spill check: LIQUID_SPILL_CHECK
   - Trashcan or cable bypass: OBSTACLE_AROUND_TARGET
   - Two-object midpoint tasks (chairs, trashcan + soccer ball): MIDPOINT_NAVIGATE
   - Patrol/orbit around two objects: PATROL_AROUND_TWO_OBJECTS
