@@ -108,31 +108,34 @@ instruction_template: |
 
     1. bbox = tbot_vision_get_object_bbox(
            object_name="<object>",
-           attributes=["<optional>"]
        )
        -> If bbox.visible=True, lock target and skip active scan.
 
     2. If bbox.visible is not True:
        finder = tbot_vision_find_object(
            object_name="<object>",
-           attributes=["<optional>"]
        )
        -> finder must return visible=True before any navigation.
 
-    3. nav = tbot_navigate_to_object(
+    3. Pre-approach obstacle check (before any navigation)
+       a. tbot_vision_inspect_floor()
+          -> If obstacles detected: run OBSTACLE_BYPASS, then re-check floor.
+          -> If no obstacles: proceed to Step 4.
+
+    4. nav = tbot_navigate_to_object(
            target="<object>",
            qualifier="<optional>",
            stop_distance=<optional meters; omit to use default 0.20>,
            confirm_in_frame=True   <- always True when task requires visual QA
        )
 
-    4. Arrival condition:
+    5. Arrival condition:
        - Primary: reached when distance <= stop_distance and object_in_frame=True.
        - Close-range fallback: if object was recently locked and front LiDAR <= stop_distance,
          treat as reached even if the object drops out of frame because it is too close.
        - Immediately call tbot_motion_stop() when reached.
 
-    5. After each move, verify with tbot_vision_describe_scene():
+    6. After each move, verify with tbot_vision_describe_scene():
        - Call tbot_vision_get_object_bbox for the target.
        - If bbox.visible=True: recenter if off-center.
        - If bbox.visible is not True: treat as target_lost and reacquire with tbot_vision_find_object.
@@ -153,11 +156,16 @@ instruction_template: |
   Use for tasks like "Go to the door and check if it is fully open."
 
     1. tbot_vision_get_object_bbox(object_name="<object>")
+       -> If bbox.visible=True: lock target and proceed to Step 2. Do NOT call tbot_vision_find_object.
        - If not visible, call tbot_vision_find_object(object_name="<object>")
-    2. tbot_navigate_to_object(target="<object>", confirm_in_frame=True)
-       - If blocked, run OBSTACLE_BYPASS and then retry navigation.
+    2. Pre-approach obstacle check
+       a. tbot_vision_inspect_floor()
+          -> If obstacles detected: run OBSTACLE_BYPASS, then re-check floor.
+          -> If no obstacles: proceed to Step 3.
+    3. tbot_navigate_to_object(target="<object>", confirm_in_frame=True)
+       - If blocked mid-navigation, run OBSTACLE_BYPASS and then retry navigation.
        - If object goes out of frame mid-task, check bbox first; if still not visible, reacquire with tbot_vision_find_object and retry.
-    3. End with tbot_vision_describe_scene() and classify final state.
+    4. End with tbot_vision_describe_scene() and classify final state.
        - For door: fully open / partially open / closed.
 
   ---
@@ -168,7 +176,7 @@ instruction_template: |
   - "stool near the glass door"
   - "power strip on the floor near the wall"
 
-    1. First try tbot_vision_find_object with attributes/relation qualifiers.
+    1. First try tbot_vision_find_object using the full descriptive object name (e.g. 'green trashcan', 'chair with wheels').
     2. If qualifier confidence is weak, find the base object class and verify qualifiers in final visual QA.
     3. Navigate using FIND_AND_APPROACH.
     4. For "near wall" tasks, verify with LiDAR side/front distance before declaring success.
@@ -214,6 +222,66 @@ instruction_template: |
       4) bypasses if unsafe, then navigates to midpoint.
     - If midpoint.success is False, inspect midpoint.error and retry once only
       if the failure is object-detection related.
+
+  ---
+
+  ### PATTERN: PATROL_AROUND_TWO_OBJECTS <object_A> and <object_B>
+  Use when the task requires orbiting or patrolling a lap around two objects together, for example:
+  - "Patrol around the two chairs."
+  - "Do a loop around the trashcan and the soccer ball."
+
+    1. Localize both objects (do not move yet):
+       pose_A = tbot_estimate_object_pose(target="<object_A>", qualifier="<optional>")
+       pose_B = tbot_estimate_object_pose(target="<object_B>", qualifier="<optional>")
+       -> If either returns success=False, run FIND_AND_APPROACH for that object first,
+          then retry tbot_estimate_object_pose before proceeding.
+       -> Store: x1=pose_A.x, y1=pose_A.y, x2=pose_B.x, y2=pose_B.y
+
+    2. Compute orbit geometry (do this arithmetic inline before calling any tool):
+       mx = (x1 + x2) / 2              # midpoint X
+       my = (y1 + y2) / 2              # midpoint Y
+       dx = x2 - x1
+       dy = y2 - y1
+       sep = sqrt(dx^2 + dy^2)         # separation between objects
+       ux = dx / sep,  uy = dy / sep   # unit vector along A->B axis
+       px = -uy,       py =  ux        # unit vector perpendicular to axis
+
+       CLEARANCE = max(0.55, sep * 0.4)   # lateral orbit margin (min 0.55 m)
+       HALF_LEN  = sep / 2 + CLEARANCE    # half-length along axis
+
+       # Four rectangle corners, in traversal order (counter-clockwise):
+       W1 = (mx + ux*HALF_LEN  + px*CLEARANCE,  my + uy*HALF_LEN  + py*CLEARANCE)
+       W2 = (mx - ux*HALF_LEN  + px*CLEARANCE,  my - uy*HALF_LEN  + py*CLEARANCE)
+       W3 = (mx - ux*HALF_LEN  - px*CLEARANCE,  my - uy*HALF_LEN  - py*CLEARANCE)
+       W4 = (mx + ux*HALF_LEN  - px*CLEARANCE,  my + uy*HALF_LEN  - py*CLEARANCE)
+
+    3. Approach — navigate to the midpoint between the two objects first:
+       approach = tbot_nav_go_to_midpoint_between_objects(
+           object_1="<object_A>", object_2="<object_B>",
+           qualifier_1="<optional>", qualifier_2="<optional>"
+       )
+       -> If approach.success is False, check approach.error and abort with reason.
+       -> Verify both objects still visible: tbot_vision_get_object_bbox for each.
+
+    4. Execute patrol lap around both objects:
+       patrol = tbot_nav_patrol(
+           waypoints=[
+               {{"x_m": W1[0], "y_m": W1[1]}},
+               {{"x_m": W2[0], "y_m": W2[1]}},
+               {{"x_m": W3[0], "y_m": W3[1]}},
+               {{"x_m": W4[0], "y_m": W4[1]}},
+           ],
+           cycles=1,
+       )
+       -> If patrol.status == "collision_blocked" at any waypoint, call
+          tbot_motion_bypass_obstacle(preferred_side="auto") then resume patrol
+          from the next waypoint by calling tbot_nav_go_to_pose directly.
+       -> After completing the lap, call tbot_motion_stop().
+
+    5. Final visual QA:
+       tbot_vision_describe_scene()
+       -> Confirm both objects are visible or nearby.
+       -> Report patrol result: completed_waypoints / total_waypoints.
 
   ---
 
@@ -293,6 +361,7 @@ instruction_template: |
 
     1. Find the destination landmark first
        a. tbot_vision_get_object_bbox(object_name="<destination>")
+          -> If visible=True: lock target and skip to Step 2. Do NOT call tbot_vision_find_object.
        b. If not visible, call tbot_vision_find_object(object_name="<destination>")
        c. If still not found, run a turn-search loop with fixed 15 deg steps:
           - tbot_motion_turn(...15 deg...)
@@ -397,7 +466,8 @@ instruction_template: |
 
     1. Detection and target pose lock
        a. tbot_vision_get_object_bbox(object_name="<object>")
-       b. If not visible, call tbot_vision_find_object(object_name="<object>")
+          -> If bbox.visible=True: lock target and skip directly to step d. Do NOT call tbot_vision_find_object.
+       b. If bbox.visible is not True, call tbot_vision_find_object(object_name="<object>")
        c. If still not visible after scan:
           - tbot_motion_stop()
           - Return {{"status": "failed", "reason": "object_not_found", "attempts": 0}}
@@ -474,6 +544,7 @@ instruction_template: |
   - Chair/stool/power-strip/lab-bench/person-feet/floor-tape: QUALIFIED_FIND_AND_APPROACH or STOP_ON_PERSON_FEET
   - Trashcan or cable bypass: OBSTACLE_AROUND_TARGET
   - Two-object midpoint tasks (chairs, trashcan + soccer ball): MIDPOINT_NAVIGATE
+  - Patrol/orbit around two objects: PATROL_AROUND_TWO_OBJECTS
   - Free-space mapping: FREE_SPACE_MAP
   - Glass-door-path obstacle ID and misplaced floor object scan: VISUAL_QA_ONLY
   - Under-chair positioning: POSITION_UNDER_OBJECT

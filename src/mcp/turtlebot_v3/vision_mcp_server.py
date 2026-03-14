@@ -221,15 +221,10 @@ def _load_frame_as_base64(path: str) -> str:
 
 def _build_object_query(
     object_name: str,
-    attributes: list[str] | None = None,
     anchor_object: str | None = None,
     relation: str | None = None,
 ) -> str:
     fragments = [object_name]
-    if attributes:
-        attrs = [a.strip() for a in attributes if isinstance(a, str) and a.strip()]
-        if attrs:
-            fragments.append(f"with attributes: {', '.join(attrs)}")
     if anchor_object and isinstance(anchor_object, str) and anchor_object.strip():
         fragments.append(f"near/relative to: {anchor_object.strip()}")
     if relation and isinstance(relation, str) and relation.strip():
@@ -290,7 +285,6 @@ async def tbot_vision_describe_scene(
 
 async def _find_object_in_frame(
     object_name: str,
-    attributes: list[str] | None = None,
     anchor_object: str | None = None,
     relation: str | None = None,
 ) -> dict[str, Any]:
@@ -310,7 +304,6 @@ async def _find_object_in_frame(
     )
     query = _build_object_query(
         object_name=object_name,
-        attributes=attributes,
         anchor_object=anchor_object,
         relation=relation,
     )
@@ -352,12 +345,19 @@ async def _find_object_in_frame(
 @mcp_vision_v3.tool()
 async def tbot_vision_find_object(
     object_name: str,
-    attributes: list[str] | None = None,
     anchor_object: str | None = None,
     relation: str | None = None,
 ) -> dict[str, Any]:
     """
-    Find a named object by checking the current frame first, then scanning if needed.
+    Scan for a named object by rotating and checking the camera frame until it is visible.
+
+    IMPORTANT: Only call this tool when the object is NOT already in the current frame.
+    If tbot_vision_get_object_bbox already returned visible=True, do NOT call this tool —
+    the object is already located. Calling it anyway wastes an extra VLM inference.
+
+    Use this tool only when:
+    - tbot_vision_get_object_bbox returned visible=False, OR
+    - The object has never been checked in the current frame.
     """
     object_name_clean = object_name.strip() if isinstance(object_name, str) else ""
     if not object_name_clean:
@@ -373,7 +373,6 @@ async def tbot_vision_find_object(
 
     result = await _find_object_in_frame(
         object_name_clean,
-        attributes=attributes,
         anchor_object=anchor_object,
         relation=relation,
     )
@@ -386,7 +385,6 @@ async def tbot_vision_find_object(
             scan_steps += 1
             result = await _find_object_in_frame(
                 object_name_clean,
-                attributes=attributes,
                 anchor_object=anchor_object,
                 relation=relation,
             )
@@ -408,7 +406,6 @@ async def tbot_vision_find_object(
             bbox_retries += 1
             refreshed = await _find_object_in_frame(
                 object_name_clean,
-                attributes=attributes,
                 anchor_object=anchor_object,
                 relation=relation,
             )
@@ -438,7 +435,6 @@ async def tbot_vision_find_object(
 
                 recentered = await _find_object_in_frame(
                     object_name_clean,
-                    attributes=attributes,
                     anchor_object=anchor_object,
                     relation=relation,
                 )
@@ -463,7 +459,6 @@ async def tbot_vision_find_object(
 @mcp_vision_v3.tool()
 async def tbot_vision_get_object_bbox(
     object_name: str,
-    attributes: list[str] | None = None,
     anchor_object: str | None = None,
     relation: str | None = None,
 ) -> dict[str, Any]:
@@ -484,7 +479,6 @@ async def tbot_vision_get_object_bbox(
 
     result = await _find_object_in_frame(
         object_name_clean,
-        attributes=attributes,
         anchor_object=anchor_object,
         relation=relation,
     )

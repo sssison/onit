@@ -281,14 +281,6 @@ def _extract_valid_distance(value: Any) -> float | None:
     return None
 
 
-def _qualifier_to_attributes(qualifier: str | None) -> list[str] | None:
-    if isinstance(qualifier, str):
-        cleaned = qualifier.strip()
-        if cleaned:
-            return [cleaned]
-    return None
-
-
 def _heading_offset_from_bbox_deg(bbox: Any, camera_fov_deg: float = TBOT_CAMERA_FOV_DEG) -> float | None:
     if not isinstance(bbox, dict):
         return None
@@ -359,10 +351,8 @@ async def _vision_find_target(
     target: str,
     qualifier: str | None,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {"object_name": target}
-    attrs = _qualifier_to_attributes(qualifier)
-    if attrs:
-        payload["attributes"] = attrs
+    combined = f"{qualifier.strip()} {target}" if isinstance(qualifier, str) and qualifier.strip() else target
+    payload: dict[str, Any] = {"object_name": combined}
     raw = await vision.call_tool("tbot_vision_find_object", payload)
     return _extract_tool_result_dict(raw)
 
@@ -372,10 +362,8 @@ async def _vision_get_target_bbox(
     target: str,
     qualifier: str | None,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {"object_name": target}
-    attrs = _qualifier_to_attributes(qualifier)
-    if attrs:
-        payload["attributes"] = attrs
+    combined = f"{qualifier.strip()} {target}" if isinstance(qualifier, str) and qualifier.strip() else target
+    payload: dict[str, Any] = {"object_name": combined}
     raw = await vision.call_tool("tbot_vision_get_object_bbox", payload)
     return _extract_tool_result_dict(raw)
 
