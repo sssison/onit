@@ -85,16 +85,30 @@ instruction_template: |
   ### Object lock discipline
   - If tbot_vision_get_object_bbox reports target visible, lock target and skip find-object scan.
   - If tbot_vision_find_object reports the target is visible, lock the target.
-  - After lock, move toward the target immediately — do NOT insert a turn step before forward motion.
-  - Use bbox.center_x to decide alignment: only turn if the object is significantly off-center
-    (center_x offset > 30 % of frame width). If within that range, move forward directly.
-  - HARD RULE: never call tbot_motion_turn before tbot_motion_move_forward_distance when
-    bbox.visible=True and forward motion has already been decided.
+  - After lock, run RECENTER_ON_BBOX to align if needed, then proceed to forward motion.
+    Do NOT call tbot_motion_turn for any other reason before tbot_navigate_to_object.
   - Do not run another search sweep after lock.
   - Rescan ONLY IF the object is not present in frame.
   - HARD RULE: If bbox.visible=True was already confirmed at the current position,
     calling tbot_vision_find_object is forbidden regardless of task instructions.
   - If tbot_navigate_to_object returns target_lost after motion, call tbot_vision_get_object_bbox first; call tbot_vision_find_object only if bbox still reports not visible.
+
+  ### SUB-PROCEDURE: RECENTER_ON_BBOX
+  Call this whenever an object is locked and you are about to move toward it.
+
+    1. offset_frac = (bbox.center_x - frame_width / 2) / frame_width
+       (negative = object is left of center, positive = right of center)
+
+    2. If abs(offset_frac) <= 0.30:
+       → Object is close enough to center. Do NOT turn. Proceed to forward motion.
+
+    3. If abs(offset_frac) > 0.30:
+       a. direction = "right" if offset_frac > 0 else "left"
+       b. angle_deg = round(abs(offset_frac) * 60)
+          (examples: offset_frac=0.33 → 20°,  0.42 → 25°,  0.50 → 30°)
+       c. tbot_motion_turn(direction=direction, angle_deg=angle_deg)
+       d. Re-fetch bbox = tbot_vision_get_object_bbox(object_name="<object>")
+          → If still off-center, apply one more correction (same formula), then stop correcting.
 
   ### Directional cue bootstrap
   - If a task includes directional language like "on the left" or "on the right" for the target:
@@ -125,6 +139,9 @@ instruction_template: |
        )
        -> finder must return visible=True before any navigation.
 
+    2b. RECENTER_ON_BBOX  ← run this immediately after lock, before any other step
+        Use bbox returned from Step 1 (or from tbot_vision_find_object if that ran).
+
     3. Pre-approach obstacle check (before any navigation)
        a. tbot_vision_inspect_floor()
           -> If obstacles detected: run OBSTACLE_BYPASS, then re-check floor.
@@ -149,8 +166,7 @@ instruction_template: |
 
     6. After each move, verify with tbot_vision_describe_scene():
        - Call tbot_vision_get_object_bbox for the target.
-       - If bbox.visible=True: continue approach — only turn if center_x offset > 30 % of frame width,
-         otherwise move forward directly without turning.
+       - If bbox.visible=True: run RECENTER_ON_BBOX, then continue approach.
        - If bbox.visible is not True: treat as target_lost and reacquire with tbot_vision_find_object.
        If nav.stopped_reason == "target_lost":
        -> Repeat Step 1 (find again) then Step 2 (navigate again).
