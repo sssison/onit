@@ -1082,9 +1082,6 @@ async def tbot_navigate_to_object(
                     target=target_clean,
                     qualifier=qualifier,
                 )
-                if bool(initial_bbox_view.get("visible")):
-                    await _recenter_to_visible_target_if_needed(motion, initial_bbox_view)
-
                 approach_steps = 0
                 while approach_steps < NAV_OBJECT_MAX_APPROACH_STEPS:
                     risk_level, scale, collision = await _guard_motion_and_get_scale(lidar, motion)
