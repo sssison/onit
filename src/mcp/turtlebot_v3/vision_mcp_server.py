@@ -492,21 +492,19 @@ async def tbot_vision_get_object_bbox(
 
 @mcp_vision_v3.tool()
 async def tbot_vision_inspect_floor(
-    targets: list[str] | None = None,
+    targets: list[str] | str | None = None,
     region: str = "lower_half",
     near_object: str | None = None,
 ) -> dict[str, Any]:
     """
     Structured floor inspection for hazards and misplaced objects.
     """
-    requested_targets = targets if isinstance(targets, list) and targets else [
-        "cables",
-        "spill",
-        "feet_legs",
-        "fallen_objects",
-        "power_strip",
-        "floor_tape",
-    ]
+    if isinstance(targets, str) and targets:
+        requested_targets = [targets]
+    elif isinstance(targets, list) and targets:
+        requested_targets = targets
+    else:
+        requested_targets = ["cables", "spill", "feet_legs", "fallen_objects", "power_strip", "floor_tape"]
     query = (
         "Inspect the floor region of the scene and return hazards/objects for: "
         f"{', '.join(str(t) for t in requested_targets)}. "

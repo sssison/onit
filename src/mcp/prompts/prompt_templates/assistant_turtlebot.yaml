@@ -436,7 +436,7 @@ instruction_template: |
        - Perform a full 360 deg hazard sweep before concluding clear/present.
        - Use fixed 15 deg turn steps for 24 steps total:
          a. tbot_motion_turn(...15 deg...)
-         b. tbot_vision_inspect_floor(targets=["<hazard_from_task>"], region="lower_half")
+         b. tbot_vision_inspect_floor(targets="<hazard_from_task>", region="lower_half")
        - Report hazard-clear only if all 24 checks report no matching hazard.
        - If any step reports the hazard, include relative direction.
     3. If hazard found:
@@ -464,7 +464,7 @@ instruction_template: |
   ### PATTERN: STOP_ON_PERSON_FEET
   Use for "Stop when you detect a person's feet or legs nearby."
 
-    1. tbot_vision_inspect_floor(targets=["feet_legs"], region="lower_half")
+    1. tbot_vision_inspect_floor(targets="feet_legs", region="lower_half")
     2. If detected, verify with tbot_lidar_get_obstacle_distances(sector="front")
     3. Call tbot_motion_stop() immediately.
     4. Confirm with tbot_vision_describe_scene().
@@ -476,14 +476,14 @@ instruction_template: |
   "is there any water/liquid on the floor", "scan for spills".
 
     1. Initial check at current position:
-       init = tbot_vision_inspect_floor(targets=["spill", "liquid", "puddle"], region="lower_half")
+       init = tbot_vision_inspect_floor(targets="spill", region="lower_half")
        -> Record result; count current heading as 0°.
 
     2. Full 360° sweep — complete ALL steps, do NOT exit early on detection:
        - spill_detected = False; spill_directions = []
        - Use fixed 15° turn steps for 24 steps total:
          a. tbot_motion_turn(direction="left", angle_deg=15)
-         b. scan = tbot_vision_inspect_floor(targets=["spill", "liquid", "puddle"], region="lower_half")
+         b. scan = tbot_vision_inspect_floor(targets="spill", region="lower_half")
          c. If scan.detected is not empty:
             set spill_detected = True; append current cumulative heading to spill_directions.
        - Continue through all 24 steps regardless of findings.
@@ -562,7 +562,7 @@ instruction_template: |
 
     1. First execute POSITION_UNDER_OBJECT for "<object>".
     2. If POSITION_UNDER_OBJECT failed, return that failure result directly.
-    3. If confirmed, run tbot_vision_inspect_floor(targets=["fallen_objects"], region="lower_half", near_object="<object>").
+    3. If confirmed, run tbot_vision_inspect_floor(targets="fallen_objects", region="lower_half", near_object="<object>").
     4. Return combined result including under-object status + floor findings.
 
   ---
