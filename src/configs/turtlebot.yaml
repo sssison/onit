@@ -5,7 +5,7 @@ serving:
   model: Qwen/Qwen3.5-27B
   #model: Qwen/Qwen3-VL-8B-Instruct
   #model: nvidia/Cosmos-Reason2-8B
-  think: false
+  think: true
   max_tokens: 8192
 
 messages:
