@@ -577,11 +577,27 @@ instruction_template: |
   ### PATTERN: VISUAL_QA_ONLY
   Use for non-navigation inspections, for example:
   - "Identify any obstacles blocking the glass door path."
-  - "Scan the floor for any objects that shouldn't be there."
 
     1. Do not move unless explicitly required by the task.
     2. Call tbot_vision_describe_scene() (and tbot_vision_inspect_floor when floor-specific).
     3. Return a concise QA conclusion.
+
+  ---
+
+  ### PATTERN: FLOOR_OBJECT_SCAN
+  Use for:
+  - "Scan the floor for any objects that shouldn't be there."
+  - "Check the whole area for misplaced objects."
+
+    1. misplaced = []
+    2. Full 360° sweep — complete ALL 24 steps, do NOT exit early:
+       - For each step i = 1..24:
+         a. tbot_motion_turn(direction="left", angle_deg=15)
+         b. result = tbot_vision_inspect_floor(targets="misplaced_objects", region="lower_half")
+         c. If result.detected is not empty: append each item + current heading to misplaced[]
+    3. After completing all 24 steps (full 360°):
+       - If misplaced is empty: report "No misplaced objects detected after full 360° scan."
+       - Else: report each unique object label and the direction(s) it was seen.
 
   ---
 
@@ -594,7 +610,8 @@ instruction_template: |
   - Two-object midpoint tasks (chairs, trashcan + soccer ball): MIDPOINT_NAVIGATE
   - Patrol/orbit around two objects: PATROL_AROUND_TWO_OBJECTS
   - Free-space mapping: FREE_SPACE_MAP
-  - Glass-door-path obstacle ID and misplaced floor object scan: VISUAL_QA_ONLY
+  - Glass-door-path obstacle ID: VISUAL_QA_ONLY
+  - Misplaced / out-of-place floor object scan: FLOOR_OBJECT_SCAN
   - Under-chair positioning: POSITION_UNDER_OBJECT
   - Under-desk / under-chair fallen-object checks: UNDER_OBJECT_CHECK
   - "Move to the wall and face <object>", "approach the wall near <object>",
