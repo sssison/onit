@@ -71,6 +71,9 @@ instruction_template: |
   for the same target in the current frame.
   If bbox reports visible=True, lock target immediately and skip find-object scan.
   Use tbot_vision_find_object only when the object is not already present in frame.
+  NEVER call tbot_vision_find_object if tbot_vision_get_object_bbox already returned
+  visible=True for the same target at the same robot position — doing so wastes tool
+  calls and triggers an unnecessary rotation scan.
   Use tbot_navigate_to_object only after the object is visible in frame.
   If stop_distance is omitted, tbot_navigate_to_object defaults to 0.20 m (20 cm).
   Use explicit stop_distance when requested by the task (example: soccer ball at 0.50 m).
@@ -85,6 +88,8 @@ instruction_template: |
   - After lock, recenter only if needed, then plan movement toward the target.
   - Do not run another search sweep after lock.
   - Rescan ONLY IF the object is not present in frame.
+  - HARD RULE: If bbox.visible=True was already confirmed at the current position,
+    calling tbot_vision_find_object is forbidden regardless of task instructions.
   - If the object is present but off-center, recenter using the bounding box and continue approach.
   - If tbot_navigate_to_object returns target_lost after motion, call tbot_vision_get_object_bbox first; call tbot_vision_find_object only if bbox still reports not visible.
 
@@ -133,6 +138,10 @@ instruction_template: |
        - Primary: reached when distance <= stop_distance and object_in_frame=True.
        - Close-range fallback: if object was recently locked and front LiDAR <= stop_distance,
          treat as reached even if the object drops out of frame because it is too close.
+       - Early hard-stop: if tbot_navigate_to_object already ran AND returned
+         stopped_reason="reached_target" AND tbot_vision_get_object_bbox confirms the
+         target visible (even partially) → call tbot_motion_stop() and end the task.
+         Do NOT re-run tbot_navigate_to_object or tbot_vision_find_object after this.
        - Immediately call tbot_motion_stop() when reached.
 
     6. After each move, verify with tbot_vision_describe_scene():
@@ -165,6 +174,9 @@ instruction_template: |
     3. tbot_navigate_to_object(target="<object>", confirm_in_frame=True)
        - If blocked mid-navigation, run OBSTACLE_BYPASS and then retry navigation.
        - If object goes out of frame mid-task, check bbox first; if still not visible, reacquire with tbot_vision_find_object and retry.
+       - Early hard-stop: if stopped_reason="reached_target" AND bbox shows target
+         visible (even partially) → call tbot_motion_stop() and proceed to Step 4 immediately.
+         Do not retry navigation.
     4. End with tbot_vision_describe_scene() and classify final state.
        - For door: fully open / partially open / closed.
 
