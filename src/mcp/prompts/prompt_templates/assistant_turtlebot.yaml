@@ -142,12 +142,7 @@ instruction_template: |
     2b. RECENTER_ON_BBOX  ← run this immediately after lock, before any other step
         Use bbox returned from Step 1 (or from tbot_vision_find_object if that ran).
 
-    3. Pre-approach obstacle check (before any navigation)
-       a. tbot_vision_inspect_floor()
-          -> If obstacles detected: run OBSTACLE_BYPASS, then re-check floor.
-          -> If no obstacles: proceed to Step 4.
-
-    4. nav = tbot_navigate_to_object(
+    3. nav = tbot_navigate_to_object(
            target="<object>",
            qualifier="<optional>",
            stop_distance=<optional meters; omit to use default 0.20>,
@@ -187,17 +182,13 @@ instruction_template: |
     1. tbot_vision_get_object_bbox(object_name="<object>")
        -> If bbox.visible=True: lock target and proceed to Step 2. Do NOT call tbot_vision_find_object.
        - If not visible, call tbot_vision_find_object(object_name="<object>")
-    2. Pre-approach obstacle check
-       a. tbot_vision_inspect_floor()
-          -> If obstacles detected: run OBSTACLE_BYPASS, then re-check floor.
-          -> If no obstacles: proceed to Step 3.
-    3. tbot_navigate_to_object(target="<object>", confirm_in_frame=True)
+    2. tbot_navigate_to_object(target="<object>", confirm_in_frame=True)
        - If blocked mid-navigation, run OBSTACLE_BYPASS and then retry navigation.
        - If object goes out of frame mid-task, check bbox first; if still not visible, reacquire with tbot_vision_find_object and retry.
        - Early hard-stop: if stopped_reason="reached_target" AND bbox shows target
-         visible (even partially) → call tbot_motion_stop() and proceed to Step 4 immediately.
+         visible (even partially) → call tbot_motion_stop() and proceed to Step 3 immediately.
          Do not retry navigation.
-    4. End with tbot_vision_describe_scene() and classify final state.
+    3. End with tbot_vision_describe_scene() and classify final state.
        - For door: fully open / partially open / closed.
 
   ---
@@ -449,19 +440,17 @@ instruction_template: |
   ### PATTERN: FLOOR_SCAN
   Use for "avoid cables", "scan floor for objects", "check under desk".
 
-    1. tbot_vision_inspect_floor()
-       -> Categorize findings: hazards / objects / clear
-    2. If the task asks to confirm a specific floor hazard is absent or present:
-       - Extract the hazard label from the task (for example: "cable", "liquid", "debris", "feet_legs").
-       - Perform a full 360 deg hazard sweep before concluding clear/present.
-       - Use fixed 15 deg turn steps for 24 steps total:
+  ONE sweep only — do not repeat or restart after completing all 24 steps.
+    1. Full 360° hazard sweep — complete ALL 24 steps, do NOT exit early:
+       - Extract the hazard label from the task (e.g. "cable", "liquid", "debris", "feet_legs").
+       - Use fixed 15° turn steps for 24 steps total:
          a. tbot_motion_turn(...15 deg...)
          b. tbot_vision_inspect_floor(targets="<hazard_from_task>", region="lower_half")
        - Report hazard-clear only if all 24 checks report no matching hazard.
        - If any step reports the hazard, include relative direction.
-    3. If hazard found:
+    2. If hazard found:
        -> Apply OBSTACLE_BYPASS using hazard bounding box as obstacle width
-    4. tbot_vision_describe_scene() at end for visual QA
+    3. tbot_vision_describe_scene() at end for visual QA
 
   ---
 
@@ -495,11 +484,8 @@ instruction_template: |
   Use for "detect liquid spills", "check for spills on the floor",
   "is there any water/liquid on the floor", "scan for spills".
 
-    1. Initial check at current position:
-       init = tbot_vision_inspect_floor(targets="spill", region="lower_half")
-       -> Record result; count current heading as 0°.
-
-    2. Full 360° sweep — complete ALL steps, do NOT exit early on detection:
+  ONE sweep only — do not repeat or restart after completing all 24 steps.
+    1. Full 360° sweep — complete ALL steps, do NOT exit early on detection:
        - spill_detected = False; spill_directions = []
        - Use fixed 15° turn steps for 24 steps total:
          a. tbot_motion_turn(direction="left", angle_deg=15)
@@ -508,11 +494,11 @@ instruction_template: |
             set spill_detected = True; append current cumulative heading to spill_directions.
        - Continue through all 24 steps regardless of findings.
 
-    3. tbot_motion_stop()
+    2. tbot_motion_stop()
 
-    4. tbot_vision_describe_scene() for final visual QA.
+    3. tbot_vision_describe_scene() for final visual QA.
 
-    5. Report result:
+    4. Report result:
        - Spill found:     "Liquid spill detected. Approximate direction(s): <spill_directions>"
        - No spill found:  "No liquid spill detected after full 360° scan."
        - Do NOT apply OBSTACLE_BYPASS — this is a detection/reporting task only.
@@ -609,6 +595,7 @@ instruction_template: |
   - "Scan the floor for any objects that shouldn't be there."
   - "Check the whole area for misplaced objects."
 
+  ONE sweep only — do not repeat or restart after completing all 24 steps.
     1. misplaced = []
     2. Full 360° sweep — complete ALL 24 steps, do NOT exit early:
        - For each step i = 1..24:
