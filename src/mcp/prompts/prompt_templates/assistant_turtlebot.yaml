@@ -560,10 +560,36 @@ instruction_template: |
   - "Check under the desk for any fallen objects."
   - "Check under the chair for any fallen objects."
 
-    1. First execute POSITION_UNDER_OBJECT for "<object>".
-    2. If POSITION_UNDER_OBJECT failed, return that failure result directly.
-    3. If confirmed, run tbot_vision_inspect_floor(targets="fallen_objects", region="lower_half", near_object="<object>").
-    4. Return combined result including under-object status + floor findings.
+    1. Visibility check:
+       a. bbox = tbot_vision_get_object_bbox(object_name="<object>")
+       b. If bbox.visible is not True:
+          - tbot_motion_stop()
+          - Return {{"status": "failed", "reason": "object_not_visible"}}
+
+    2. Proximity check:
+       a. pose = tbot_estimate_object_pose(target="<object>")
+       b. near_threshold = 1.0  (metres)
+       c. already_near = (pose.success is True and pose.distance_m is not None
+                          and pose.distance_m <= near_threshold)
+
+    3. If not already_near, approach the object:
+       a. If pose.success is not True:
+          - tbot_motion_stop()
+          - Return {{"status": "failed", "reason": "pose_estimation_failed"}}
+       b. nav = tbot_nav_go_to_pose(target_x_m=pose.x, target_y_m=pose.y)
+       c. If nav.status == "collision_blocked":
+          - tbot_motion_bypass_obstacle(preferred_side="auto")
+          - Retry tbot_nav_go_to_pose once
+       d. If final nav.status != "reached":
+          - tbot_motion_stop()
+          - Return {{"status": "failed", "reason": nav.status, "approached": False}}
+
+    4. Visual inspection (whether already near or just approached):
+       findings = tbot_vision_inspect_floor(
+           targets="fallen_objects", region="lower_half", near_object="<object>"
+       )
+
+    5. Return {{"status": "completed", "approached": not already_near, "floor_findings": findings}}
 
   ---
 
