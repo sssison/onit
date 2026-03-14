@@ -351,6 +351,9 @@ async def tbot_vision_find_object(
     """
     Scan for a named object by rotating and checking the camera frame until it is visible.
 
+    ⚠ Takes full control of rotation. Do NOT call inside ACQUIRE_TARGET or FLOOR_360_SCAN.
+    Use only for quick searches without frame-by-frame control.
+
     IMPORTANT: Only call this tool when the object is NOT already in the current frame.
     If tbot_vision_get_object_bbox already returned visible=True, do NOT call this tool —
     the object is already located. Calling it anyway wastes an extra VLM inference.

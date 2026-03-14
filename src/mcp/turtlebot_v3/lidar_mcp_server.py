@@ -554,6 +554,8 @@ async def tbot_lidar_check_collision(
     """
     Check directional collision risk for short motion planning.
     Returns risk_level in: clear|caution|stop|unknown.
+    Role: gate for all forward motion — always call via the COLLISION_GUARD sub-procedure.
+    Do NOT call for pure rotations.
     """
     front_threshold = _ensure_non_negative("front_threshold_m", front_threshold_m)
     side_threshold = _ensure_non_negative("side_threshold_m", side_threshold_m)

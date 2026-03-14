@@ -307,8 +307,8 @@ async def tbot_motion_move_forward_distance(
     """
     Move forward by a precomputed travel distance.
 
-    This tool does not perform LiDAR checks while moving. Planners should
-    precompute distance using LiDAR before calling this tool.
+    No internal collision check. Caller must call tbot_lidar_check_collision()
+    (via the COLLISION_GUARD sub-procedure) before every call.
     """
     return await _execute_forward_distance(distance_m=distance_m, speed=speed)
 
@@ -439,7 +439,8 @@ async def tbot_motion_approach_until_close(
 ) -> dict[str, Any]:
     """
     Safely approach until the front LiDAR distance is near target_distance_m.
-    Uses collision checks before and after a single planned forward segment.
+    Reads front LiDAR once before moving. For multi-step approaches, prefer
+    tbot_motion_move_forward_distance with an external COLLISION_GUARD loop.
     """
     target_f = _validate_finite("target_distance_m", target_distance_m)
     stop_f = _validate_finite("stop_distance_m", stop_distance_m)
