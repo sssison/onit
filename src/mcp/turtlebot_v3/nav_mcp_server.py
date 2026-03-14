@@ -71,6 +71,7 @@ NAV_OBJECT_MAX_APPROACH_STEPS = max(1, int(_env_float("NAV_OBJECT_MAX_APPROACH_S
 NAV_OBJECT_RECENTER_EPS_DEG = max(0.5, _env_float("NAV_OBJECT_RECENTER_EPS_DEG", 1.0))
 NAV_OBJECT_LOSS_CONFIRM_FRAMES = max(1, int(_env_float("NAV_OBJECT_LOSS_CONFIRM_FRAMES", 2.0)))
 NAV_OBJECT_DEFAULT_STOP_DISTANCE_M = max(0.05, _env_float("NAV_OBJECT_DEFAULT_STOP_DISTANCE_M", 0.20))
+NAV_OBJECT_CLOSE_BBOX_AREA_THRESHOLD = _env_float("NAV_OBJECT_CLOSE_BBOX_AREA_THRESHOLD", 0.25)
 NAV_MIDPOINT_TIMEOUT_S = max(5.0, _env_float("NAV_MIDPOINT_TIMEOUT_S", 45.0))
 NAV_FORWARD_CONE_HALF_WIDTH_DEG = max(5.0, _env_float("NAV_FORWARD_CONE_HALF_WIDTH_DEG", 30.0))
 NAV_MIDPOINT_SAMPLE_OFFSETS_DEG = (-10.0, 0.0, 10.0)
@@ -383,11 +384,17 @@ async def _scene_confirms_target_visible(
     vision: Client,
     target: str,
     qualifier: str | None,
+    close_hint: bool = False,
 ) -> bool:
     qualifier_text = f" with qualifier '{qualifier.strip()}'" if isinstance(qualifier, str) and qualifier.strip() else ""
+    close_text = (
+        f" The robot is very close and the {target} may be filling or cropping the frame — "
+        "count it as visible even if only partially in view."
+        if close_hint else ""
+    )
     prompt = (
         "Return JSON only with keys visible (boolean) and confidence (0..1). "
-        f"Is the target object '{target}'{qualifier_text} currently visible in frame?"
+        f"Is the target object '{target}'{qualifier_text} currently visible in frame?{close_text}"
     )
     raw = await vision.call_tool("tbot_vision_describe_scene", {"prompt": prompt})
     scene = _extract_tool_result_dict(raw)
@@ -403,6 +410,28 @@ async def _scene_confirms_target_visible(
         return False
     if target_lower in desc_lower and any(token in desc_lower for token in ("visible", "present", "confirmed", "seen")):
         return True
+    return False
+
+
+async def _target_visible_or_close(
+    vision: Client,
+    target: str,
+    qualifier: str | None,
+) -> bool:
+    """Return True if the target is confirmed visible, OR if its bbox area
+    indicates it is very close (filling/cropping the frame), which covers the
+    case where the vision LLM incorrectly says 'not visible' because the object
+    is too large in the frame."""
+    if await _scene_confirms_target_visible(vision=vision, target=target, qualifier=qualifier, close_hint=True):
+        return True
+    bbox_view = await _vision_get_target_bbox(vision=vision, target=target, qualifier=qualifier)
+    bbox = bbox_view.get("bbox") if isinstance(bbox_view, dict) else None
+    if isinstance(bbox, dict):
+        w = bbox.get("w")
+        h = bbox.get("h")
+        if isinstance(w, (int, float)) and isinstance(h, (int, float)):
+            if float(w) * float(h) >= NAV_OBJECT_CLOSE_BBOX_AREA_THRESHOLD:
+                return True
     return False
 
 
@@ -1096,7 +1125,7 @@ async def tbot_navigate_to_object(
                                     target_distance_m = float(measured)
 
                     if risk_level == "stop":
-                        visible_for_stop = await _scene_confirms_target_visible(
+                        visible_for_stop = await _target_visible_or_close(
                             vision=vision,
                             target=target_clean,
                             qualifier=qualifier,
@@ -1155,7 +1184,7 @@ async def tbot_navigate_to_object(
                     near_target = distance_for_limit is not None and distance_for_limit <= stop_distance_f
                     blocked = allowed_step <= 0.0
                     if near_target or blocked:
-                        visible_for_stop = await _scene_confirms_target_visible(
+                        visible_for_stop = await _target_visible_or_close(
                             vision=vision,
                             target=target_clean,
                             qualifier=qualifier,
@@ -1186,7 +1215,7 @@ async def tbot_navigate_to_object(
                     )
                     approach_steps += 1
 
-                    post_move_visible = await _scene_confirms_target_visible(
+                    post_move_visible = await _target_visible_or_close(
                         vision=vision,
                         target=target_clean,
                         qualifier=qualifier,
@@ -1204,7 +1233,7 @@ async def tbot_navigate_to_object(
 
                     # Confirm absence across additional frame checks before declaring target_lost.
                     for _ in range(max(0, NAV_OBJECT_LOSS_CONFIRM_FRAMES - 1)):
-                        confirm_visible = await _scene_confirms_target_visible(
+                        confirm_visible = await _target_visible_or_close(
                             vision=vision,
                             target=target_clean,
                             qualifier=qualifier,
@@ -1243,7 +1272,7 @@ async def tbot_navigate_to_object(
                     }
 
                 if not object_in_frame:
-                    object_in_frame = await _scene_confirms_target_visible(
+                    object_in_frame = await _target_visible_or_close(
                         vision=vision,
                         target=target_clean,
                         qualifier=qualifier,
@@ -1251,7 +1280,12 @@ async def tbot_navigate_to_object(
                 if confirm_in_frame:
                     scene_raw = await vision.call_tool(
                         "tbot_vision_describe_scene",
-                        {"prompt": f"Confirm the {target_clean} and nearby context."},
+                        {"prompt": (
+                            f"The robot has stopped close to a {target_clean}. "
+                            f"The object may be very close and only partially visible or filling the entire frame. "
+                            f"Confirm whether any part of the {target_clean} is still visible, "
+                            f"even if it is cropped at the edges."
+                        )},
                     )
                     scene = _extract_tool_result_dict(scene_raw)
                     scene_description = str(scene.get("description", ""))
